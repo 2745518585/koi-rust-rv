@@ -7,11 +7,15 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+axum.workspace = true
 koi-api = { path = "../../crates/koi-api" }
 koi-core = { path = "../../crates/koi-core" }
 koi-infra = { path = "../../crates/koi-infra" }
 serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
 toml.workspace = true
+tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

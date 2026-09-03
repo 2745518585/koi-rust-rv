@@ -3,6 +3,9 @@
 [server]
 bind_addr = "127.0.0.1:8080"
 web_dist_dir = "./web/dist"
+# JSONL event store for the single-process API adapter. A database adapter can replace it later.
+event_store_dir = "./data/events"
+user_store_path = "./data/users.json"
 
 [qq]
 api_base_url = "https://api.bot.qq.com"

@@ -31,6 +31,38 @@ impl JsonlEventStore {
         })
     }
 
+    /// Returns every task stream currently persisted in this local store.
+    ///
+    /// The list is derived from filenames and is intended for the single-process API adapter.
+    /// Reading events themselves remains the source of truth and validates continuity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage directory cannot be enumerated.
+    pub fn list_task_ids(&self) -> Result<Vec<TaskId>, EventStoreError> {
+        let entries = fs::read_dir(&self.directory).map_err(|error| io_error(&error))?;
+        let mut task_ids = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| io_error(&error))?;
+            let path = entry.path();
+            if path
+                .extension()
+                .is_none_or(|extension| extension != "jsonl")
+            {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let Ok(uuid) = uuid::Uuid::parse_str(stem) else {
+                continue;
+            };
+            task_ids.push(TaskId(uuid));
+        }
+        task_ids.sort_by_key(ToString::to_string);
+        Ok(task_ids)
+    }
+
     fn task_path(&self, task_id: TaskId) -> PathBuf {
         self.directory.join(format!("{task_id}.jsonl"))
     }

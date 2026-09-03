@@ -7,16 +7,21 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+argon2.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+chrono.workspace = true
 futures-util.workspace = true
+koi-api = { path = "../koi-api" }
 koi-core = { path = "../koi-core" }
 reqwest.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 thiserror.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
