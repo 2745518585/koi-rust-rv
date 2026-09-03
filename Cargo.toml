@@ -1,0 +1,44 @@
+[workspace]
+members = [
+  "apps/koi-server",
+  "crates/koi-api",
+  "crates/koi-core",
+  "crates/koi-infra",
+]
+default-members = ["apps/koi-server"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["koi-rust-rv contributors"]
+repository = "https://github.com/Pond-Ink/koi-rust-rv"
+
+[workspace.dependencies]
+async-trait = "0.1"
+axum = { version = "0.8", features = ["json", "macros", "tokio"] }
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "uuid", "chrono"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "process"] }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
+tower-http = { version = "0.7", features = ["cors", "request-id", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["serde", "v7"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"

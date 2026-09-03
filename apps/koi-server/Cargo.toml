@@ -1,0 +1,17 @@
+[package]
+name = "koi-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+koi-api = { path = "../../crates/koi-api" }
+koi-core = { path = "../../crates/koi-core" }
+koi-infra = { path = "../../crates/koi-infra" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

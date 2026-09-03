@@ -1,0 +1,13 @@
+[package]
+name = "koi-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+koi-core = { path = "../koi-core" }
+
+[lints]
+workspace = true

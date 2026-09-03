@@ -1,0 +1,49 @@
+# 非敏感运行配置。复制为 agent.toml 后按部署环境调整。
+
+[server]
+bind_addr = "127.0.0.1:8080"
+web_dist_dir = "./web/dist"
+
+[qq]
+api_base_url = "https://api.bot.qq.com"
+# GROUP_AND_C2C_EVENT (1 << 25)。启用全量群消息权限后，机器人可旁听群聊。
+intents = 33554432
+request_timeout_secs = 10
+max_retries = 2
+
+[model]
+base_url = "https://api.openai.com/v1"
+name = "gpt-5-mini"
+request_timeout_secs = 60
+max_context_messages = 32
+reasoning_effort = "medium"
+
+[agent]
+max_steps = 8
+max_concurrent_tasks = 4
+max_tasks_per_server = 2
+task_timeout_secs = 180
+token_budget_per_task = 12000
+
+[context]
+recent_group_messages = 32
+intervention_cooldown_secs = 300
+alert_dedup_window_secs = 600
+
+[storage]
+database_url = "sqlite://data/koi.db?mode=rwc"
+
+[usage]
+input_price_per_million_tokens = 0.0
+output_price_per_million_tokens = 0.0
+monthly_budget_usd = 10.0
+
+[security]
+# 仅列出允许执行诊断工具的本机服务；不要开放任意 shell。
+allowed_services = ["koi-demo.service"]
+allow_mutating_tools = false
+approval_timeout_secs = 300
+
+[notifications]
+notify_severity_at_or_above = "warning"
+max_reply_chars = 1500
