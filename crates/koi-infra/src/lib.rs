@@ -1,5 +1,6 @@
 //! Infrastructure adapters: QQ, database, model providers, and ops tools.
 
 pub mod event_store;
+pub mod tools;
 
 pub const CRATE_NAME: &str = "koi-infra";

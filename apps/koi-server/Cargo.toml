@@ -10,6 +10,8 @@ authors.workspace = true
 koi-api = { path = "../../crates/koi-api" }
 koi-core = { path = "../../crates/koi-core" }
 koi-infra = { path = "../../crates/koi-infra" }
+serde.workspace = true
+toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

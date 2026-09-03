@@ -39,9 +39,16 @@ output_price_per_million_tokens = 0.0
 monthly_budget_usd = 10.0
 
 [security]
+# 结构化文件、Git、归档和 Compose 工具只能访问这些根目录。
+allowed_roots = ["./data", "./config"]
 # 仅列出允许执行诊断工具的本机服务；不要开放任意 shell。
 allowed_services = ["koi-demo.service"]
+# HTTP 工具只允许访问列出的主机名；空数组表示全部拒绝。
+allowed_http_hosts = []
+allowed_database_targets = []
 allow_mutating_tools = false
+allow_admin_commands = false
+use_sudo = true
 approval_timeout_secs = 300
 
 [notifications]
