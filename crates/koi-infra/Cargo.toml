@@ -8,6 +8,7 @@ authors.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+bytes.workspace = true
 futures-util.workspace = true
 koi-core = { path = "../koi-core" }
 reqwest.workspace = true
@@ -15,6 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
