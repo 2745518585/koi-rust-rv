@@ -169,6 +169,12 @@ function applyStreamEvent(snapshot: SystemSnapshot, streamEvent: StreamEvent): S
     };
   }
 
+  if (streamEvent.type === "authorization.requested") {
+    // 该通知只用于唤醒刷新；审批 DTO 仍由下方从事件存储重建，不能信任传输层自行声明的
+    // 审批状态或权限。
+    return snapshot;
+  }
+
   return {
     ...snapshot,
     recentEvents: [streamEvent.event, ...snapshot.recentEvents].slice(0, 24),
@@ -277,7 +283,19 @@ function App() {
     if (!isLive || !selectedTask) return;
     return api.openEventStream(
       selectedTask.taskId,
-      (event) => setSnapshot((current) => applyStreamEvent(current, event)),
+      (event) => {
+        setSnapshot((current) => applyStreamEvent(current, event));
+        if (event.type === "authorization.requested") {
+          void api.getSnapshot().then(setSnapshot).catch(() => undefined);
+        }
+        if (
+          event.type === "event.appended" &&
+          (event.event.kind === "control" || event.event.kind === "approval")
+        ) {
+          // 生命周期和审批状态由事件投影计算，收到这两类事件后重新读取权威快照。
+          void api.getSnapshot().then(setSnapshot).catch(() => undefined);
+        }
+      },
       () => undefined,
     );
   }, [api, isLive, selectedTask]);

@@ -266,23 +266,7 @@ impl OpenAiCompatibleModelProvider {
             .conversations
             .lock()
             .map_err(|_| internal_error("模型会话状态锁已中毒"))?;
-        let pending_tool_calls = turn
-            .outputs
-            .iter()
-            .filter_map(|output| match output {
-                ModelOutput::ToolCall(call) => Some(PendingToolCall {
-                    id: call.provider_call_id.clone()?,
-                    name: call.name.clone(),
-                    arguments: serde_json::to_string(&call.arguments).ok()?,
-                }),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if pending_tool_calls.is_empty() {
-            conversations.remove(&task_id);
-        } else {
-            conversations.insert(task_id, ConversationState { pending_tool_calls });
-        }
+        append_tool_calls(&mut conversations, task_id, turn);
         Ok(())
     }
 }
@@ -601,6 +585,32 @@ fn chat_assistant_tool_call(calls: &[PendingToolCall]) -> Value {
             },
         })).collect::<Vec<_>>(),
     })
+}
+
+fn append_tool_calls(
+    conversations: &mut HashMap<TaskId, ConversationState>,
+    task_id: TaskId,
+    turn: &ModelTurn,
+) {
+    let tool_calls = turn
+        .outputs
+        .iter()
+        .filter_map(|output| match output {
+            ModelOutput::ToolCall(call) => Some(PendingToolCall {
+                id: call.provider_call_id.clone()?,
+                name: call.name.clone(),
+                arguments: serde_json::to_string(&call.arguments).ok()?,
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !tool_calls.is_empty() {
+        conversations
+            .entry(task_id)
+            .or_default()
+            .pending_tool_calls
+            .extend(tool_calls);
+    }
 }
 
 fn responses_role(role: ModelInputRole) -> &'static str {
@@ -1000,23 +1010,7 @@ impl ModelResponseStream {
             return;
         }
         if let Ok(mut conversations) = self.conversations.lock() {
-            let pending_tool_calls = turn
-                .outputs
-                .iter()
-                .filter_map(|output| match output {
-                    ModelOutput::ToolCall(call) => Some(PendingToolCall {
-                        id: call.provider_call_id.clone()?,
-                        name: call.name.clone(),
-                        arguments: serde_json::to_string(&call.arguments).ok()?,
-                    }),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            if pending_tool_calls.is_empty() {
-                conversations.remove(&self.task_id);
-            } else {
-                conversations.insert(self.task_id, ConversationState { pending_tool_calls });
-            }
+            append_tool_calls(&mut conversations, self.task_id, &turn);
         }
         self.done = true;
         self.queue.push_back(Ok(ModelStreamEvent::Completed(turn)));

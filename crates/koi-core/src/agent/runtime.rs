@@ -48,6 +48,18 @@ where
         &self.projection
     }
 
+    /// 读取当前任务的完整事件流。
+    ///
+    /// Agent 恢复、审批绑定和调度器重启恢复都必须以持久化事件为准，不能只依赖运行时
+    /// 内存中的投影。
+    ///
+    /// # Errors
+    ///
+    /// 当底层事件存储读取失败时返回错误。
+    pub async fn load_events(&self) -> Result<Vec<EventEnvelope>, RuntimeError> {
+        Ok(self.store.load_task(self.projection.task_id).await?)
+    }
+
     /// 取得底层事件存储的所有权，常用于完成任务后重建或迁移运行时。
     #[must_use]
     pub fn into_store(self) -> S {
@@ -84,7 +96,7 @@ where
                 self.projection.task_id,
             ));
         }
-        let event = EventEnvelope {
+        let mut event = EventEnvelope {
             id: crate::domain::EventId::new(),
             task_id: self.projection.task_id,
             sequence: self.projection.last_sequence.saturating_add(1),
@@ -95,10 +107,43 @@ where
             payload,
         };
 
-        self.store.append(&event).await?;
-        self.projection.apply(&event)?;
+        match self.store.append(&event).await {
+            Ok(()) => self.projection.apply(&event)?,
+            Err(error) if is_sequence_conflict(&error) => {
+                // 外部来源可能在 Agent 思考期间追加了输入。用持久化事件流刷新投影后重试
+                // 一次，避免长时间模型调用与来源写入之间产生不可恢复的序号竞争。
+                self.refresh_projection().await?;
+                event = EventEnvelope {
+                    id: crate::domain::EventId::new(),
+                    task_id: self.projection.task_id,
+                    sequence: self.projection.last_sequence.saturating_add(1),
+                    occurred_at: Utc::now(),
+                    recorded_at: Utc::now(),
+                    causation_id: event.causation_id,
+                    provenance: event.provenance.clone(),
+                    payload: event.payload.clone(),
+                };
+                self.store.append(&event).await?;
+                self.projection.apply(&event)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
         Ok(event)
     }
+
+    async fn refresh_projection(&mut self) -> Result<(), RuntimeError> {
+        let events = self.store.load_task(self.projection.task_id).await?;
+        let mut projection = TaskProjection::new(self.projection.task_id);
+        for event in &events {
+            projection.apply(event)?;
+        }
+        self.projection = projection;
+        Ok(())
+    }
+}
+
+fn is_sequence_conflict(error: &EventStoreError) -> bool {
+    error.message.contains("序号") || error.message.contains("sequence")
 }
 
 fn payload_is_child_task_management_operation(payload: &AgentEvent, task_id: TaskId) -> bool {

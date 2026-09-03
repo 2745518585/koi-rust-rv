@@ -4,7 +4,9 @@ use futures_util::StreamExt;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{InputInjectionError, InputInjector, RuntimeError, TaskRuntime};
+use crate::agent::{
+    InputInjectionError, InputInjector, RuntimeError, RuntimeRecoveryError, TaskRuntime,
+};
 use crate::domain::{
     AgentEvent, AuthorizationRequest, AuthorizationRequestResult, AuthorizedToolInvocation,
     ControlEvent, EventId, MemoryContextBuilder, MemoryQuery, ModelContextItem, ModelError,
@@ -136,6 +138,116 @@ impl<'a> AgentLoop<'a> {
         self.run_internal(runtime, request, cancel, true).await
     }
 
+    /// 在来源方已经写入审批结果后恢复一个等待授权的任务。
+    ///
+    /// 恢复时只接受任务事件流中已经存在的 `ApprovalSubmitted` 事件，并从该事件反查
+    /// `ApprovalRequested -> Tool::Proposed`。调用方不能直接提交工具参数、权限或提议事件
+    /// 来替换原始调用；恢复后的工具调用仍会经过完整的权限检查。
+    ///
+    /// # Errors
+    ///
+    /// 当任务状态、审批绑定、事件读取或后续 Agent 执行失败时返回错误。
+    pub async fn resume_after_approval<S>(
+        &self,
+        runtime: &mut TaskRuntime<S>,
+        request: AgentRunRequest,
+        approval_submission_event_id: EventId,
+        cancel: CancellationToken,
+    ) -> Result<AgentRunOutcome, AgentLoopError>
+    where
+        S: EventStore,
+    {
+        request.validate()?;
+        if runtime.projection().status != TaskStatus::WaitingApproval {
+            return Err(AgentLoopError::TaskNotWaitingApproval(
+                runtime.projection().status,
+            ));
+        }
+
+        let task_id = runtime.projection().task_id;
+        let events = runtime.load_events().await?;
+        let binding = approval_binding(&events, approval_submission_event_id)?;
+
+        let mut context = self.build_initial_context(task_id, &request).await?;
+        let available_evidence = context
+            .iter()
+            .map(|item| item.event_id)
+            .collect::<HashSet<_>>();
+        if binding
+            .tool_call
+            .authority_parent_event_id
+            .is_some_and(|event_id| !available_evidence.contains(&event_id))
+        {
+            return Err(AgentLoopError::InvalidApproval(
+                "原始工具提议引用了当前上下文之外的授权证据".into(),
+            ));
+        }
+
+        let Some(definition) = self.tools.get_definition(&binding.tool_call.name) else {
+            return Err(AgentLoopError::InvalidApproval(
+                "原始工具已经不再注册".into(),
+            ));
+        };
+        if !binding.tool_call.arguments.is_object() {
+            return Err(AgentLoopError::InvalidApproval(
+                "原始工具参数不是 JSON 对象".into(),
+            ));
+        }
+
+        let original_evidence = self
+            .resolve_evidence(task_id, binding.proposal_event_id)
+            .await;
+        let tool_outcome = if binding.approved {
+            let authorization = self
+                .resolve_authority_chain(task_id, binding.approval_submission_event_id)
+                .await
+                .filter(|evidence| {
+                    evidence.approval_request_event_id == Some(binding.approval_request_event_id)
+                });
+            let mut all_evidence = original_evidence;
+            if let Some(authorization) = authorization {
+                all_evidence.push(authorization);
+            }
+            match PermissionChecker::check(&definition, &all_evidence) {
+                PermissionCheckResult::Allowed {
+                    effective_permission,
+                    evidence_event_ids,
+                } => {
+                    self.execute_tool(
+                        runtime,
+                        ExecutionFlow {
+                            proposal_event_id: binding.proposal_event_id,
+                            causation_id: binding.approval_submission_event_id,
+                            tool_call: binding.tool_call,
+                            effective_permission,
+                            evidence_event_ids,
+                        },
+                        cancel.clone(),
+                    )
+                    .await?
+                }
+                PermissionCheckResult::Insufficient { .. } => {
+                    self.deny_tool(runtime, binding.proposal_event_id, "审批事件未提供足够权限")
+                        .await?
+                }
+            }
+        } else {
+            self.deny_tool(runtime, binding.proposal_event_id, "来源方拒绝了工具调用")
+                .await?
+        };
+
+        match tool_outcome {
+            ToolHandlingOutcome::Continue(tool_context) => context.push(tool_context),
+            ToolHandlingOutcome::AwaitingAuthorization(_) => {
+                return Err(AgentLoopError::InvalidApproval(
+                    "审批恢复不应再次进入等待授权状态".into(),
+                ));
+            }
+        }
+        self.run_turns(runtime, request, cancel, false, context)
+            .await
+    }
+
     async fn run_internal<S>(
         &self,
         runtime: &mut TaskRuntime<S>,
@@ -150,13 +262,28 @@ impl<'a> AgentLoop<'a> {
         let status = runtime.projection().status;
         if status == TaskStatus::New {
             self.prepare_task(runtime, request.trigger_event_id).await?;
-        } else if !is_main_session || status.is_terminal() {
+        } else if status.is_terminal() || (!is_main_session && status != TaskStatus::Queued) {
             return Err(AgentLoopError::TaskNotNew(runtime.projection().status));
         }
-        let mut context = self
+        let context = self
             .build_initial_context(runtime.projection().task_id, &request)
             .await?;
 
+        self.run_turns(runtime, request, cancel, is_main_session, context)
+            .await
+    }
+
+    async fn run_turns<S>(
+        &self,
+        runtime: &mut TaskRuntime<S>,
+        request: AgentRunRequest,
+        cancel: CancellationToken,
+        is_main_session: bool,
+        mut context: Vec<ModelContextItem>,
+    ) -> Result<AgentRunOutcome, AgentLoopError>
+    where
+        S: EventStore,
+    {
         let mut final_text = Vec::new();
         for _ in 0..request.max_model_turns {
             if cancel.is_cancelled() {
@@ -814,6 +941,141 @@ struct ExecutionFlow {
     evidence_event_ids: Vec<EventId>,
 }
 
+struct ApprovalBinding {
+    approval_submission_event_id: EventId,
+    approval_request_event_id: EventId,
+    proposal_event_id: EventId,
+    approved: bool,
+    tool_call: ToolCall,
+}
+
+fn approval_binding(
+    events: &[crate::domain::EventEnvelope],
+    approval_submission_event_id: EventId,
+) -> Result<ApprovalBinding, AgentLoopError> {
+    let approval_request_event_id = approval_submission(events, approval_submission_event_id)?;
+    let proposal_event_id = approval_proposal(events, approval_request_event_id)?;
+    let tool_call = proposed_tool_call(events, proposal_event_id)?;
+    Ok(ApprovalBinding {
+        approval_submission_event_id,
+        approval_request_event_id,
+        proposal_event_id,
+        approved: approval_submission_approved(events, approval_submission_event_id)?,
+        tool_call,
+    })
+}
+
+fn approval_submission(
+    events: &[crate::domain::EventEnvelope],
+    approval_submission_event_id: EventId,
+) -> Result<EventId, AgentLoopError> {
+    let event = events
+        .iter()
+        .find(|event| event.id == approval_submission_event_id)
+        .ok_or(AgentLoopError::ApprovalEventNotFound(
+            approval_submission_event_id,
+        ))?;
+    let AgentEvent::Ingress(ingress) = &event.payload else {
+        return Err(AgentLoopError::InvalidApproval(
+            "指定事件不是审批提交事件".into(),
+        ));
+    };
+    match ingress.as_ref() {
+        crate::domain::IngressEvent::ApprovalSubmitted {
+            approval_request_event_id,
+            ..
+        } => {
+            let latest_approval_request = events.iter().rev().find_map(|event| {
+                let AgentEvent::Tool(tool) = &event.payload else {
+                    return None;
+                };
+                match tool.as_ref() {
+                    ToolEvent::ApprovalRequested { .. } => Some(event.id),
+                    _ => None,
+                }
+            });
+            if latest_approval_request != Some(*approval_request_event_id) {
+                return Err(AgentLoopError::InvalidApproval(
+                    "审批提交没有绑定当前等待中的授权请求".into(),
+                ));
+            }
+            Ok(*approval_request_event_id)
+        }
+        _ => Err(AgentLoopError::InvalidApproval(
+            "指定事件不是审批提交事件".into(),
+        )),
+    }
+}
+
+fn approval_submission_approved(
+    events: &[crate::domain::EventEnvelope],
+    approval_submission_event_id: EventId,
+) -> Result<bool, AgentLoopError> {
+    let event = events
+        .iter()
+        .find(|event| event.id == approval_submission_event_id)
+        .ok_or(AgentLoopError::ApprovalEventNotFound(
+            approval_submission_event_id,
+        ))?;
+    let AgentEvent::Ingress(ingress) = &event.payload else {
+        return Err(AgentLoopError::InvalidApproval(
+            "指定事件不是审批提交事件".into(),
+        ));
+    };
+    match ingress.as_ref() {
+        crate::domain::IngressEvent::ApprovalSubmitted { approved, .. } => Ok(*approved),
+        _ => Err(AgentLoopError::InvalidApproval(
+            "指定事件不是审批提交事件".into(),
+        )),
+    }
+}
+
+fn approval_proposal(
+    events: &[crate::domain::EventEnvelope],
+    approval_request_event_id: EventId,
+) -> Result<EventId, AgentLoopError> {
+    events
+        .iter()
+        .find_map(|event| {
+            if event.id != approval_request_event_id {
+                return None;
+            }
+            let AgentEvent::Tool(tool) = &event.payload else {
+                return None;
+            };
+            match tool.as_ref() {
+                ToolEvent::ApprovalRequested { proposal_event_id } => Some(*proposal_event_id),
+                _ => None,
+            }
+        })
+        .ok_or(AgentLoopError::InvalidApproval(
+            "授权请求事件不存在或类型不正确".into(),
+        ))
+}
+
+fn proposed_tool_call(
+    events: &[crate::domain::EventEnvelope],
+    proposal_event_id: EventId,
+) -> Result<ToolCall, AgentLoopError> {
+    events
+        .iter()
+        .find_map(|event| {
+            if event.id != proposal_event_id {
+                return None;
+            }
+            let AgentEvent::Tool(tool) = &event.payload else {
+                return None;
+            };
+            match tool.as_ref() {
+                ToolEvent::Proposed { tool_call } => Some(tool_call.clone()),
+                _ => None,
+            }
+        })
+        .ok_or(AgentLoopError::InvalidApproval(
+            "授权请求对应的工具提议不存在".into(),
+        ))
+}
+
 fn unique_sources(evidence: &[crate::domain::AuthorizationEvidence]) -> Vec<String> {
     let mut sources = HashSet::new();
     evidence
@@ -853,6 +1115,8 @@ pub enum AgentLoopError {
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
     #[error(transparent)]
+    RuntimeRecovery(#[from] RuntimeRecoveryError),
+    #[error(transparent)]
     ModelRequest(#[from] crate::domain::ModelRequestValidationError),
     #[error(transparent)]
     Memory(#[from] MemoryError),
@@ -864,6 +1128,12 @@ pub enum AgentLoopError {
     InputInjection(#[from] InputInjectionError),
     #[error("任务必须处于 New 状态，当前为 {0:?}")]
     TaskNotNew(TaskStatus),
+    #[error("任务必须处于 WaitingApproval 状态，当前为 {0:?}")]
+    TaskNotWaitingApproval(TaskStatus),
+    #[error("审批事件不存在：{0}")]
+    ApprovalEventNotFound(EventId),
+    #[error("审批事件无效：{0}")]
+    InvalidApproval(String),
     #[error("模型流在完成前结束")]
     ModelStreamEndedWithoutCompletion,
     #[error("模型调用被取消")]

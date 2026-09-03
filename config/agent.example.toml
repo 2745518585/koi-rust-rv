@@ -17,6 +17,7 @@ max_retries = 2
 [model]
 base_url = "https://api.openai.com/v1"
 name = "gpt-5-mini"
+protocol = "responses" # responses 或 chat_completions；学校接口可切换为 chat_completions
 request_timeout_secs = 60
 max_context_messages = 32
 reasoning_effort = "medium"

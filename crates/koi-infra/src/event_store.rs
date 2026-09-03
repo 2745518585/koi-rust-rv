@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use koi_core::domain::{EventEnvelope, EventId, TaskId};
 use koi_core::ports::{EventStore, EventStoreError};
+use tokio::sync::broadcast;
 
 /// 每个任务一个 JSON Lines 文件的本地事件存储。
 ///
@@ -14,6 +15,7 @@ use koi_core::ports::{EventStore, EventStoreError};
 pub struct JsonlEventStore {
     directory: PathBuf,
     write_lock: Mutex<()>,
+    events: broadcast::Sender<EventEnvelope>,
 }
 
 impl JsonlEventStore {
@@ -25,10 +27,18 @@ impl JsonlEventStore {
     pub fn open(directory: impl Into<PathBuf>) -> Result<Self, EventStoreError> {
         let directory = directory.into();
         fs::create_dir_all(&directory).map_err(|error| io_error(&error))?;
+        let (events, _) = broadcast::channel(1024);
         Ok(Self {
             directory,
             write_lock: Mutex::new(()),
+            events,
         })
+    }
+
+    /// 订阅所有成功持久化的事件，用于向 Web UI 或其他本地观察者转发运行时进展。
+    #[must_use]
+    pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
+        self.events.subscribe()
     }
 
     /// Returns every task stream currently persisted in this local store.
@@ -120,7 +130,9 @@ impl EventStore for JsonlEventStore {
             .open(path)
             .map_err(|error| io_error(&error))?;
         writeln!(file, "{serialized}").map_err(|error| io_error(&error))?;
-        file.sync_data().map_err(|error| io_error(&error))
+        file.sync_data().map_err(|error| io_error(&error))?;
+        let _ = self.events.send(event.clone());
+        Ok(())
     }
 
     async fn load_task(&self, task_id: TaskId) -> Result<Vec<EventEnvelope>, EventStoreError> {

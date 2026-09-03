@@ -102,6 +102,14 @@ impl KoiWebSource {
         });
     }
 
+    /// 将非 Web 适配器产生的核心事件转发给 Web UI。
+    ///
+    /// Web 自己写入的输入事件仍由命令方法直接发布；后台 Agent 事件由事件存储订阅器
+    /// 调用此方法发布，避免把 UI 推送逻辑耦合进核心循环。
+    pub fn publish_event(&self, event: &EventEnvelope) {
+        self.publish(event);
+    }
+
     /// Creates the core-facing authorization capability for this source. The provider is
     /// intentionally asynchronous: it announces a pending Web confirmation and waits for the
     /// normal Web approval command to append a bound ingress event.
@@ -500,7 +508,11 @@ impl WebCommandPort for KoiWebSource {
         let kind = match command.kind {
             WebContextKind::UserMessage => ContextKind::UserMessage,
             WebContextKind::Alert => ContextKind::Alert,
-            WebContextKind::AssistantMessage => ContextKind::AssistantMessage,
+            WebContextKind::AssistantMessage => {
+                return Err(WebApiError::validation(
+                    "Web 来源不能伪造 assistant 上下文；模型输出由核心事件流产生",
+                ));
+            }
         };
         let recorded = self
             .record_context(

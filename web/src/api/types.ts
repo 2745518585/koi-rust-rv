@@ -82,6 +82,16 @@ export interface ApprovalRequest {
   requester: string;
 }
 
+export interface AuthorizationNotification {
+  taskId: string;
+  approvalRequestEventId: string;
+  toolProposalEventId: string;
+  toolName: string;
+  argumentsHash: string;
+  requiredPermission: PermissionLevel;
+  originalEvidenceEventIds: string[];
+}
+
 export interface ToolDefinition {
   name: string;
   description: string;
@@ -129,4 +139,5 @@ export interface ApprovalSubmission {
 export type StreamEvent =
   | { type: "task.updated"; task: TaskSummary }
   | { type: "event.appended"; event: TaskEvent }
-  | { type: "approval.updated"; approval: ApprovalRequest };
+  | { type: "approval.updated"; approval: ApprovalRequest }
+  | { type: "authorization.requested"; request: AuthorizationNotification };

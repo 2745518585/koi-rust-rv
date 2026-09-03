@@ -73,7 +73,7 @@ pub struct WebUserDto {
 }
 
 /// Authentication result kept inside the transport boundary. Its opaque session token is emitted
-/// only as an HttpOnly cookie; event sources and core code receive just `WebPrincipal`.
+/// only as an `HttpOnly` cookie; event sources and core code receive just `WebPrincipal`.
 #[derive(Clone, Debug)]
 pub struct WebSession {
     pub token: String,
@@ -84,9 +84,29 @@ pub struct WebSession {
 /// Credential-system port implemented by infrastructure. It keeps password verification and
 /// account storage out of HTTP routes and ensures the resulting subject is the core identity.
 pub trait WebIdentityProvider: Send + Sync {
+    /// 注册一个 Web 用户。
+    ///
+    /// # Errors
+    ///
+    /// 当用户信息非法或账户已经存在时返回错误。
     fn register(&self, command: RegisterUserCommand) -> Result<WebSession, WebApiError>;
+    /// 登录一个 Web 用户。
+    ///
+    /// # Errors
+    ///
+    /// 当凭据无效或账户不可用时返回错误。
     fn login(&self, command: LoginCommand) -> Result<WebSession, WebApiError>;
+    /// 使用会话令牌恢复登录状态。
+    ///
+    /// # Errors
+    ///
+    /// 当令牌无效、过期或会话不存在时返回错误。
     fn authenticate_session(&self, token: &str) -> Result<WebSession, WebApiError>;
+    /// 使用管理访问令牌创建会话。
+    ///
+    /// # Errors
+    ///
+    /// 当令牌无效或访问令牌未配置时返回错误。
     fn authenticate_bearer(&self, token: &str) -> Result<WebSession, WebApiError>;
 }
 
@@ -452,11 +472,8 @@ impl WebAuth {
             })
     }
 
-    fn session_cookie(&self, token: &str) -> String {
-        format!(
-            "{WEB_SESSION_COOKIE}={}; HttpOnly; Path=/; SameSite=Strict; Max-Age=28800",
-            token
-        )
+    fn session_cookie(token: &str) -> String {
+        format!("{WEB_SESSION_COOKIE}={token}; HttpOnly; Path=/; SameSite=Strict; Max-Age=28800")
     }
 }
 
@@ -486,7 +503,6 @@ struct HttpState {
 }
 
 /// Builds the versioned Axum API router. Static file hosting remains the application's concern.
-#[must_use]
 pub fn router(api: Arc<dyn WebApi>, auth: WebAuth) -> Router {
     Router::new()
         .route("/healthz", get(health))
@@ -535,8 +551,8 @@ struct SessionDto {
     user: WebUserDto,
 }
 
-fn session_response(state: &HttpState, session: WebSession) -> Result<Response, ApiError> {
-    let cookie = HeaderValue::from_str(&state.auth.session_cookie(&session.token))
+fn session_response(_state: &HttpState, session: WebSession) -> Result<Response, ApiError> {
+    let cookie = HeaderValue::from_str(&WebAuth::session_cookie(&session.token))
         .map_err(|_| ApiError::bad_request("无法创建 Web 会话 Cookie"))?;
     let mut response = Json(ApiEnvelope {
         data: SessionDto { user: session.user },
@@ -739,7 +755,7 @@ async fn event_stream(
                         };
                         return Some((Ok::<Event, Infallible>(event), receiver));
                     }
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => return None,
                 }
             }

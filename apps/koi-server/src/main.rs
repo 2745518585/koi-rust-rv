@@ -3,16 +3,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use koi_api::{WebApi, WebAuth};
+use koi_core::domain::{EventSource, ModelGenerationOptions, ModelProtocol};
 use koi_core::ports::{SourceAuthorizationRegistry, ToolRegistry};
 use koi_infra::event_store::JsonlEventStore;
+use koi_infra::llm::{OpenAiCompatibleModelConfig, OpenAiCompatibleModelProvider};
 use koi_infra::tools::ToolPolicy;
 use koi_infra::web_identity::WebUserStore;
 use koi_infra::web_source::KoiWebSource;
 use serde::Deserialize;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
+mod agent_runtime;
 mod prompts;
 
 #[derive(Debug, Deserialize)]
@@ -20,6 +24,8 @@ mod prompts;
 struct RuntimeConfig {
     server: ServerConfig,
     security: ToolPolicy,
+    model: ModelConfig,
+    agent: AgentConfig,
     usage: UsageConfig,
 }
 
@@ -28,7 +34,49 @@ impl Default for RuntimeConfig {
         Self {
             server: ServerConfig::default(),
             security: ToolPolicy::default(),
+            model: ModelConfig::default(),
+            agent: AgentConfig::default(),
             usage: UsageConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct ModelConfig {
+    base_url: String,
+    name: String,
+    protocol: String,
+    request_timeout_secs: u64,
+    max_context_messages: usize,
+    reasoning_effort: Option<String>,
+}
+
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "https://api.openai.com/v1".into(),
+            name: "gpt-5-mini".into(),
+            protocol: "responses".into(),
+            request_timeout_secs: 60,
+            max_context_messages: 32,
+            reasoning_effort: Some("medium".into()),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct AgentConfig {
+    max_steps: u16,
+    max_concurrent_tasks: usize,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            max_steps: 8,
+            max_concurrent_tasks: 4,
         }
     }
 }
@@ -84,7 +132,25 @@ async fn run() -> Result<(), ServerError> {
     let mut registry = ToolRegistry::default();
     let registered = koi_infra::tools::register_builtin_tools(&mut registry, config.security)
         .map_err(|error| ServerError::ToolRegistry(error.to_string()))?;
-    let tools = registry.list_definitions();
+    let tools = Arc::new(registry);
+    let tool_definitions = tools.list_definitions();
+
+    let protocol = parse_model_protocol(&config.model.protocol)?;
+    let model_config =
+        OpenAiCompatibleModelConfig::from_env(config.model.base_url, config.model.name)
+            .with_protocol(protocol)
+            .with_request_timeout_secs(config.model.request_timeout_secs);
+    let model = Arc::new(
+        OpenAiCompatibleModelProvider::new(model_config)
+            .map_err(|error| ServerError::ModelProvider(error.to_string()))?,
+    );
+    let model_options = ModelGenerationOptions {
+        reasoning_effort: config
+            .model
+            .reasoning_effort
+            .filter(|effort| !effort.trim().is_empty()),
+        ..ModelGenerationOptions::default()
+    };
 
     let store = Arc::new(
         JsonlEventStore::open(&config.server.event_store_dir)
@@ -96,20 +162,51 @@ async fn run() -> Result<(), ServerError> {
     );
     let source = Arc::new(
         KoiWebSource::new(
-            store,
+            Arc::clone(&store),
             Arc::clone(&identities),
-            tools,
+            tool_definitions,
             config.usage.monthly_budget_usd,
         )
         .map_err(ServerError::WebApi)?,
     );
     let auth = WebAuth::new(identities);
-    // Keep the registered Web provider alive for the server lifetime. The AgentLoop receives this
-    // registry when the model runner is wired in; HTTP routes never fabricate authorization.
-    let mut _authorization_providers = SourceAuthorizationRegistry::default();
-    _authorization_providers
+    let mut authorization_providers = SourceAuthorizationRegistry::default();
+    authorization_providers
         .register(source.authorization_provider())
         .map_err(|error| ServerError::AuthorizationProvider(error.to_string()))?;
+    let authorization_providers = Arc::new(authorization_providers);
+
+    // Web 命令会直接发布自己的输入事件；后台 Agent 产生的模型、工具和系统事件通过
+    // 事件存储订阅器转发，保证刷新页面或重连 SSE 后仍可从存储恢复完整历史。
+    let mut stored_events = store.subscribe();
+    let event_sink = Arc::clone(&source);
+    tokio::spawn(async move {
+        loop {
+            match stored_events.recv().await {
+                Ok(event) if !matches!(event.provenance.creator, EventSource::External(_)) => {
+                    event_sink.publish_event(&event);
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    let supervisor = agent_runtime::AgentSupervisor::new(
+        Arc::clone(&store),
+        model,
+        tools,
+        authorization_providers,
+        Arc::new(prompts),
+        model_options,
+        config.agent.max_steps,
+        config.model.max_context_messages,
+        config.agent.max_concurrent_tasks,
+    );
+    let shutdown = CancellationToken::new();
+    let supervisor_task = tokio::spawn(Arc::clone(&supervisor).run(shutdown.clone()));
+
     let api: Arc<dyn WebApi> = source;
     let api_router = koi_api::router(api, auth).layer(TraceLayer::new_for_http());
 
@@ -134,8 +231,23 @@ async fn run() -> Result<(), ServerError> {
         event_store = %config.server.event_store_dir.display(),
         "koi-server 已启动"
     );
-    let _prompts = prompts;
-    axum::serve(listener, app).await.map_err(ServerError::Serve)
+    let result = tokio::select! {
+        result = axum::serve(listener, app) => result.map_err(ServerError::Serve),
+        result = tokio::signal::ctrl_c() => result.map_err(ServerError::Signal),
+    };
+    shutdown.cancel();
+    let _ = supervisor_task.await;
+    result
+}
+
+fn parse_model_protocol(raw: &str) -> Result<ModelProtocol, ServerError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "responses" => Ok(ModelProtocol::Responses),
+        "chat_completions" | "chat-completions" | "chat" => Ok(ModelProtocol::ChatCompletions),
+        other => Err(ServerError::Configuration(format!(
+            "不支持的模型协议：{other}，可选 responses 或 chat_completions"
+        ))),
+    }
 }
 
 fn load_runtime_config() -> RuntimeConfig {
@@ -176,8 +288,12 @@ enum ServerError {
     WebApi(#[from] koi_api::WebApiError),
     #[error("来源授权 Provider 注册失败：{0}")]
     AuthorizationProvider(String),
+    #[error("模型 Provider 初始化失败：{0}")]
+    ModelProvider(String),
     #[error("监听地址失败：{0}")]
     Bind(#[source] std::io::Error),
     #[error("HTTP 服务异常结束：{0}")]
     Serve(#[source] std::io::Error),
+    #[error("接收关闭信号失败：{0}")]
+    Signal(#[source] std::io::Error),
 }
