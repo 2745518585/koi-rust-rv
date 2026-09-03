@@ -15,8 +15,8 @@ use koi_core::domain::{
 };
 use koi_core::ports::{
     AuthorizationError, AuthorizationEvidenceResolver, EventStore, EventStoreError,
-    ModelEventStream, ModelProvider, SourceAuthorizationProvider, SourceAuthorizationRegistry,
-    ToolExecutor, ToolRegistry,
+    ModelEventStream, ModelProvider, PromptError, PromptTaskKind, SourceAuthorizationProvider,
+    SourceAuthorizationRegistry, SystemPrompt, SystemPromptProvider, ToolExecutor, ToolRegistry,
 };
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -85,6 +85,20 @@ impl ModelProvider for TwoTurnModel {
 
 struct EvidenceResolver {
     ingress_event_id: EventId,
+}
+
+struct TestPromptProvider;
+
+impl SystemPromptProvider for TestPromptProvider {
+    fn prompt_for(&self, task_kind: PromptTaskKind) -> Result<SystemPrompt, PromptError> {
+        Ok(SystemPrompt {
+            content: match task_kind {
+                PromptTaskKind::Main => "主会话提示词",
+                PromptTaskKind::Child => "子任务提示词",
+            }
+            .into(),
+        })
+    }
 }
 
 #[async_trait]
@@ -205,15 +219,14 @@ async fn main_loop_records_model_tool_and_final_response() {
         ingress_event_id: evidence_event_id,
     };
     let providers = SourceAuthorizationRegistry::default();
-    let agent = AgentLoop::new(&model, &tools, &resolver, &providers, None);
+    let prompts = TestPromptProvider;
+    let agent = AgentLoop::new(&model, &tools, &resolver, &providers, None, &prompts);
 
     let outcome = agent
         .run_main(
             &mut runtime,
             AgentRunRequest {
                 trigger_event_id: Some(evidence_event_id),
-                instructions: "你是运维 Agent。".into(),
-                instructions_hash: "test-instructions".into(),
                 context: vec![ModelContextItem {
                     event_id: evidence_event_id,
                     role: ModelInputRole::User,
@@ -300,14 +313,13 @@ async fn main_loop_waits_for_source_authorization_before_privileged_tool_executi
     let resolver = EvidenceResolver {
         ingress_event_id: evidence_event_id,
     };
-    let agent = AgentLoop::new(&model, &tools, &resolver, &providers, None);
+    let prompts = TestPromptProvider;
+    let agent = AgentLoop::new(&model, &tools, &resolver, &providers, None, &prompts);
     let outcome = agent
         .run(
             &mut runtime,
             AgentRunRequest {
                 trigger_event_id: Some(evidence_event_id),
-                instructions: "你是运维 Agent。".into(),
-                instructions_hash: "test-instructions".into(),
                 context: vec![ModelContextItem {
                     event_id: evidence_event_id,
                     role: ModelInputRole::User,

@@ -22,8 +22,6 @@ use crate::ports::{
 pub struct AgentRunRequest {
     /// 触发本任务的已持久化输入事件；用于审计任务创建原因。
     pub trigger_event_id: Option<EventId>,
-    pub instructions: String,
-    pub instructions_hash: String,
     /// 调用方已持久化并筛选好的当前上下文，模型只能引用其中的事件作为证据。
     pub context: Vec<ModelContextItem>,
     /// 需要由核心检查后注入的已持久化输入事件。
@@ -37,11 +35,8 @@ pub struct AgentRunRequest {
 impl AgentRunRequest {
     /// # Errors
     ///
-    /// 当系统指令为空、最大模型轮数为零或记忆查询不合法时返回错误。
+    /// 当最大模型轮数为零或记忆查询不合法时返回错误。
     pub fn validate(&self) -> Result<(), AgentRunRequestError> {
-        if self.instructions.trim().is_empty() {
-            return Err(AgentRunRequestError::EmptyInstructions);
-        }
         if self.max_model_turns == 0 {
             return Err(AgentRunRequestError::ZeroModelTurns);
         }
@@ -54,8 +49,6 @@ impl AgentRunRequest {
 
 #[derive(Debug, Error)]
 pub enum AgentRunRequestError {
-    #[error("系统指令不能为空")]
-    EmptyInstructions,
     #[error("最大模型轮数必须大于零")]
     ZeroModelTurns,
     #[error(transparent)]
@@ -77,6 +70,7 @@ pub struct AgentLoop<'a> {
     evidence_resolver: &'a dyn AuthorizationEvidenceResolver,
     authorization_providers: &'a SourceAuthorizationRegistry,
     memory: Option<&'a dyn MemoryStore>,
+    prompts: &'a dyn crate::ports::SystemPromptProvider,
 }
 
 impl<'a> AgentLoop<'a> {
@@ -87,6 +81,7 @@ impl<'a> AgentLoop<'a> {
         evidence_resolver: &'a dyn AuthorizationEvidenceResolver,
         authorization_providers: &'a SourceAuthorizationRegistry,
         memory: Option<&'a dyn MemoryStore>,
+        prompts: &'a dyn crate::ports::SystemPromptProvider,
     ) -> Self {
         Self {
             model,
@@ -94,6 +89,7 @@ impl<'a> AgentLoop<'a> {
             evidence_resolver,
             authorization_providers,
             memory,
+            prompts,
         }
     }
 
@@ -286,10 +282,16 @@ impl<'a> AgentLoop<'a> {
     where
         S: EventStore,
     {
+        let prompt = self
+            .prompts
+            .prompt_for(crate::ports::PromptTaskKind::for_task(
+                runtime.projection().task_id,
+            ))?;
+        prompt.validate()?;
         let model_request = ModelRequest {
             task_id: runtime.projection().task_id,
-            instructions: request.instructions.clone(),
-            instructions_hash: request.instructions_hash.clone(),
+            instructions_hash: fingerprint(&prompt.content)?,
+            instructions: prompt.content,
             context: context.to_vec(),
             tools: self.model_tools(),
             output_contract: request.output_contract.clone(),
@@ -854,6 +856,8 @@ pub enum AgentLoopError {
     ModelRequest(#[from] crate::domain::ModelRequestValidationError),
     #[error(transparent)]
     Memory(#[from] MemoryError),
+    #[error(transparent)]
+    Prompt(#[from] crate::ports::PromptError),
     #[error(transparent)]
     Serialization(#[from] serde_json::Error),
     #[error(transparent)]
