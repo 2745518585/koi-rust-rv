@@ -485,6 +485,21 @@ pub enum ToolEvent {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TaskOperation {
     CreateChild,
+    /// 为子任务设置稳定显示名称。
+    NameChild {
+        task_id: TaskId,
+        name: String,
+    },
+    /// 删除一个已终止的子任务事件流；运行中的任务必须先取消。
+    DeleteChild {
+        task_id: TaskId,
+        reason: String,
+    },
+    /// 由主会话向子任务投递一条控制事件。
+    ControlChild {
+        task_id: TaskId,
+        control: Box<ControlEvent>,
+    },
     ResumeChild {
         task_id: TaskId,
     },
@@ -503,7 +518,10 @@ impl TaskOperation {
     pub const fn target_task_id(&self) -> Option<TaskId> {
         match self {
             Self::CreateChild => None,
-            Self::ResumeChild { task_id }
+            Self::NameChild { task_id, .. }
+            | Self::DeleteChild { task_id, .. }
+            | Self::ControlChild { task_id, .. }
+            | Self::ResumeChild { task_id }
             | Self::CancelChild { task_id, .. }
             | Self::DeliverChildResult { task_id, .. } => Some(*task_id),
         }
@@ -520,6 +538,10 @@ pub enum ControlEvent {
         reason: String,
     },
     TaskResumed,
+    /// 为任务设置稳定显示名称；只能由任务管理操作写入。
+    TaskNamed {
+        name: String,
+    },
     /// 修改任务后续控制指令所需的最低权限。
     MinimumControlPermissionChanged {
         minimum_permission: PermissionLevel,

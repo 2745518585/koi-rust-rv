@@ -80,6 +80,7 @@ pub(crate) fn definition(
         side_effect,
         timeout_ms,
         model_visible,
+        main_session_only: false,
     }
 }
 

@@ -157,7 +157,7 @@ impl StatusTool {
                 side_effect: ToolSideEffect::ReadOnly,
                 timeout_ms: 1_000,
                 model_visible: true,
-            },
+                main_session_only: false,            },
             calls: AtomicUsize::new(0),
         }
     }
@@ -342,4 +342,158 @@ async fn main_loop_waits_for_source_authorization_before_privileged_tool_executi
         AgentRunOutcome::AwaitingAuthorization { .. }
     ));
     assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+}
+
+struct TaskStartModel {
+    evidence_event_id: EventId,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl ModelProvider for TaskStartModel {
+    fn descriptor(&self) -> ModelProviderDescriptor {
+        ModelProviderDescriptor {
+            provider: "test".into(),
+            model: "test-model".into(),
+            protocol: ModelProtocol::Responses,
+            capabilities: ModelCapabilities::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        _request: ModelRequest,
+        _cancel: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::pin(stream::iter(vec![Ok(ModelStreamEvent::Completed(
+            koi_core::domain::ModelTurn {
+                outputs: vec![ModelOutput::ToolCall(ToolCall {
+                    name: "task.start".into(),
+                    arguments: json!({"message": "巡检磁盘空间并汇报"}),
+                    provider_call_id: Some("call-task-1".into()),
+                    authority_parent_event_id: Some(self.evidence_event_id),
+                })],
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cached_input_tokens: None,
+                    reasoning_tokens: None,
+                },
+                provider_response_id: None,
+            },
+        ))])))
+    }
+}
+
+#[tokio::test]
+async fn main_session_task_start_creates_child_and_returns_pending_external() {
+    use koi_core::agent::TaskManager;
+    use koi_core::domain::{ControlEvent, IngressEvent, ToolEvent};
+
+    let evidence_event_id = EventId::new();
+    let model = TaskStartModel {
+        evidence_event_id,
+        calls: AtomicUsize::new(0),
+    };
+    let mut tools = ToolRegistry::default();
+    let registered = koi_core::agent::task_tools::register_task_management_tools(&mut tools)
+        .expect("任务管理工具注册失败");
+    assert_eq!(registered, 4);
+
+    let store = MemoryEventStore::default();
+    let events = Arc::clone(&store.events);
+    let manager = TaskManager::new(Arc::new(store.clone()));
+    let mut runtime = TaskRuntime::new(store, TaskId::MAIN);
+    let resolver = EvidenceResolver {
+        ingress_event_id: evidence_event_id,
+    };
+    let providers = SourceAuthorizationRegistry::default();
+    let prompts = TestPromptProvider;
+    let agent =
+        AgentLoop::new(&model, &tools, &resolver, &providers, None, &prompts)
+            .with_task_manager(&manager);
+
+    let outcome = agent
+        .run_main(
+            &mut runtime,
+            AgentRunRequest {
+                trigger_event_id: Some(evidence_event_id),
+                context: vec![ModelContextItem {
+                    event_id: evidence_event_id,
+                    role: ModelInputRole::User,
+                    content: "巡检磁盘".into(),
+                    permission: PermissionLevel::User,
+                }],
+                input_events: vec![],
+                memory_query: None,
+                output_contract: ModelOutputContract::Text,
+                model_options: ModelGenerationOptions::default(),
+                max_model_turns: 3,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let AgentRunOutcome::StartedChildTask { task_id } = outcome else {
+        panic!("task.start 应使本轮以 StartedChildTask 结束");
+    };
+    assert_ne!(task_id, TaskId::MAIN);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+
+    let recorded = events.lock().await;
+    // 主会话流必须留有跨任务创建审计，并且 Started 的 causation 指向 Accepted 事件。
+    let accepted = recorded
+        .iter()
+        .find_map(|event| match &event.payload {
+            AgentEvent::Control(control) => match control.as_ref() {
+                ControlEvent::TaskOperationAccepted {
+                    target_task_id, ..
+                } if *target_task_id == task_id => Some(event.id),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("主会话流必须记录跨任务创建的接受事件");
+    let started = recorded
+        .iter()
+        .find(|event| {
+            matches!(
+                &event.payload,
+                AgentEvent::Tool(tool) if matches!(tool.as_ref(), ToolEvent::Started { .. })
+            )
+        })
+        .expect("主会话流必须记录 task.start 的 Started 事件");
+    assert_eq!(started.causation_id, Some(accepted));
+    assert_eq!(started.task_id, TaskId::MAIN);
+    // fail-closed 的桩执行器不应被直接调用：不允许出现 Failed 工具事件。
+    assert!(!recorded.iter().any(|event| matches!(
+        &event.payload,
+        AgentEvent::Tool(tool) if matches!(tool.as_ref(), ToolEvent::Failed { .. })
+    )));
+
+    // 子任务流：TaskCreated(trigger=accepted) -> TaskQueued -> 首条输入（System 记录）。
+    let child_events: Vec<&EventEnvelope> = recorded
+        .iter()
+        .filter(|event| event.task_id == task_id)
+        .collect();
+    assert_eq!(child_events.len(), 3);
+    let ControlEvent::TaskCreated {
+        trigger_event_id: Some(trigger),
+    } = (match &child_events[0].payload {
+        AgentEvent::Control(control) => control.as_ref(),
+        _ => panic!("子任务首事件必须是 TaskCreated"),
+    }) else {
+        panic!("子任务 TaskCreated 必须绑定主会话 task.start 审计事件");
+    };
+    assert_eq!(*trigger, accepted);
+    assert!(
+        matches!(&child_events[1].payload, AgentEvent::Control(control) if matches!(control.as_ref(), ControlEvent::TaskQueued))
+    );
+    assert!(
+        matches!(&child_events[2].payload, AgentEvent::Ingress(ingress) if matches!(ingress.as_ref(), IngressEvent::ContextReceived { .. }))
+    );
+    // 子任务尚未运行：不应有任何模型事件。
+    assert!(child_events.iter().all(|event| !matches!(event.payload, AgentEvent::Model(_))));
 }

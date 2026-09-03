@@ -58,6 +58,8 @@ pub struct TaskProjection {
     pub status: TaskStatus,
     /// 外部控制指令生效所需的最低权限，不影响工具调用权限。
     pub minimum_control_permission: super::PermissionLevel,
+    /// 由任务管理操作设置的稳定显示名称；为空时由调用方按事件流推断。
+    pub title: Option<String>,
     pub last_sequence: u64,
     pub last_event_id: Option<EventId>,
     pub usage: UsageTotals,
@@ -71,6 +73,7 @@ impl TaskProjection {
             task_id,
             status: TaskStatus::New,
             minimum_control_permission: super::PermissionLevel::User,
+            title: None,
             last_sequence: 0,
             last_event_id: None,
             usage: UsageTotals::default(),
@@ -117,6 +120,9 @@ impl TaskProjection {
                 ControlEvent::TaskQueued => self.transition(TaskStatus::Queued)?,
                 ControlEvent::TaskPaused { .. } => self.transition(TaskStatus::Paused)?,
                 ControlEvent::TaskResumed => self.transition(TaskStatus::Running)?,
+                ControlEvent::TaskNamed { name } => {
+                    self.title = Some(name.clone());
+                }
                 ControlEvent::MinimumControlPermissionChanged { minimum_permission } => {
                     self.minimum_control_permission = *minimum_permission;
                 }

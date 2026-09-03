@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use koi_core::agent::{
     AgentLoop, AgentRunOutcome, AgentRunRequest, PersistedAuthorizationEvidenceResolver,
-    TaskRuntime,
+    TaskManager, TaskRuntime,
 };
 use koi_core::domain::{
-    AgentEvent, EventEnvelope, IngressEvent, ModelGenerationOptions, ModelOutputContract, TaskId,
-    TaskStatus, ToolEvent,
+    AgentEvent, EventEnvelope, IngressEvent, ModelContextItem, ModelGenerationOptions,
+    ModelInputRole, ModelOutputContract, TaskId, TaskStatus, ToolEvent,
 };
 use koi_core::ports::{
     EventStore, ModelProvider, SourceAuthorizationRegistry, SystemPromptProvider, ToolRegistry,
@@ -26,13 +26,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// 进程内的最小 Agent 运行器。
 ///
 /// 当前版本按事件存储轮询任务，适合课程作业和单进程部署。事件存储仍是唯一事实来源，
-/// 因此服务重启后可以重新扫描 `Queued` 或等待审批的任务继续运行。
+/// 因此服务重启后可以重新扫描 `Queued` 或等待审批的任务继续运行。主会话由本运行器
+/// 调度：收到新输入或子任务回传的工具结果时继续运行；子任务结果通过 `TaskManager`
+/// 回传为主会话中的工具事件。
 pub struct AgentSupervisor {
     store: Arc<JsonlEventStore>,
     model: Arc<dyn ModelProvider>,
     tools: Arc<ToolRegistry>,
     authorization_providers: Arc<SourceAuthorizationRegistry>,
     prompts: Arc<dyn SystemPromptProvider>,
+    task_manager: Arc<TaskManager<Arc<JsonlEventStore>>>,
     model_options: ModelGenerationOptions,
     max_model_turns: u16,
     max_context_messages: usize,
@@ -49,6 +52,7 @@ impl AgentSupervisor {
         tools: Arc<ToolRegistry>,
         authorization_providers: Arc<SourceAuthorizationRegistry>,
         prompts: Arc<dyn SystemPromptProvider>,
+        task_manager: Arc<TaskManager<Arc<JsonlEventStore>>>,
         model_options: ModelGenerationOptions,
         max_model_turns: u16,
         max_context_messages: usize,
@@ -60,6 +64,7 @@ impl AgentSupervisor {
             tools,
             authorization_providers,
             prompts,
+            task_manager,
             model_options,
             max_model_turns: max_model_turns.max(1),
             max_context_messages: max_context_messages.max(1),
@@ -109,28 +114,53 @@ impl AgentSupervisor {
             };
             match runtime.projection().status {
                 TaskStatus::New | TaskStatus::Queued => {
-                    if !task_id.is_main() {
-                        let input_events = context_events(&events, self.max_context_messages);
-                        // Web 建任务会先写入生命周期事件，再写入首条输入；没有输入时不应
-                        // 让模型凭空启动，也避免与仍在提交首条输入的请求竞争事件序号。
-                        if !input_events.is_empty() {
+                    let input_events = context_events(&events, self.max_context_messages);
+                    // Web/工具建任务会先写入生命周期事件，再写入首条输入；没有输入时不
+                    // 应让模型凭空启动，也避免与仍在提交首条输入的请求竞争事件序号。
+                    if !input_events.is_empty() {
+                        if task_id.is_main() {
+                            self.spawn_main(task_id, input_events, Vec::new());
+                        } else {
                             self.spawn_initial(task_id, input_events);
                         }
                     }
                 }
+                TaskStatus::Running if task_id.is_main() && !self.is_active(task_id) => {
+                    // 主会话持续存在：新输入或子任务回传的工具结果都会唤醒一次续跑。
+                    let input_events = context_events(&events, self.max_context_messages);
+                    let tool_results = pending_tool_results(&events);
+                    if !input_events.is_empty() || !tool_results.is_empty() {
+                        self.spawn_main(task_id, input_events, tool_results);
+                    }
+                }
                 TaskStatus::WaitingApproval => {
                     if let Some(approval_event_id) = completed_approval(&events) {
-                        self.spawn_resume(
-                            task_id,
-                            approval_event_id,
-                            context_events(&events, self.max_context_messages),
-                        );
+                        if task_id.is_main() {
+                            self.spawn_main_resume(
+                                task_id,
+                                approval_event_id,
+                                context_events(&events, self.max_context_messages),
+                            );
+                        } else {
+                            self.spawn_resume(
+                                task_id,
+                                approval_event_id,
+                                context_events(&events, self.max_context_messages),
+                            );
+                        }
                     }
                 }
                 TaskStatus::Cancelling if !self.is_active(task_id) => {
                     self.finish_cancelling(task_id).await;
                 }
                 _ => {}
+            }
+
+            if !task_id.is_main()
+                && runtime.projection().status.is_terminal()
+                && !self.is_active(task_id)
+            {
+                self.deliver_child_result(task_id).await;
             }
         }
     }
@@ -178,6 +208,84 @@ impl AgentSupervisor {
         });
     }
 
+    /// 启动一次主会话运行（初始或续跑）；结果回传触发的续跑携带预构建的工具上下文。
+    fn spawn_main(
+        self: &Arc<Self>,
+        task_id: TaskId,
+        input_events: Vec<EventEnvelope>,
+        tool_results: Vec<ModelContextItem>,
+    ) {
+        let Some(cancel) = self.try_start(task_id) else {
+            return;
+        };
+        let supervisor = Arc::clone(self);
+        tokio::spawn(async move {
+            let result = supervisor
+                .execute_main(task_id, input_events, tool_results, cancel)
+                .await;
+            match result {
+                Ok(outcome) => {
+                    if let AgentRunOutcome::StartedChildTask { task_id } = outcome {
+                        tracing::info!(%task_id, "主会话已启动子任务，等待结果回传");
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%task_id, %error, "主会话运行失败");
+                    supervisor
+                        .fail_task_if_needed(task_id, error.to_string())
+                        .await;
+                }
+            }
+            supervisor.finish(task_id);
+        });
+    }
+
+    fn spawn_main_resume(
+        self: &Arc<Self>,
+        task_id: TaskId,
+        approval_event_id: koi_core::domain::EventId,
+        input_events: Vec<EventEnvelope>,
+    ) {
+        let Some(cancel) = self.try_start(task_id) else {
+            return;
+        };
+        let supervisor = Arc::clone(self);
+        tokio::spawn(async move {
+            let result = supervisor
+                .execute_main_resume(task_id, approval_event_id, input_events, cancel)
+                .await;
+            if let Err(error) = result {
+                tracing::error!(%task_id, %error, "主会话审批后的恢复失败");
+                supervisor
+                    .fail_task_if_needed(task_id, error.to_string())
+                    .await;
+            }
+            supervisor.finish(task_id);
+        });
+    }
+
+    fn build_agent<'a>(
+        &'a self,
+        resolver: &'a PersistedAuthorizationEvidenceResolver<'a, JsonlEventStore>,
+    ) -> AgentLoop<'a, Arc<JsonlEventStore>> {
+        AgentLoop::new(
+            self.model.as_ref(),
+            self.tools.as_ref(),
+            resolver,
+            self.authorization_providers.as_ref(),
+            None,
+            self.prompts.as_ref(),
+        )
+    }
+
+    fn build_main_agent<'a>(
+        &'a self,
+        resolver: &'a PersistedAuthorizationEvidenceResolver<'a, JsonlEventStore>,
+    ) -> AgentLoop<'a, Arc<JsonlEventStore>> {
+        self.build_agent(resolver)
+            .with_task_manager(self.task_manager.as_ref())
+    }
+
     async fn execute_initial(
         &self,
         task_id: TaskId,
@@ -188,16 +296,8 @@ impl AgentSupervisor {
             .await
             .map_err(koi_core::agent::AgentLoopError::from)?;
         let resolver = PersistedAuthorizationEvidenceResolver::new(self.store.as_ref());
-        let agent = AgentLoop::new(
-            self.model.as_ref(),
-            self.tools.as_ref(),
-            &resolver,
-            self.authorization_providers.as_ref(),
-            None,
-            self.prompts.as_ref(),
-        );
-        agent
-            .run(&mut runtime, self.request(input_events), cancel)
+        self.build_agent(&resolver)
+            .run(&mut runtime, self.request(input_events, Vec::new()), cancel)
             .await
     }
 
@@ -212,22 +312,81 @@ impl AgentSupervisor {
             .await
             .map_err(koi_core::agent::AgentLoopError::from)?;
         let resolver = PersistedAuthorizationEvidenceResolver::new(self.store.as_ref());
-        let agent = AgentLoop::new(
-            self.model.as_ref(),
-            self.tools.as_ref(),
-            &resolver,
-            self.authorization_providers.as_ref(),
-            None,
-            self.prompts.as_ref(),
-        );
-        agent
+        self.build_agent(&resolver)
             .resume_after_approval(
                 &mut runtime,
-                self.request(input_events),
+                self.request(input_events, Vec::new()),
                 approval_event_id,
                 cancel,
             )
             .await
+    }
+
+    async fn execute_main(
+        &self,
+        task_id: TaskId,
+        input_events: Vec<EventEnvelope>,
+        tool_results: Vec<ModelContextItem>,
+        cancel: CancellationToken,
+    ) -> Result<AgentRunOutcome, koi_core::agent::AgentLoopError> {
+        let mut runtime = TaskRuntime::recover(Arc::clone(&self.store), task_id)
+            .await
+            .map_err(koi_core::agent::AgentLoopError::from)?;
+        let resolver = PersistedAuthorizationEvidenceResolver::new(self.store.as_ref());
+        self.build_main_agent(&resolver)
+            .run_main(&mut runtime, self.request(input_events, tool_results), cancel)
+            .await
+    }
+
+    async fn execute_main_resume(
+        &self,
+        task_id: TaskId,
+        approval_event_id: koi_core::domain::EventId,
+        input_events: Vec<EventEnvelope>,
+        cancel: CancellationToken,
+    ) -> Result<AgentRunOutcome, koi_core::agent::AgentLoopError> {
+        let mut runtime = TaskRuntime::recover(Arc::clone(&self.store), task_id)
+            .await
+            .map_err(koi_core::agent::AgentLoopError::from)?;
+        let resolver = PersistedAuthorizationEvidenceResolver::new(self.store.as_ref());
+        self.build_main_agent(&resolver)
+            .resume_after_approval(
+                &mut runtime,
+                self.request(input_events, Vec::new()),
+                approval_event_id,
+                cancel,
+            )
+            .await
+    }
+
+    /// 将已终止子任务的最终输出回传为主会话事件流中的工具事件。
+    ///
+    /// 回传只对通过 `task.start` 启动的子任务生效（依据子任务 `TaskCreated` 中的触发
+    /// 事件绑定）；方法本身幂等，重复调用不会产生重复的工具结果。
+    async fn deliver_child_result(&self, task_id: TaskId) {
+        let Ok(mut main) = TaskRuntime::recover(Arc::clone(&self.store), TaskId::MAIN).await else {
+            return;
+        };
+        if main.projection().status.is_terminal() {
+            return;
+        }
+        match self
+            .task_manager
+            .deliver_child_result(&mut main, task_id)
+            .await
+        {
+            Ok(Some(delivered)) => {
+                tracing::info!(
+                    task = %task_id,
+                    finished_event = %delivered.finished_event_id,
+                    "子任务结果已回传为主会话工具事件"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(task = %task_id, %error, "回传子任务结果失败");
+            }
+        }
     }
 
     async fn finish_cancelling(&self, task_id: TaskId) {
@@ -265,10 +424,17 @@ impl AgentSupervisor {
         }
     }
 
-    fn request(&self, input_events: Vec<EventEnvelope>) -> AgentRunRequest {
+    fn request(
+        &self,
+        input_events: Vec<EventEnvelope>,
+        tool_results: Vec<ModelContextItem>,
+    ) -> AgentRunRequest {
         AgentRunRequest {
-            trigger_event_id: input_events.first().map(|event| event.id),
-            context: Vec::new(),
+            trigger_event_id: input_events
+                .first()
+                .map(|event| event.id)
+                .or_else(|| tool_results.first().map(|item| item.event_id)),
+            context: tool_results,
             input_events,
             memory_query: None,
             output_contract: ModelOutputContract::Text,
@@ -328,6 +494,40 @@ fn context_events(events: &[EventEnvelope], limit: usize) -> Vec<EventEnvelope> 
         contexts.drain(..first);
     }
     contexts
+}
+
+/// 主会话续跑时待注入的工具结果上下文。
+///
+/// 只有最近一次模型完成之后新写入的 `ToolEvent::Finished` 才是模型尚未看到的；同一次
+/// 运行内已经继续推理过的工具结果都会被后续的模型完成事件覆盖。
+fn pending_tool_results(events: &[EventEnvelope]) -> Vec<ModelContextItem> {
+    let last_model_completed = events
+        .iter()
+        .rev()
+        .find(|event| {
+            matches!(
+                event.payload,
+                AgentEvent::Model(ref model)
+                    if matches!(model.as_ref(), koi_core::domain::ModelEvent::Completed { .. })
+            )
+        })
+        .map_or(0, |event| event.sequence);
+    events
+        .iter()
+        .filter(|event| event.sequence > last_model_completed)
+        .filter_map(|event| match &event.payload {
+            AgentEvent::Tool(tool) => match tool.as_ref() {
+                ToolEvent::Finished { result, .. } => Some(ModelContextItem {
+                    event_id: event.id,
+                    role: ModelInputRole::Tool,
+                    content: result.summary.clone(),
+                    permission: koi_core::domain::PermissionLevel::None,
+                }),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
 }
 
 fn has_cancellation_request(events: &[EventEnvelope]) -> bool {

@@ -32,6 +32,12 @@ pub struct ToolDefinition {
     pub side_effect: ToolSideEffect,
     pub timeout_ms: u64,
     pub model_visible: bool,
+    /// 仅主会话可见、可调用的任务管理工具。
+    ///
+    /// 这类工具的调用权来自“主会话”这一结构身份，而不是输入事件的权限证据，因此
+    /// 允许 `required_permission` 为 `None`。
+    #[serde(default)]
+    pub main_session_only: bool,
 }
 
 impl ToolDefinition {
@@ -50,7 +56,7 @@ impl ToolDefinition {
         if !self.input_schema.is_object() {
             return Err(ToolDefinitionValidationError::InputSchemaNotObject);
         }
-        if self.required_permission == PermissionLevel::None {
+        if self.required_permission == PermissionLevel::None && !self.main_session_only {
             return Err(ToolDefinitionValidationError::NoRequiredPermission);
         }
         if self.timeout_ms == 0 {

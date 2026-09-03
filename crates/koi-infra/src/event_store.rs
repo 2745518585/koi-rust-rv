@@ -152,6 +152,18 @@ impl EventStore for JsonlEventStore {
             .into_iter()
             .find(|event| event.id == event_id))
     }
+
+    async fn delete_task(&self, task_id: TaskId) -> Result<(), EventStoreError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| EventStoreError::new("事件存储写锁已中毒"))?;
+        let path = self.task_path(task_id);
+        if !path.exists() {
+            return Ok(());
+        }
+        fs::remove_file(&path).map_err(|error| io_error(&error))
+    }
 }
 
 fn validate_task_events(task_id: TaskId, events: &[EventEnvelope]) -> Result<(), EventStoreError> {

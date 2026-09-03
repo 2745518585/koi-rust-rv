@@ -5,14 +5,19 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{
-    InputInjectionError, InputInjector, RuntimeError, RuntimeRecoveryError, TaskRuntime,
+    InputInjectionError, InputInjector, RuntimeError, RuntimeRecoveryError,
+    TaskManager, TaskManagerError, TaskRuntime, TaskStartArguments, TaskToolArgumentsError,
+    parse_task_control, parse_task_delete, parse_task_name, parse_task_start, TASK_CONTROL_TOOL,
+    TASK_DELETE_TOOL, TASK_NAME_TOOL, TASK_START_TOOL,
 };
 use crate::domain::{
     AgentEvent, AuthorizationRequest, AuthorizationRequestResult, AuthorizedToolInvocation,
-    ControlEvent, EventId, MemoryContextBuilder, MemoryQuery, ModelContextItem, ModelError,
-    ModelEvent, ModelGenerationOptions, ModelInputRole, ModelOutput, ModelOutputContract,
-    ModelRequest, ModelStreamEvent, PermissionCheckResult, PermissionChecker, PermissionLevel,
-    PolicyDecision, TaskStatus, ToolCall, ToolEvent, ToolResult,
+    ContextEnvelope, ContextKind, ContextOrigin, ContextPayload, ControlEvent, EventId, EventSource,
+    IngressEvent, MemoryContextBuilder, MemoryQuery, ModelContextItem, ModelError, ModelEvent,
+    ModelGenerationOptions, ModelInputRole, ModelOutput, ModelOutputContract, ModelRequest,
+    ModelStreamEvent, PermissionAssessment, PermissionCheckResult, PermissionChecker,
+    PermissionLevel, PolicyDecision, Scope, TaskId, TaskStatus, ToolCall,
+    ToolDefinition, ToolEvent, ToolResult,
 };
 use crate::ports::{
     AuthorizationEvidenceResolver, EventStore, MemoryError, MemoryStore, ModelProvider,
@@ -62,20 +67,65 @@ pub enum AgentRunRequestError {
 pub enum AgentRunOutcome {
     Completed { response: Option<String> },
     AwaitingAuthorization { approval_request_event_id: EventId },
+    /// 主会话通过 `task.start` 启动了一个子任务；结果将在子任务结束后异步回传。
+    StartedChildTask { task_id: TaskId },
     Cancelled,
 }
 
+/// `task.*` 工具解析后的调度动作。
+enum TaskToolAction {
+    Start(TaskStartArguments),
+    Control {
+        task_id: TaskId,
+        control: ControlEvent,
+    },
+    Name {
+        task_id: TaskId,
+        name: String,
+    },
+    Delete {
+        task_id: TaskId,
+        reason: String,
+    },
+}
+
+/// 按工具名解析任务管理工具参数；未知工具名视为参数错误。
+fn parse_task_tool_action(
+    name: &str,
+    arguments: &serde_json::Value,
+) -> Result<TaskToolAction, TaskToolArgumentsError> {
+    match name {
+        TASK_START_TOOL => parse_task_start(arguments).map(TaskToolAction::Start),
+        TASK_CONTROL_TOOL => parse_task_control(arguments).map(|args| TaskToolAction::Control {
+            task_id: args.task_id,
+            control: args.control,
+        }),
+        TASK_NAME_TOOL => parse_task_name(arguments).map(|args| TaskToolAction::Name {
+            task_id: args.task_id,
+            name: args.name,
+        }),
+        TASK_DELETE_TOOL => parse_task_delete(arguments).map(|args| TaskToolAction::Delete {
+            task_id: args.task_id,
+            reason: args.reason,
+        }),
+        other => Err(TaskToolArgumentsError(format!(
+            "未知任务管理工具：{other}"
+        ))),
+    }
+}
+
 /// 将模型、工具、权限与记忆端口编排为单任务主循环。
-pub struct AgentLoop<'a> {
+pub struct AgentLoop<'a, S: EventStore> {
     model: &'a dyn ModelProvider,
     tools: &'a ToolRegistry,
     evidence_resolver: &'a dyn AuthorizationEvidenceResolver,
     authorization_providers: &'a SourceAuthorizationRegistry,
     memory: Option<&'a dyn MemoryStore>,
     prompts: &'a dyn crate::ports::SystemPromptProvider,
+    task_manager: Option<&'a TaskManager<S>>,
 }
 
-impl<'a> AgentLoop<'a> {
+impl<'a, S: EventStore> AgentLoop<'a, S> {
     #[must_use]
     pub const fn new(
         model: &'a dyn ModelProvider,
@@ -92,7 +142,15 @@ impl<'a> AgentLoop<'a> {
             authorization_providers,
             memory,
             prompts,
+            task_manager: None,
         }
+    }
+
+    /// 绑定任务管理器，使主会话可以使用 `task.*` 管理工具。
+    #[must_use]
+    pub const fn with_task_manager(mut self, task_manager: &'a TaskManager<S>) -> Self {
+        self.task_manager = Some(task_manager);
+        self
     }
 
     /// 运行一个从 `TaskStatus::New` 开始的新任务。
@@ -103,15 +161,12 @@ impl<'a> AgentLoop<'a> {
     /// # Errors
     ///
     /// 当任务状态、请求、事件持久化、模型、记忆或来源授权基础设施发生错误时返回错误。
-    pub async fn run<S>(
+    pub async fn run(
         &self,
         runtime: &mut TaskRuntime<S>,
         request: AgentRunRequest,
         cancel: CancellationToken,
-    ) -> Result<AgentRunOutcome, AgentLoopError>
-    where
-        S: EventStore,
-    {
+    ) -> Result<AgentRunOutcome, AgentLoopError> {
         self.run_internal(runtime, request, cancel, false).await
     }
 
@@ -123,15 +178,12 @@ impl<'a> AgentLoop<'a> {
     /// # Errors
     ///
     /// 当运行时不是主会话、请求非法或底层模型/存储失败时返回错误。
-    pub async fn run_main<S>(
+    pub async fn run_main(
         &self,
         runtime: &mut TaskRuntime<S>,
         request: AgentRunRequest,
         cancel: CancellationToken,
-    ) -> Result<AgentRunOutcome, AgentLoopError>
-    where
-        S: EventStore,
-    {
+    ) -> Result<AgentRunOutcome, AgentLoopError> {
         if !runtime.projection().task_id.is_main() {
             return Err(AgentLoopError::MainTaskRequired);
         }
@@ -147,16 +199,13 @@ impl<'a> AgentLoop<'a> {
     /// # Errors
     ///
     /// 当任务状态、审批绑定、事件读取或后续 Agent 执行失败时返回错误。
-    pub async fn resume_after_approval<S>(
+    pub async fn resume_after_approval(
         &self,
         runtime: &mut TaskRuntime<S>,
         request: AgentRunRequest,
         approval_submission_event_id: EventId,
         cancel: CancellationToken,
-    ) -> Result<AgentRunOutcome, AgentLoopError>
-    where
-        S: EventStore,
-    {
+    ) -> Result<AgentRunOutcome, AgentLoopError> {
         request.validate()?;
         if runtime.projection().status != TaskStatus::WaitingApproval {
             return Err(AgentLoopError::TaskNotWaitingApproval(
@@ -167,6 +216,7 @@ impl<'a> AgentLoop<'a> {
         let task_id = runtime.projection().task_id;
         let events = runtime.load_events().await?;
         let binding = approval_binding(&events, approval_submission_event_id)?;
+        let is_main_session = task_id.is_main();
 
         let mut context = self.build_initial_context(task_id, &request).await?;
         let available_evidence = context
@@ -243,12 +293,17 @@ impl<'a> AgentLoop<'a> {
                     "审批恢复不应再次进入等待授权状态".into(),
                 ));
             }
+            ToolHandlingOutcome::PendingExternal { .. } => {
+                return Err(AgentLoopError::InvalidApproval(
+                    "审批恢复不应启动异步任务工具".into(),
+                ));
+            }
         }
-        self.run_turns(runtime, request, cancel, false, context)
+        self.run_turns(runtime, request, cancel, is_main_session, context)
             .await
     }
 
-    async fn run_internal<S>(
+    async fn run_internal(
         &self,
         runtime: &mut TaskRuntime<S>,
         request: AgentRunRequest,
@@ -273,17 +328,14 @@ impl<'a> AgentLoop<'a> {
             .await
     }
 
-    async fn run_turns<S>(
+    async fn run_turns(
         &self,
         runtime: &mut TaskRuntime<S>,
         request: AgentRunRequest,
         cancel: CancellationToken,
         is_main_session: bool,
         mut context: Vec<ModelContextItem>,
-    ) -> Result<AgentRunOutcome, AgentLoopError>
-    where
-        S: EventStore,
-    {
+    ) -> Result<AgentRunOutcome, AgentLoopError> {
         let mut final_text = Vec::new();
         for _ in 0..request.max_model_turns {
             if cancel.is_cancelled() {
@@ -325,6 +377,7 @@ impl<'a> AgentLoop<'a> {
                 return Ok(AgentRunOutcome::Completed { response });
             }
 
+            let mut started_child_task: Option<TaskId> = None;
             let available_evidence = context.iter().map(|item| item.event_id).collect();
             for tool_call in tool_calls {
                 match self
@@ -343,7 +396,16 @@ impl<'a> AgentLoop<'a> {
                             approval_request_event_id,
                         });
                     }
+                    ToolHandlingOutcome::PendingExternal { task_id } => {
+                        // 子任务结果将在其结束后以工具事件形式回到本会话；同一轮的其余
+                        // 工具调用仍会先执行完毕，其结果在下一次续跑时一并注入。
+                        started_child_task = Some(task_id);
+                    }
                 }
+            }
+
+            if let Some(task_id) = started_child_task {
+                return Ok(AgentRunOutcome::StartedChildTask { task_id });
             }
         }
 
@@ -351,11 +413,13 @@ impl<'a> AgentLoop<'a> {
         Err(AgentLoopError::ModelTurnLimitExceeded)
     }
 
-    fn model_tools(&self) -> Vec<crate::domain::ModelToolDefinition> {
+    fn model_tools(&self, is_main_session: bool) -> Vec<crate::domain::ModelToolDefinition> {
         self.tools
             .list_definitions()
             .into_iter()
-            .filter(|definition| definition.model_visible)
+            .filter(|definition| {
+                definition.model_visible && (!definition.main_session_only || is_main_session)
+            })
             .map(|definition| crate::domain::ModelToolDefinition {
                 name: definition.name,
                 description: definition.description,
@@ -365,14 +429,11 @@ impl<'a> AgentLoop<'a> {
             .collect()
     }
 
-    async fn prepare_task<S>(
+    async fn prepare_task(
         &self,
         runtime: &mut TaskRuntime<S>,
         trigger_event_id: Option<EventId>,
-    ) -> Result<(), AgentLoopError>
-    where
-        S: EventStore,
-    {
+    ) -> Result<(), AgentLoopError> {
         runtime
             .record(
                 AgentEvent::control(ControlEvent::TaskCreated { trigger_event_id }),
@@ -399,16 +460,13 @@ impl<'a> AgentLoop<'a> {
         Ok(context)
     }
 
-    async fn call_model<S>(
+    async fn call_model(
         &self,
         runtime: &mut TaskRuntime<S>,
         request: &AgentRunRequest,
         context: &[ModelContextItem],
         cancel: CancellationToken,
-    ) -> Result<CompletedModel, AgentLoopError>
-    where
-        S: EventStore,
-    {
+    ) -> Result<CompletedModel, AgentLoopError> {
         let prompt = self
             .prompts
             .prompt_for(crate::ports::PromptTaskKind::for_task(
@@ -420,7 +478,7 @@ impl<'a> AgentLoop<'a> {
             instructions_hash: fingerprint(&prompt.content)?,
             instructions: prompt.content,
             context: context.to_vec(),
-            tools: self.model_tools(),
+            tools: self.model_tools(runtime.projection().task_id.is_main()),
             output_contract: request.output_contract.clone(),
             options: request.model_options.clone(),
         };
@@ -476,16 +534,13 @@ impl<'a> AgentLoop<'a> {
         })
     }
 
-    async fn record_model_stream<S>(
+    async fn record_model_stream(
         &self,
         runtime: &mut TaskRuntime<S>,
         mut stream: crate::ports::ModelEventStream,
         call_started_event_id: EventId,
         cancel: CancellationToken,
-    ) -> Result<crate::domain::ModelTurn, AgentLoopError>
-    where
-        S: EventStore,
-    {
+    ) -> Result<crate::domain::ModelTurn, AgentLoopError> {
         while let Some(item) = stream.next().await {
             if cancel.is_cancelled() {
                 self.record_cancelled(runtime, "模型调用已取消").await?;
@@ -517,17 +572,14 @@ impl<'a> AgentLoop<'a> {
         Err(AgentLoopError::ModelStreamEndedWithoutCompletion)
     }
 
-    async fn handle_tool_call<S>(
+    async fn handle_tool_call(
         &self,
         runtime: &mut TaskRuntime<S>,
         tool_call: ToolCall,
         model_completed_event_id: EventId,
         available_evidence: &HashSet<EventId>,
         cancel: CancellationToken,
-    ) -> Result<ToolHandlingOutcome, AgentLoopError>
-    where
-        S: EventStore,
-    {
+    ) -> Result<ToolHandlingOutcome, AgentLoopError> {
         let proposed = runtime
             .record_with_provenance(
                 AgentEvent::tool(ToolEvent::Proposed {
@@ -571,6 +623,17 @@ impl<'a> AgentLoop<'a> {
                 effective_permission,
                 evidence_event_ids,
             } => {
+                if definition.main_session_only {
+                    return self
+                        .execute_task_tool(
+                            runtime,
+                            &definition,
+                            proposed.id,
+                            validated.id,
+                            tool_call,
+                        )
+                        .await;
+                }
                 self.execute_tool(
                     runtime,
                     ExecutionFlow {
@@ -588,40 +651,67 @@ impl<'a> AgentLoop<'a> {
                 effective_permission,
                 required_permission,
             } => {
-                let checked = runtime
-                    .record(
-                        AgentEvent::tool(ToolEvent::AuthorizationChecked {
-                            proposal_event_id: proposed.id,
-                            decision: PolicyDecision::RequireApproval,
-                            effective_permission,
-                            evidence_event_ids: Vec::new(),
-                        }),
-                        Some(validated.id),
-                    )
-                    .await?;
-                let approval_requested = runtime
-                    .record(
-                        AgentEvent::tool(ToolEvent::ApprovalRequested {
-                            proposal_event_id: proposed.id,
-                        }),
-                        Some(checked.id),
-                    )
-                    .await?;
-
-                self.request_authorization(
+                self.begin_approval_flow(
                     runtime,
-                    AuthorizationFlow {
-                        proposal_event_id: proposed.id,
-                        approval_request_event_id: approval_requested.id,
-                        tool_call,
-                        required_permission,
-                        original_evidence: evidence,
-                    },
+                    proposed.id,
+                    validated.id,
+                    tool_call,
+                    evidence,
+                    effective_permission,
+                    required_permission,
                     cancel,
                 )
                 .await
             }
         }
+    }
+
+    /// 记录 `AuthorizationChecked(RequireApproval)` 与 `ApprovalRequested`，
+    /// 然后向来源适配器发起提权请求。
+    #[allow(clippy::too_many_arguments)]
+    async fn begin_approval_flow(
+        &self,
+        runtime: &mut TaskRuntime<S>,
+        proposal_event_id: EventId,
+        validated_event_id: EventId,
+        tool_call: ToolCall,
+        evidence: Vec<crate::domain::AuthorizationEvidence>,
+        effective_permission: PermissionLevel,
+        required_permission: PermissionLevel,
+        cancel: CancellationToken,
+    ) -> Result<ToolHandlingOutcome, AgentLoopError> {
+        let checked = runtime
+            .record(
+                AgentEvent::tool(ToolEvent::AuthorizationChecked {
+                    proposal_event_id,
+                    decision: PolicyDecision::RequireApproval,
+                    effective_permission,
+                    evidence_event_ids: Vec::new(),
+                }),
+                Some(validated_event_id),
+            )
+            .await?;
+        let approval_requested = runtime
+            .record(
+                AgentEvent::tool(ToolEvent::ApprovalRequested {
+                    proposal_event_id,
+                }),
+                Some(checked.id),
+            )
+            .await?;
+
+        self.request_authorization(
+            runtime,
+            AuthorizationFlow {
+                proposal_event_id,
+                approval_request_event_id: approval_requested.id,
+                tool_call,
+                required_permission,
+                original_evidence: evidence,
+            },
+            cancel,
+        )
+        .await
     }
 
     async fn resolve_evidence(
@@ -683,15 +773,12 @@ impl<'a> AgentLoop<'a> {
         None
     }
 
-    async fn request_authorization<S>(
+    async fn request_authorization(
         &self,
         runtime: &mut TaskRuntime<S>,
         flow: AuthorizationFlow,
         cancel: CancellationToken,
-    ) -> Result<ToolHandlingOutcome, AgentLoopError>
-    where
-        S: EventStore,
-    {
+    ) -> Result<ToolHandlingOutcome, AgentLoopError> {
         let task_id = runtime.projection().task_id;
         let mut pending = false;
         for source in unique_sources(&flow.original_evidence) {
@@ -769,15 +856,12 @@ impl<'a> AgentLoop<'a> {
             .await
     }
 
-    async fn execute_tool<S>(
+    async fn execute_tool(
         &self,
         runtime: &mut TaskRuntime<S>,
         flow: ExecutionFlow,
         cancel: CancellationToken,
-    ) -> Result<ToolHandlingOutcome, AgentLoopError>
-    where
-        S: EventStore,
-    {
+    ) -> Result<ToolHandlingOutcome, AgentLoopError> {
         let checked = runtime
             .record(
                 AgentEvent::tool(ToolEvent::AuthorizationChecked {
@@ -844,15 +928,290 @@ impl<'a> AgentLoop<'a> {
         }
     }
 
-    async fn deny_tool<S>(
+    /// 执行主会话专用的任务管理工具。
+    ///
+    /// 所有操作经 `TaskManager` 在主会话事件流中留下 `TaskOperationRequested` 与
+    /// `Accepted/Rejected` 审计事件。`task.start` 在成功后写入绑定 Accepted 事件的
+    /// `ToolEvent::Started`，其结果由核心在子任务结束后以 `ToolEvent::Finished` 回传；
+    /// 其余操作同步完成并立即返回工具结果。
+    async fn execute_task_tool(
+        &self,
+        runtime: &mut TaskRuntime<S>,
+        definition: &ToolDefinition,
+        proposal_event_id: EventId,
+        validated_event_id: EventId,
+        tool_call: ToolCall,
+    ) -> Result<ToolHandlingOutcome, AgentLoopError> {
+        let Some(manager) = self.task_manager else {
+            return self
+                .deny_tool(runtime, proposal_event_id, "任务管理器未配置")
+                .await;
+        };
+        if !runtime.projection().task_id.is_main() {
+            return self
+                .deny_tool(runtime, proposal_event_id, "任务管理工具仅主会话可用")
+                .await;
+        }
+
+        let checked = runtime
+            .record(
+                AgentEvent::tool(ToolEvent::AuthorizationChecked {
+                    proposal_event_id,
+                    decision: PolicyDecision::Allow,
+                    effective_permission: PermissionLevel::None,
+                    evidence_event_ids: Vec::new(),
+                }),
+                Some(validated_event_id),
+            )
+            .await?;
+
+        let action = match parse_task_tool_action(&definition.name, &tool_call.arguments) {
+            Ok(action) => action,
+            Err(error) => {
+                return self
+                    .deny_tool(runtime, proposal_event_id, &error.to_string())
+                    .await;
+            }
+        };
+
+        match action {
+            TaskToolAction::Start(args) => {
+                let mut created = match manager
+                    .request_create_child(runtime, Some(validated_event_id))
+                    .await
+                {
+                    Ok(created) => created,
+                    Err(error) => {
+                        return self
+                            .fail_task_tool(runtime, proposal_event_id, checked.id, &error.to_string())
+                            .await;
+                    }
+                };
+                let started = runtime
+                    .record_with_provenance(
+                        AgentEvent::tool(ToolEvent::Started {
+                            proposal_event_id,
+                        }),
+                        Some(created.accepted_event_id),
+                        crate::domain::EventProvenance::tool(),
+                    )
+                    .await?;
+                self.bootstrap_child_task(&mut created, started.id, args.message)
+                    .await?;
+                Ok(ToolHandlingOutcome::PendingExternal {
+                    task_id: created.task_id,
+                })
+            }
+            TaskToolAction::Control { task_id, control } => {
+                let outcome = manager
+                    .request_control_child(runtime, task_id, control, Some(validated_event_id))
+                    .await
+                    .map(|()| {
+                        (
+                            format!("已向子任务 {task_id} 发送控制事件"),
+                            serde_json::json!({ "task_id": task_id.to_string() }),
+                        )
+                    });
+                self.settle_sync_task_tool(runtime, proposal_event_id, checked.id, outcome)
+                    .await
+            }
+            TaskToolAction::Name { task_id, name } => {
+                let outcome = manager
+                    .request_name_child(runtime, task_id, &name, Some(validated_event_id))
+                    .await
+                    .map(|_| {
+                        (
+                            format!("已将子任务 {task_id} 命名为「{name}」"),
+                            serde_json::json!({ "task_id": task_id.to_string(), "name": name }),
+                        )
+                    });
+                self.settle_sync_task_tool(runtime, proposal_event_id, checked.id, outcome)
+                    .await
+            }
+            TaskToolAction::Delete { task_id, reason } => {
+                let outcome = manager
+                    .request_delete_child(runtime, task_id, reason, Some(validated_event_id))
+                    .await
+                    .map(|()| {
+                        (
+                            format!("已删除子任务 {task_id}"),
+                            serde_json::json!({ "task_id": task_id.to_string() }),
+                        )
+                    });
+                self.settle_sync_task_tool(runtime, proposal_event_id, checked.id, outcome)
+                    .await
+            }
+        }
+    }
+
+    /// 同步任务管理操作的统一收尾：成功记录 `Finished`，失败记录 `Failed`。
+    async fn settle_sync_task_tool(
+        &self,
+        runtime: &mut TaskRuntime<S>,
+        proposal_event_id: EventId,
+        checked_event_id: EventId,
+        outcome: Result<(String, serde_json::Value), TaskManagerError>,
+    ) -> Result<ToolHandlingOutcome, AgentLoopError> {
+        match outcome {
+            Ok((summary, data)) => {
+                self.finish_task_tool(runtime, proposal_event_id, checked_event_id, summary, data)
+                    .await
+            }
+            Err(error) => {
+                self.fail_task_tool(
+                    runtime,
+                    proposal_event_id,
+                    checked_event_id,
+                    &error.to_string(),
+                )
+                .await
+            }
+        }
+    }
+
+    /// 为同步完成的任务管理工具记录 `Started` 与 `Finished` 并返回工具结果上下文。
+    async fn finish_task_tool(
+        &self,
+        runtime: &mut TaskRuntime<S>,
+        proposal_event_id: EventId,
+        checked_event_id: EventId,
+        summary: String,
+        data: serde_json::Value,
+    ) -> Result<ToolHandlingOutcome, AgentLoopError> {
+        let started = runtime
+            .record_with_provenance(
+                AgentEvent::tool(ToolEvent::Started {
+                    proposal_event_id,
+                }),
+                Some(checked_event_id),
+                crate::domain::EventProvenance::tool(),
+            )
+            .await?;
+        let result = ToolResult {
+            summary: summary.clone(),
+            data,
+            truncated: false,
+        };
+        let finished = runtime
+            .record_with_provenance(
+                AgentEvent::tool(ToolEvent::Finished {
+                    execution_started_event_id: started.id,
+                    result: result.clone(),
+                }),
+                Some(started.id),
+                crate::domain::EventProvenance::tool(),
+            )
+            .await?;
+        Ok(ToolHandlingOutcome::Continue(tool_result_context(
+            finished.id,
+            result,
+        )))
+    }
+
+    /// 为被拒绝的任务管理操作记录 `Started` 与 `Failed` 并返回失败上下文。
+    async fn fail_task_tool(
+        &self,
+        runtime: &mut TaskRuntime<S>,
+        proposal_event_id: EventId,
+        checked_event_id: EventId,
+        error: &str,
+    ) -> Result<ToolHandlingOutcome, AgentLoopError> {
+        let started = runtime
+            .record_with_provenance(
+                AgentEvent::tool(ToolEvent::Started {
+                    proposal_event_id,
+                }),
+                Some(checked_event_id),
+                crate::domain::EventProvenance::tool(),
+            )
+            .await?;
+        let failed = runtime
+            .record_with_provenance(
+                AgentEvent::tool(ToolEvent::Failed {
+                    execution_started_event_id: started.id,
+                    error: error.to_owned(),
+                }),
+                Some(started.id),
+                crate::domain::EventProvenance::tool(),
+            )
+            .await?;
+        Ok(ToolHandlingOutcome::Continue(ModelContextItem {
+            event_id: failed.id,
+            role: ModelInputRole::Tool,
+            content: format!("任务管理操作被拒绝：{error}"),
+            permission: PermissionLevel::None,
+        }))
+    }
+
+    /// 为新子任务写入生命周期事件与首条系统指令输入。
+    async fn bootstrap_child_task(
+        &self,
+        created: &mut crate::agent::CreatedChild<S>,
+        started_event_id: EventId,
+        message: String,
+    ) -> Result<(), AgentLoopError> {
+        let child = &mut created.runtime;
+        child
+            .record(
+                AgentEvent::control(ControlEvent::TaskCreated {
+                    trigger_event_id: Some(created.accepted_event_id),
+                }),
+                Some(created.accepted_event_id),
+            )
+            .await?;
+        child
+            .record(AgentEvent::control(ControlEvent::TaskQueued), None)
+            .await?;
+        let now = chrono::Utc::now();
+        let assessment = PermissionAssessment::new(
+            PermissionLevel::None,
+            PermissionLevel::None,
+            PermissionLevel::None,
+        );
+        child
+            .record_with_provenance(
+                AgentEvent::ingress(IngressEvent::ContextReceived {
+                    context: Box::new(ContextEnvelope {
+                        schema_version: 1,
+                        kind: ContextKind::SystemEvent,
+                        origin: ContextOrigin {
+                            source: "internal-task".into(),
+                            source_instance: "main-session".into(),
+                            native_event_id: started_event_id.to_string(),
+                        },
+                        actor: None,
+                        scope: Scope::new("task", created.task_id.to_string()),
+                        occurred_at: now,
+                        received_at: now,
+                        position: None,
+                        permission: PermissionLevel::None,
+                        payload: ContextPayload::Text {
+                            text: message,
+                            mentions: Vec::new(),
+                        },
+                        causation_id: Some(started_event_id),
+                        content_hash: format!("task-start:{started_event_id}"),
+                    }),
+                    assessment,
+                }),
+                Some(started_event_id),
+                crate::domain::EventProvenance {
+                    creator: EventSource::System,
+                    direct_permission: Some(PermissionLevel::None),
+                    authority_parent_event_id: None,
+                    expires_at: None,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn deny_tool(
         &self,
         runtime: &mut TaskRuntime<S>,
         proposal_event_id: EventId,
         reason: &str,
-    ) -> Result<ToolHandlingOutcome, AgentLoopError>
-    where
-        S: EventStore,
-    {
+    ) -> Result<ToolHandlingOutcome, AgentLoopError> {
         let denied = runtime
             .record(
                 AgentEvent::tool(ToolEvent::AuthorizationChecked {
@@ -872,14 +1231,11 @@ impl<'a> AgentLoop<'a> {
         }))
     }
 
-    async fn record_cancelled<S>(
+    async fn record_cancelled(
         &self,
         runtime: &mut TaskRuntime<S>,
         reason: &str,
-    ) -> Result<(), AgentLoopError>
-    where
-        S: EventStore,
-    {
+    ) -> Result<(), AgentLoopError> {
         if !runtime.projection().status.is_terminal() {
             runtime
                 .record(
@@ -893,14 +1249,11 @@ impl<'a> AgentLoop<'a> {
         Ok(())
     }
 
-    async fn record_failed<S>(
+    async fn record_failed(
         &self,
         runtime: &mut TaskRuntime<S>,
         reason: impl Into<String>,
-    ) -> Result<(), AgentLoopError>
-    where
-        S: EventStore,
-    {
+    ) -> Result<(), AgentLoopError> {
         if !runtime.projection().status.is_terminal() {
             runtime
                 .record(
@@ -918,6 +1271,8 @@ impl<'a> AgentLoop<'a> {
 enum ToolHandlingOutcome {
     Continue(ModelContextItem),
     AwaitingAuthorization(EventId),
+    /// 任务管理工具已启动一个子任务；结果在子任务结束后异步回传。
+    PendingExternal { task_id: TaskId },
 }
 
 struct CompletedModel {

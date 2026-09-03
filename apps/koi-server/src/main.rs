@@ -4,8 +4,7 @@ use std::sync::Arc;
 
 use koi_api::{WebApi, WebAuth};
 use koi_core::domain::{EventSource, ModelGenerationOptions, ModelProtocol};
-use koi_core::ports::{SourceAuthorizationRegistry, ToolRegistry};
-use koi_infra::event_store::JsonlEventStore;
+use koi_core::ports::{EventStore, SourceAuthorizationRegistry, ToolRegistry};use koi_infra::event_store::JsonlEventStore;
 use koi_infra::llm::{OpenAiCompatibleModelConfig, OpenAiCompatibleModelProvider};
 use koi_infra::tools::ToolPolicy;
 use koi_infra::web_identity::WebUserStore;
@@ -132,6 +131,8 @@ async fn run() -> Result<(), ServerError> {
     let mut registry = ToolRegistry::default();
     let registered = koi_infra::tools::register_builtin_tools(&mut registry, config.security)
         .map_err(|error| ServerError::ToolRegistry(error.to_string()))?;
+    let task_tools = koi_core::agent::task_tools::register_task_management_tools(&mut registry)
+        .map_err(|error| ServerError::ToolRegistry(error.to_string()))?;
     let tools = Arc::new(registry);
     let tool_definitions = tools.list_definitions();
 
@@ -156,6 +157,14 @@ async fn run() -> Result<(), ServerError> {
         JsonlEventStore::open(&config.server.event_store_dir)
             .map_err(|error| ServerError::EventStore(error.to_string()))?,
     );
+    // 主会话是唯一的跨任务管理入口：启动时初始化其事件流（TaskCreated/TaskQueued），
+    // 之后 Web 与 `task.*` 工具共享同一个任务管理器。
+    bootstrap_main_session(&store)
+        .await
+        .map_err(|error| ServerError::EventStore(error.to_string()))?;
+    let task_manager = Arc::new(koi_core::agent::TaskManager::new(Arc::new(Arc::clone(
+        &store,
+    ))));
     let identities = Arc::new(
         WebUserStore::open(&config.server.user_store_path, web_token)
             .map_err(ServerError::WebApi)?,
@@ -164,6 +173,7 @@ async fn run() -> Result<(), ServerError> {
         KoiWebSource::new(
             Arc::clone(&store),
             Arc::clone(&identities),
+            Arc::clone(&task_manager),
             tool_definitions,
             config.usage.monthly_budget_usd,
         )
@@ -199,6 +209,7 @@ async fn run() -> Result<(), ServerError> {
         tools,
         authorization_providers,
         Arc::new(prompts),
+        task_manager,
         model_options,
         config.agent.max_steps,
         config.model.max_context_messages,
@@ -226,7 +237,7 @@ async fn run() -> Result<(), ServerError> {
     tracing::info!(
         app = koi_core::APP_NAME,
         api_crate = koi_api::CRATE_NAME,
-        tool_count = registered,
+        tool_count = registered + task_tools,
         bind_addr = %config.server.bind_addr,
         event_store = %config.server.event_store_dir.display(),
         "koi-server 已启动"
@@ -248,6 +259,38 @@ fn parse_model_protocol(raw: &str) -> Result<ModelProtocol, ServerError> {
             "不支持的模型协议：{other}，可选 responses 或 chat_completions"
         ))),
     }
+}
+
+/// 若主会话事件流为空，则写入 `TaskCreated` 与 `TaskQueued`，使主会话可以被
+/// Web 输入唤醒并接收 `task.*` 管理工具的审计事件。
+async fn bootstrap_main_session(store: &Arc<JsonlEventStore>) -> Result<(), String> {
+    let events = store
+        .load_task(koi_core::domain::TaskId::MAIN)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !events.is_empty() {
+        return Ok(());
+    }
+    let mut runtime =
+        koi_core::agent::TaskRuntime::new(Arc::clone(store), koi_core::domain::TaskId::MAIN);
+    runtime
+        .record(
+            koi_core::domain::AgentEvent::control(koi_core::domain::ControlEvent::TaskCreated {
+                trigger_event_id: None,
+            }),
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    runtime
+        .record(
+            koi_core::domain::AgentEvent::control(koi_core::domain::ControlEvent::TaskQueued),
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    tracing::info!("已初始化主会话事件流");
+    Ok(())
 }
 
 fn load_runtime_config() -> RuntimeConfig {

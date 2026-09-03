@@ -1,4 +1,4 @@
-use std::sync::Arc;
+﻿use std::sync::Arc;
 
 use async_trait::async_trait;
 use koi_core::domain::{
@@ -21,7 +21,7 @@ fn restart_definition() -> ToolDefinition {
         side_effect: ToolSideEffect::Stateful,
         timeout_ms: 10_000,
         model_visible: true,
-    }
+                main_session_only: false,    }
 }
 
 fn evidence(

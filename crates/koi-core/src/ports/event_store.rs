@@ -58,6 +58,18 @@ pub trait EventStore: Send + Sync {
             .into_iter()
             .find(|event| event.id == event_id))
     }
+
+    /// 删除一个任务的全部事件。
+    ///
+    /// 只有任务管理流程在确认目标已终止后才允许调用。默认实现拒绝删除，保证只支持
+    /// 追加的存储适配器不会静默丢数据。
+    ///
+    /// # Errors
+    ///
+    /// 当存储不支持删除或删除失败时返回错误。
+    async fn delete_task(&self, _task_id: TaskId) -> Result<(), EventStoreError> {
+        Err(EventStoreError::new("事件存储不支持删除任务"))
+    }
 }
 
 /// 允许运行时和任务管理器共享同一个事件存储实例。
@@ -81,6 +93,10 @@ where
     ) -> Result<Option<EventEnvelope>, EventStoreError> {
         self.as_ref().load_event(task_id, event_id).await
     }
+
+    async fn delete_task(&self, task_id: TaskId) -> Result<(), EventStoreError> {
+        self.as_ref().delete_task(task_id).await
+    }
 }
 
 /// 用于本地开发和测试的进程内事件存储。
@@ -101,6 +117,19 @@ impl InMemoryEventStore {
             .lock()
             .map_err(|_| EventStoreError::new("内存事件存储锁已中毒"))?;
         Ok(events.get(&task_id).map_or(0, Vec::len))
+    }
+
+    /// 列出当前持有事件流的任务，主要用于测试与诊断。
+    #[must_use]
+    pub fn known_tasks(&self) -> Vec<TaskId> {
+        self.events
+            .lock()
+            .map(|events| {
+                let mut task_ids = events.keys().copied().collect::<Vec<_>>();
+                task_ids.sort_by_cached_key(ToString::to_string);
+                task_ids
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -134,5 +163,14 @@ impl EventStore for InMemoryEventStore {
             .lock()
             .map_err(|_| EventStoreError::new("内存事件存储锁已中毒"))?;
         Ok(events.get(&task_id).cloned().unwrap_or_default())
+    }
+
+    async fn delete_task(&self, task_id: TaskId) -> Result<(), EventStoreError> {
+        let mut events = self
+            .events
+            .lock()
+            .map_err(|_| EventStoreError::new("内存事件存储锁已中毒"))?;
+        events.remove(&task_id);
+        Ok(())
     }
 }

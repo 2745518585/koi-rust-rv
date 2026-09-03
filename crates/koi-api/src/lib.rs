@@ -13,7 +13,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::stream;
 use koi_core::domain::{EventId, PermissionLevel, TaskId};
@@ -160,6 +160,21 @@ pub struct TaskControlCommand {
     pub minimum_permission: Option<PermissionLevel>,
 }
 
+/// Request body for naming an existing (non-main) task session.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NameTaskCommand {
+    pub name: String,
+}
+
+/// Result of deleting a terminal task session and its event stream.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletedTaskDto {
+    pub task_id: String,
+    pub deleted: bool,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskControlAction {
@@ -218,6 +233,21 @@ pub trait WebCommandPort: Send + Sync {
         task_id: TaskId,
         command: TaskControlCommand,
     ) -> Result<TaskDto, WebApiError>;
+
+    /// Set a stable display name on a task session. The main session cannot be named.
+    async fn name_task(
+        &self,
+        principal: WebPrincipal,
+        task_id: TaskId,
+        command: NameTaskCommand,
+    ) -> Result<TaskDto, WebApiError>;
+
+    /// Delete a terminal task session and its event stream. The main session cannot be deleted.
+    async fn delete_task(
+        &self,
+        principal: WebPrincipal,
+        task_id: TaskId,
+    ) -> Result<DeletedTaskDto, WebApiError>;
 }
 
 /// Event delivery responsibility. Events are immutable projections of core event envelopes.
@@ -317,6 +347,8 @@ pub struct ToolDto {
     pub side_effect: String,
     pub timeout_ms: u64,
     pub model_visible: bool,
+    #[serde(default)]
+    pub main_session_only: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -397,6 +429,12 @@ impl WebApiError {
     #[must_use]
     pub fn validation(message: impl Into<String>) -> Self {
         Self::Validation(message.into())
+    }
+
+    /// 503-style failure for dependencies that exist but are not ready (e.g. the main session
+    /// stream has not been bootstrapped yet).
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::Unavailable(message.into())
     }
     #[must_use]
     pub fn not_found(message: impl Into<String>) -> Self {
@@ -521,6 +559,8 @@ pub fn router(api: Arc<dyn WebApi>, auth: WebAuth) -> Router {
             post(request_cancellation),
         )
         .route("/api/v1/tasks/{task_id}/controls", post(control_task))
+        .route("/api/v1/tasks/{task_id}/name", post(name_task))
+        .route("/api/v1/tasks/{task_id}", delete(delete_task))
         .route(
             "/api/v1/approvals/{approval_request_event_id}",
             post(submit_approval),
@@ -717,6 +757,37 @@ async fn control_task(
         data: state
             .api
             .control_task(principal, parse_task_id(&task_id)?, command)
+            .await
+            .map_err(ApiError::from)?,
+    }))
+}
+
+async fn name_task(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+    Json(command): Json<NameTaskCommand>,
+) -> Result<Json<ApiEnvelope<TaskDto>>, ApiError> {
+    let principal = state.auth.authenticate(&headers)?;
+    Ok(Json(ApiEnvelope {
+        data: state
+            .api
+            .name_task(principal, parse_task_id(&task_id)?, command)
+            .await
+            .map_err(ApiError::from)?,
+    }))
+}
+
+async fn delete_task(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+) -> Result<Json<ApiEnvelope<DeletedTaskDto>>, ApiError> {
+    let principal = state.auth.authenticate(&headers)?;
+    Ok(Json(ApiEnvelope {
+        data: state
+            .api
+            .delete_task(principal, parse_task_id(&task_id)?)
             .await
             .map_err(ApiError::from)?,
     }))
