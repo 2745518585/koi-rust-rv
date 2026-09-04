@@ -5,8 +5,8 @@ target
 data/
 .env
 .env.*
-!.env.example
-!.env.*.example
+config/agent.toml
+config/persona.toml
 node_modules/
 web/dist/
 coverage/

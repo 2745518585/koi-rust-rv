@@ -109,6 +109,10 @@ pub trait WebIdentityProvider: Send + Sync {
     /// 当令牌无效或访问令牌未配置时返回错误。
     fn authenticate_bearer(&self, token: &str) -> Result<WebSession, WebApiError>;
     /// 使当前不透明会话令牌立即失效。
+    ///
+    /// # Errors
+    ///
+    /// 当令牌无效或会话不存在时返回错误。
     fn logout(&self, token: &str) -> Result<(), WebApiError>;
 }
 
@@ -160,6 +164,8 @@ pub struct TaskControlCommand {
     pub action: TaskControlAction,
     pub reason: Option<String>,
     pub minimum_permission: Option<PermissionLevel>,
+    pub provider: Option<String>,
+    pub model_id: Option<String>,
 }
 
 /// Request body for naming an existing (non-main) task session.
@@ -183,6 +189,7 @@ pub enum TaskControlAction {
     Pause,
     Resume,
     Cancel,
+    SelectModel,
     SetMinimumPermission,
 }
 
@@ -283,6 +290,13 @@ pub struct UsageDto {
     pub reasoning_tokens: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSelectionDto {
+    pub provider: String,
+    pub model_id: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskDto {
@@ -297,6 +311,7 @@ pub struct TaskDto {
     pub last_event_kind: String,
     pub last_event_summary: String,
     pub minimum_control_permission: String,
+    pub selected_model: Option<ModelSelectionDto>,
     pub usage: UsageDto,
     pub event_count: usize,
 }
@@ -395,6 +410,8 @@ pub struct DashboardDto {
     pub approvals: Vec<ApprovalDto>,
     pub recent_events: Vec<EventDto>,
     pub tools: Vec<ToolDto>,
+    pub models: Vec<ModelSelectionDto>,
+    pub default_model: Option<ModelSelectionDto>,
     pub usage: UsageSummaryDto,
 }
 
@@ -523,7 +540,7 @@ impl WebAuth {
     }
 
     fn session_cookie(&self, token: &str) -> String {
-        let secure = self.secure_cookie.then_some("; Secure").unwrap_or_default();
+        let secure = if self.secure_cookie { "; Secure" } else { "" };
         format!(
             "{WEB_SESSION_COOKIE}={token}; HttpOnly; Path=/; SameSite=Strict; Max-Age=28800{secure}"
         )
@@ -659,11 +676,11 @@ async fn logout(State(state): State<HttpState>, headers: HeaderMap) -> Result<Re
         .identities
         .logout(token)
         .map_err(ApiError::from)?;
-    let secure = state
-        .auth
-        .secure_cookie
-        .then_some("; Secure")
-        .unwrap_or_default();
+    let secure = if state.auth.secure_cookie {
+        "; Secure"
+    } else {
+        ""
+    };
     let cookie = HeaderValue::from_str(&format!(
         "{WEB_SESSION_COOKIE}=; HttpOnly; Path=/; SameSite=Strict; Max-Age=0{secure}"
     ))

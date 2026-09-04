@@ -14,8 +14,9 @@ use futures_util::stream::{self, BoxStream};
 use koi_core::domain::{
     EventId, ModelCapabilities, ModelCapability, ModelContextItem, ModelDeltaKind, ModelError,
     ModelErrorKind, ModelGenerationOptions, ModelInputRole, ModelOutput, ModelOutputContract,
-    ModelProtocol, ModelProviderDescriptor, ModelRequest, ModelStreamEvent, ModelToolDefinition,
-    ModelTurn, TaskId, ToolCall, Usage,
+    ModelProtocol, ModelProviderDescriptor, ModelRequest, ModelSelection,
+    ModelSelectionValidationError, ModelStreamEvent, ModelToolDefinition, ModelTurn, TaskId,
+    ToolCall, Usage, validate_model_id, validate_model_provider, validate_model_selection,
 };
 use koi_core::ports::{ModelEventStream, ModelProvider};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
@@ -24,24 +25,24 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-const DEFAULT_MODEL: &str = "gpt-5-mini";
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 4 * 1024 * 1024;
 const AUTHORITY_PARENT_FIELD: &str = "__koi_authority_parent_event_id";
-const AUTHORITY_PARENT_DESCRIPTION: &str = "授权此调用的 KOI_CONTEXT event_id；无可用授权事件时必须传 null，不能编造。";
+const AUTHORITY_PARENT_DESCRIPTION: &str =
+    "授权此调用的 KOI_CONTEXT event_id；无可用授权事件时必须传 null，不能编造。";
 
 /// Configuration for an OpenAI-compatible model endpoint.
 ///
 /// `api_key` is optional so local OpenAI-compatible gateways can be used without an
-/// Authorization header.  A deployed server should normally obtain it from
-/// `KOI_LLM_API_KEY`, rather than putting it in a TOML file.
+/// Authorization header. The server loads it from the local TOML runtime configuration;
+/// it is never part of the model identity.
 #[derive(Clone)]
 pub struct OpenAiCompatibleModelConfig {
+    pub provider: String,
     pub base_url: String,
-    pub model: String,
+    pub model_id: String,
     pub api_key: Option<String>,
     pub protocol: ModelProtocol,
     pub request_timeout_secs: u64,
@@ -51,8 +52,9 @@ impl fmt::Debug for OpenAiCompatibleModelConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("OpenAiCompatibleModelConfig")
+            .field("provider", &self.provider)
             .field("base_url", &self.base_url)
-            .field("model", &self.model)
+            .field("model_id", &self.model_id)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("protocol", &self.protocol)
             .field("request_timeout_secs", &self.request_timeout_secs)
@@ -60,44 +62,23 @@ impl fmt::Debug for OpenAiCompatibleModelConfig {
     }
 }
 
-impl Default for OpenAiCompatibleModelConfig {
-    fn default() -> Self {
-        Self {
-            base_url: DEFAULT_BASE_URL.into(),
-            model: DEFAULT_MODEL.into(),
-            api_key: None,
-            protocol: ModelProtocol::Responses,
-            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-        }
-    }
-}
-
 impl OpenAiCompatibleModelConfig {
     /// Creates a Responses API configuration with an optional API key.
     #[must_use]
     pub fn new(
+        provider: impl Into<String>,
         base_url: impl Into<String>,
-        model: impl Into<String>,
+        model_id: impl Into<String>,
         api_key: Option<String>,
     ) -> Self {
         Self {
+            provider: provider.into(),
             base_url: base_url.into(),
-            model: model.into(),
+            model_id: model_id.into(),
             api_key,
-            ..Self::default()
+            protocol: ModelProtocol::Responses,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
         }
-    }
-
-    /// Reads the optional API key from `KOI_LLM_API_KEY`.
-    #[must_use]
-    pub fn from_env(base_url: impl Into<String>, model: impl Into<String>) -> Self {
-        Self::new(
-            base_url,
-            model,
-            std::env::var("KOI_LLM_API_KEY")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
-        )
     }
 
     #[must_use]
@@ -119,9 +100,13 @@ impl OpenAiCompatibleModelConfig {
     }
 
     fn validate(&self) -> Result<Url, ModelProviderConfigError> {
-        if self.model.trim().is_empty() {
+        validate_model_provider(&self.provider)
+            .map_err(|error| ModelProviderConfigError::InvalidProvider(error.to_string()))?;
+        if self.model_id.trim().is_empty() {
             return Err(ModelProviderConfigError::EmptyModel);
         }
+        validate_model_id(&self.model_id)
+            .map_err(|error| ModelProviderConfigError::InvalidModelId(error.to_string()))?;
         if self.request_timeout_secs == 0 {
             return Err(ModelProviderConfigError::ZeroRequestTimeout);
         }
@@ -164,8 +149,12 @@ impl OpenAiCompatibleModelConfig {
 /// Errors found before a model request can be sent.
 #[derive(Debug, Error)]
 pub enum ModelProviderConfigError {
-    #[error("模型名称不能为空")]
+    #[error("模型供应商无效：{0}")]
+    InvalidProvider(String),
+    #[error("模型 ID 不能为空")]
     EmptyModel,
+    #[error("模型 ID 无效：{0}")]
+    InvalidModelId(String),
     #[error("模型请求超时时间必须大于零")]
     ZeroRequestTimeout,
     #[error("模型 API key 不能为空")]
@@ -239,14 +228,21 @@ impl OpenAiCompatibleModelProvider {
         &self.config
     }
 
+    /// Drops provider-local tool continuation state for a task.
+    pub fn reset_task(&self, task_id: TaskId) {
+        if let Ok(mut conversations) = self.conversations.lock() {
+            conversations.remove(&task_id);
+        }
+    }
+
     fn request_body(&self, request: &ModelRequest) -> Result<Value, ModelError> {
         let pending_tool_calls = self.conversation_snapshot(request.task_id)?;
         match self.config.protocol {
             ModelProtocol::Responses => {
-                build_responses_request(&self.config.model, request, pending_tool_calls)
+                build_responses_request(&self.config.model_id, request, pending_tool_calls)
             }
             ModelProtocol::ChatCompletions => {
-                build_chat_request(&self.config.model, request, pending_tool_calls)
+                build_chat_request(&self.config.model_id, request, pending_tool_calls)
             }
         }
     }
@@ -276,8 +272,8 @@ impl OpenAiCompatibleModelProvider {
 impl ModelProvider for OpenAiCompatibleModelProvider {
     fn descriptor(&self) -> ModelProviderDescriptor {
         ModelProviderDescriptor {
-            provider: "openai-compatible".into(),
-            model: self.config.model.clone(),
+            provider: self.config.provider.clone(),
+            model_id: self.config.model_id.clone(),
             protocol: self.config.protocol,
             capabilities: ModelCapabilities::new([
                 ModelCapability::Streaming,
@@ -357,6 +353,171 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             Ok(ModelStreamEvent::Completed(turn))
         })))
     }
+
+    fn reset_task(&self, task_id: TaskId) {
+        OpenAiCompatibleModelProvider::reset_task(self, task_id);
+    }
+}
+
+/// Runtime settings associated with one configured model selection.
+#[derive(Clone)]
+pub struct ModelProviderEntry {
+    pub provider: Arc<dyn ModelProvider>,
+    pub model_options: ModelGenerationOptions,
+    pub max_context_messages: usize,
+}
+
+impl ModelProviderEntry {
+    #[must_use]
+    pub fn new(
+        provider: Arc<dyn ModelProvider>,
+        model_options: ModelGenerationOptions,
+        max_context_messages: usize,
+    ) -> Self {
+        Self {
+            provider,
+            model_options,
+            max_context_messages: max_context_messages.max(1),
+        }
+    }
+}
+
+/// Registry of the models available to the running server.
+///
+/// A registry key is the provider/model pair supplied by the vendor. No application-owned alias
+/// is introduced, so identical vendor model IDs can coexist when they come from different
+/// providers.
+pub struct ModelProviderRegistry {
+    default_model: ModelSelection,
+    providers: BTreeMap<ModelSelection, ModelProviderEntry>,
+}
+
+#[derive(Debug, Error)]
+pub enum ModelRegistryError {
+    #[error("供应商模型标识无效：{0}")]
+    InvalidModelSelection(#[from] ModelSelectionValidationError),
+    #[error("供应商模型已注册：{0}")]
+    DuplicateModel(ModelSelection),
+    #[error("供应商模型未配置：{0}")]
+    UnknownModel(ModelSelection),
+    #[error("默认供应商模型未配置：{0}")]
+    MissingDefaultModel(ModelSelection),
+    #[error("Provider 描述与配置标识不一致：配置为 {configured}，实际为 {actual}")]
+    ProviderIdentityMismatch {
+        configured: ModelSelection,
+        actual: ModelSelection,
+    },
+}
+
+impl ModelProviderRegistry {
+    /// Creates an empty registry with the given default selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the default provider/model pair is invalid.
+    pub fn new(default_model: ModelSelection) -> Result<Self, ModelRegistryError> {
+        validate_model_selection(&default_model.provider, &default_model.model_id)
+            .map_err(ModelRegistryError::InvalidModelSelection)?;
+        Ok(Self {
+            default_model,
+            providers: BTreeMap::new(),
+        })
+    }
+
+    /// Adds a configured model under its provider/model identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid or duplicate IDs.
+    pub fn register(
+        &mut self,
+        selection: ModelSelection,
+        entry: ModelProviderEntry,
+    ) -> Result<(), ModelRegistryError> {
+        let selection = checked_model_selection(selection)?;
+        let descriptor = entry.provider.descriptor();
+        let actual = ModelSelection::new(descriptor.provider, descriptor.model_id)
+            .map_err(ModelRegistryError::InvalidModelSelection)?;
+        if actual != selection {
+            return Err(ModelRegistryError::ProviderIdentityMismatch {
+                configured: selection,
+                actual,
+            });
+        }
+        if self.providers.contains_key(&selection) {
+            return Err(ModelRegistryError::DuplicateModel(selection));
+        }
+        self.providers.insert(selection, entry);
+        Ok(())
+    }
+
+    /// Resolves an explicit task selection, or the configured default when it is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selection is invalid, unknown, or the default was not registered.
+    pub fn resolve(
+        &self,
+        selected_model: Option<&ModelSelection>,
+    ) -> Result<(&ModelSelection, &ModelProviderEntry), ModelRegistryError> {
+        let selection = selected_model.unwrap_or(&self.default_model);
+        validate_model_selection(&selection.provider, &selection.model_id)
+            .map_err(ModelRegistryError::InvalidModelSelection)?;
+        self.providers
+            .get_key_value(selection)
+            .ok_or_else(|| match selected_model {
+                Some(_) => ModelRegistryError::UnknownModel(selection.clone()),
+                None => ModelRegistryError::MissingDefaultModel(selection.clone()),
+            })
+    }
+
+    #[must_use]
+    pub fn default_model(&self) -> &ModelSelection {
+        &self.default_model
+    }
+
+    #[must_use]
+    pub fn default_entry(&self) -> Option<&ModelProviderEntry> {
+        self.providers.get(&self.default_model)
+    }
+
+    #[must_use]
+    pub fn contains(&self, selection: &ModelSelection) -> bool {
+        self.providers.contains_key(selection)
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.providers.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+
+    pub fn model_selections(&self) -> impl Iterator<Item = &ModelSelection> {
+        self.providers.keys()
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = (&ModelSelection, &ModelProviderEntry)> {
+        self.providers.iter()
+    }
+
+    /// Resets continuation state in every provider for one task.
+    pub fn reset_task(&self, task_id: TaskId) {
+        for entry in self.providers.values() {
+            entry.provider.reset_task(task_id);
+        }
+    }
+}
+
+fn checked_model_selection(
+    selection: ModelSelection,
+) -> Result<ModelSelection, ModelRegistryError> {
+    validate_model_selection(&selection.provider, &selection.model_id)
+        .map_err(ModelRegistryError::InvalidModelSelection)?;
+    Ok(selection)
 }
 
 fn endpoint_for(config: &OpenAiCompatibleModelConfig) -> Result<Url, ModelProviderConfigError> {
@@ -701,7 +862,10 @@ fn model_tool_schema(tool: &ModelToolDefinition) -> Value {
         .entry("required")
         .or_insert_with(|| Value::Array(Vec::new()));
     if let Some(required) = required.as_array_mut() {
-        if !required.iter().any(|field| field.as_str() == Some(AUTHORITY_PARENT_FIELD)) {
+        if !required
+            .iter()
+            .any(|field| field.as_str() == Some(AUTHORITY_PARENT_FIELD))
+        {
             required.push(Value::String(AUTHORITY_PARENT_FIELD.into()));
         }
     }
@@ -1930,6 +2094,91 @@ mod tests {
     }
 
     #[test]
+    fn model_registry_resolves_default_and_explicit_models() {
+        let openai = Arc::new(
+            OpenAiCompatibleModelProvider::new(OpenAiCompatibleModelConfig::new(
+                "openai",
+                "http://127.0.0.1:1/v1",
+                "test-model",
+                None,
+            ))
+            .unwrap(),
+        );
+        let deepseek = Arc::new(
+            OpenAiCompatibleModelProvider::new(OpenAiCompatibleModelConfig::new(
+                "deepseek",
+                "http://127.0.0.1:1/v1",
+                "test-model",
+                None,
+            ))
+            .unwrap(),
+        );
+        let openai_selection = ModelSelection::new("openai", "test-model").unwrap();
+        let deepseek_selection = ModelSelection::new("deepseek", "test-model").unwrap();
+        let mut registry = ModelProviderRegistry::new(deepseek_selection.clone()).unwrap();
+        registry
+            .register(
+                openai_selection.clone(),
+                ModelProviderEntry::new(
+                    Arc::clone(&openai) as Arc<dyn ModelProvider>,
+                    ModelGenerationOptions::default(),
+                    32,
+                ),
+            )
+            .unwrap();
+        registry
+            .register(
+                deepseek_selection.clone(),
+                ModelProviderEntry::new(
+                    deepseek,
+                    ModelGenerationOptions {
+                        reasoning_effort: Some("low".into()),
+                        ..ModelGenerationOptions::default()
+                    },
+                    16,
+                ),
+            )
+            .unwrap();
+
+        let (default_id, default_entry) = registry.resolve(None).unwrap();
+        assert_eq!(default_id, &deepseek_selection);
+        assert_eq!(default_entry.max_context_messages, 16);
+        let (selected_id, selected_entry) = registry.resolve(Some(&openai_selection)).unwrap();
+        assert_eq!(selected_id, &openai_selection);
+        assert_eq!(selected_entry.max_context_messages, 32);
+        assert_eq!(
+            registry.model_selections().collect::<Vec<_>>(),
+            [&deepseek_selection, &openai_selection]
+        );
+    }
+
+    #[test]
+    fn model_registry_rejects_unknown_and_duplicate_models() {
+        let provider = Arc::new(
+            OpenAiCompatibleModelProvider::new(OpenAiCompatibleModelConfig::new(
+                "test-provider",
+                "http://127.0.0.1:1/v1",
+                "test-model",
+                None,
+            ))
+            .unwrap(),
+        ) as Arc<dyn ModelProvider>;
+        let selection = ModelSelection::new("test-provider", "test-model").unwrap();
+        let missing = ModelSelection::new("missing", "missing-model").unwrap();
+        let mut registry = ModelProviderRegistry::new(selection.clone()).unwrap();
+        let entry = ModelProviderEntry::new(provider, ModelGenerationOptions::default(), 1);
+        registry.register(selection.clone(), entry.clone()).unwrap();
+        assert!(matches!(
+            registry.register(selection, entry),
+            Err(ModelRegistryError::DuplicateModel(_))
+        ));
+        assert!(matches!(
+            registry.resolve(Some(&missing)),
+            Err(ModelRegistryError::UnknownModel(_))
+        ));
+    }
+
+    #[test]
     fn model_receives_only_eligible_context_ids_and_reserved_tool_field() {
         let mut request = request(ModelProtocol::Responses, false);
         let eligible_id = request.context[0].event_id;
@@ -1957,11 +2206,13 @@ mod tests {
                 schema["properties"][AUTHORITY_PARENT_FIELD]["type"],
                 json!(["string", "null"])
             );
-            assert!(schema["required"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|field| field.as_str() == Some(AUTHORITY_PARENT_FIELD)));
+            assert!(
+                schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|field| field.as_str() == Some(AUTHORITY_PARENT_FIELD))
+            );
         }
     }
 
@@ -1980,6 +2231,7 @@ mod tests {
     #[test]
     fn config_redacts_api_key_and_normalizes_endpoint() {
         let config = OpenAiCompatibleModelConfig::new(
+            "test-provider",
             "http://127.0.0.1:1234/v1/",
             "test-model",
             Some("secret".into()),
@@ -2004,7 +2256,8 @@ mod tests {
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"正在分析\"}]},{\"type\":\"function_call\",\"call_id\":\"call-1\",\"name\":\"service_status\",\"arguments\":\"{\\\"service\\\":\\\"koi-demo.service\\\"}\"}],\"usage\":{\"input_tokens\":12,\"output_tokens\":8,\"output_tokens_details\":{\"reasoning_tokens\":2}}}}\n\n",
         );
         let (base_url, handle) = test_server(response.into()).await;
-        let config = OpenAiCompatibleModelConfig::new(base_url, "test-model", None);
+        let config =
+            OpenAiCompatibleModelConfig::new("test-provider", base_url, "test-model", None);
         let provider = OpenAiCompatibleModelProvider::new(config).unwrap();
         let events = provider
             .start(
@@ -2049,8 +2302,9 @@ mod tests {
             r#"{"id":"chat-1","choices":[{"index":0,"message":{"role":"assistant","content":"服务正常","tool_calls":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":2}}}"#,
         );
         let (base_url, handle) = test_server(response.into()).await;
-        let config = OpenAiCompatibleModelConfig::new(base_url, "test-model", None)
-            .with_protocol(ModelProtocol::ChatCompletions);
+        let config =
+            OpenAiCompatibleModelConfig::new("test-provider", base_url, "test-model", None)
+                .with_protocol(ModelProtocol::ChatCompletions);
         let provider = OpenAiCompatibleModelProvider::new(config).unwrap();
         let events = provider
             .start(

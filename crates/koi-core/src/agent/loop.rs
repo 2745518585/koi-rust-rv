@@ -5,10 +5,10 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{
-    InputInjectionError, InputInjector, RuntimeError, RuntimeRecoveryError,
-    TaskManager, TaskManagerError, TaskRuntime, TaskStartArguments, TaskToolArgumentsError,
-    parse_task_control, parse_task_delete, parse_task_name, parse_task_start, TASK_CONTROL_TOOL,
-    TASK_DELETE_TOOL, TASK_NAME_TOOL, TASK_START_TOOL,
+    InputInjectionError, InputInjector, RuntimeError, RuntimeRecoveryError, TASK_CONTROL_TOOL,
+    TASK_DELETE_TOOL, TASK_NAME_TOOL, TASK_START_TOOL, TaskManager, TaskManagerError, TaskRuntime,
+    TaskStartArguments, TaskToolArgumentsError, parse_task_control, parse_task_delete,
+    parse_task_name, parse_task_start,
 };
 use crate::domain::{
     AgentEvent, AuthorizationRequest, AuthorizationRequestResult, AuthorizedToolInvocation,
@@ -16,8 +16,8 @@ use crate::domain::{
     IngressEvent, MemoryContextBuilder, MemoryQuery, ModelContextItem, ModelError, ModelEvent,
     ModelGenerationOptions, ModelInputRole, ModelOutput, ModelOutputContract, ModelRequest,
     ModelStreamEvent, PermissionAssessment, PermissionCheckResult, PermissionChecker,
-    PermissionLevel, PolicyDecision, Scope, TaskId, TaskStatus, ToolCall,
-    ToolDefinition, ToolEvent, ToolResult,
+    PermissionLevel, PolicyDecision, Scope, TaskId, TaskStatus, ToolCall, ToolDefinition,
+    ToolEvent, ToolResult,
 };
 use crate::ports::{
     AuthorizationEvidenceResolver, EventStore, MemoryError, MemoryStore, ModelProvider,
@@ -65,10 +65,16 @@ pub enum AgentRunRequestError {
 /// 一次主循环的终止原因与可发送给调用方的最终文本。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentRunOutcome {
-    Completed { response: Option<String> },
-    AwaitingAuthorization { approval_request_event_id: EventId },
+    Completed {
+        response: Option<String>,
+    },
+    AwaitingAuthorization {
+        approval_request_event_id: EventId,
+    },
     /// 主会话通过 `task.start` 启动了一个子任务；结果将在子任务结束后异步回传。
-    StartedChildTask { task_id: TaskId },
+    StartedChildTask {
+        task_id: TaskId,
+    },
     Cancelled,
 }
 
@@ -108,9 +114,7 @@ fn parse_task_tool_action(
             task_id: args.task_id,
             reason: args.reason,
         }),
-        other => Err(TaskToolArgumentsError(format!(
-            "未知任务管理工具：{other}"
-        ))),
+        other => Err(TaskToolArgumentsError(format!("未知任务管理工具：{other}"))),
     }
 }
 
@@ -513,7 +517,7 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                     context_event_ids: context.iter().map(|item| item.event_id).collect(),
                     context_hash: fingerprint(&context)?,
                     provider: descriptor.provider,
-                    model: descriptor.model,
+                    model_id: descriptor.model_id,
                 }),
                 None,
                 crate::domain::EventProvenance::model(None),
@@ -715,9 +719,7 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
             .await?;
         let approval_requested = runtime
             .record(
-                AgentEvent::tool(ToolEvent::ApprovalRequested {
-                    proposal_event_id,
-                }),
+                AgentEvent::tool(ToolEvent::ApprovalRequested { proposal_event_id }),
                 Some(checked.id),
             )
             .await?;
@@ -957,6 +959,7 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
     /// `Accepted/Rejected` 审计事件。`task.start` 在成功后写入绑定 Accepted 事件的
     /// `ToolEvent::Started`，其结果由核心在子任务结束后以 `ToolEvent::Finished` 回传；
     /// 其余操作同步完成并立即返回工具结果。
+    #[allow(clippy::too_many_lines)]
     async fn execute_task_tool(
         &self,
         runtime: &mut TaskRuntime<S>,
@@ -1006,15 +1009,18 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                     Ok(created) => created,
                     Err(error) => {
                         return self
-                            .fail_task_tool(runtime, proposal_event_id, checked.id, &error.to_string())
+                            .fail_task_tool(
+                                runtime,
+                                proposal_event_id,
+                                checked.id,
+                                &error.to_string(),
+                            )
                             .await;
                     }
                 };
                 let started = runtime
                     .record_with_provenance(
-                        AgentEvent::tool(ToolEvent::Started {
-                            proposal_event_id,
-                        }),
+                        AgentEvent::tool(ToolEvent::Started { proposal_event_id }),
                         Some(created.accepted_event_id),
                         crate::domain::EventProvenance::tool(),
                     )
@@ -1103,9 +1109,7 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
     ) -> Result<ToolHandlingOutcome, AgentLoopError> {
         let started = runtime
             .record_with_provenance(
-                AgentEvent::tool(ToolEvent::Started {
-                    proposal_event_id,
-                }),
+                AgentEvent::tool(ToolEvent::Started { proposal_event_id }),
                 Some(checked_event_id),
                 crate::domain::EventProvenance::tool(),
             )
@@ -1141,9 +1145,7 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
     ) -> Result<ToolHandlingOutcome, AgentLoopError> {
         let started = runtime
             .record_with_provenance(
-                AgentEvent::tool(ToolEvent::Started {
-                    proposal_event_id,
-                }),
+                AgentEvent::tool(ToolEvent::Started { proposal_event_id }),
                 Some(checked_event_id),
                 crate::domain::EventProvenance::tool(),
             )
@@ -1295,7 +1297,9 @@ enum ToolHandlingOutcome {
     Continue(ModelContextItem),
     AwaitingAuthorization(EventId),
     /// 任务管理工具已启动一个子任务；结果在子任务结束后异步回传。
-    PendingExternal { task_id: TaskId },
+    PendingExternal {
+        task_id: TaskId,
+    },
 }
 
 struct CompletedModel {

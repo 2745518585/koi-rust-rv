@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use crate::agent::{RuntimeError, TaskRuntime};
 use crate::domain::{
-    AgentEvent, ControlEvent, EventEnvelope, EventId, EventProvenance, EventSource,
+    AgentEvent, ControlEvent, EventEnvelope, EventId, EventProvenance, EventSource, ModelSelection,
     PermissionLevel, Principal, SourceName,
 };
 use crate::ports::EventStore;
@@ -122,6 +122,10 @@ impl ControlExecutor {
                 });
             }
         }
+        if let ControlEvent::ModelSelected { provider, model_id } = &request.event {
+            ModelSelection::new(provider.clone(), model_id.clone())
+                .map_err(|error| ControlExecutionError::InvalidModelSelection(error.to_string()))?;
+        }
 
         runtime
             .record_with_provenance(
@@ -145,6 +149,7 @@ fn is_external_control(event: &ControlEvent) -> bool {
         ControlEvent::TaskPaused { .. }
             | ControlEvent::TaskResumed
             | ControlEvent::TaskCancelled { .. }
+            | ControlEvent::ModelSelected { .. }
             | ControlEvent::MinimumControlPermissionChanged { .. }
     )
 }
@@ -171,6 +176,8 @@ pub enum ControlExecutionError {
         requested: PermissionLevel,
         actual: PermissionLevel,
     },
+    #[error("供应商模型标识无效：{0}")]
+    InvalidModelSelection(String),
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
 }

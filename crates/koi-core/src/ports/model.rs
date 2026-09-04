@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use futures_util::Stream;
 use tokio_util::sync::CancellationToken;
 
-use crate::domain::{ModelError, ModelProviderDescriptor, ModelRequest, ModelStreamEvent};
+use crate::domain::{ModelError, ModelProviderDescriptor, ModelRequest, ModelStreamEvent, TaskId};
 
 /// 模型流中的每一项要么是增量输出，要么是调用完成结果。
 pub type ModelEventStream =
@@ -16,7 +16,7 @@ pub type ModelEventStream =
 /// 该端口定义的请求、流和结果。
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
-    /// 返回当前配置下 Provider 的协议、模型和能力描述。
+    /// 返回当前配置下 Provider 的供应商、模型 ID、协议和能力描述。
     fn descriptor(&self) -> ModelProviderDescriptor;
 
     /// 启动一次模型调用并返回规范化流。
@@ -31,4 +31,8 @@ pub trait ModelProvider: Send + Sync {
         request: ModelRequest,
         cancel: CancellationToken,
     ) -> Result<ModelEventStream, ModelError>;
+
+    /// Clears provider-local continuation state for a task after its selected model changes.
+    /// Providers without such state can keep the default no-op implementation.
+    fn reset_task(&self, _task_id: TaskId) {}
 }

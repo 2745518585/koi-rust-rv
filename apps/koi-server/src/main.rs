@@ -3,10 +3,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use koi_api::{WebApi, WebAuth};
-use koi_core::domain::{EventSource, ModelGenerationOptions, ModelProtocol};
+use koi_core::domain::{EventSource, ModelGenerationOptions, ModelProtocol, ModelSelection};
 use koi_core::ports::{EventStore, SourceAuthorizationRegistry, ToolRegistry};
 use koi_infra::event_store::JsonlEventStore;
-use koi_infra::llm::{OpenAiCompatibleModelConfig, OpenAiCompatibleModelProvider};
+use koi_infra::llm::{
+    ModelProviderEntry, ModelProviderRegistry, OpenAiCompatibleModelConfig,
+    OpenAiCompatibleModelProvider,
+};
 use koi_infra::tools::ToolPolicy;
 use koi_infra::web_identity::WebUserStore;
 use koi_infra::web_source::KoiWebSource;
@@ -20,49 +23,35 @@ mod agent_runtime;
 mod prompts;
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
 struct RuntimeConfig {
     server: ServerConfig,
+    #[serde(default)]
     security: ToolPolicy,
-    model: ModelConfig,
+    models: ModelsConfig,
+    #[serde(default)]
     agent: AgentConfig,
+    #[serde(default)]
     usage: UsageConfig,
 }
 
-impl Default for RuntimeConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            security: ToolPolicy::default(),
-            model: ModelConfig::default(),
-            agent: AgentConfig::default(),
-            usage: UsageConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
+#[derive(Clone, Debug, Deserialize)]
 struct ModelConfig {
+    provider: String,
     base_url: String,
-    name: String,
+    model_id: String,
+    api_key: Option<String>,
     protocol: String,
     request_timeout_secs: u64,
     max_context_messages: usize,
     reasoning_effort: Option<String>,
 }
 
-impl Default for ModelConfig {
-    fn default() -> Self {
-        Self {
-            base_url: "https://api.openai.com/v1".into(),
-            name: "gpt-5-mini".into(),
-            protocol: "responses".into(),
-            request_timeout_secs: 60,
-            max_context_messages: 32,
-            reasoning_effort: Some("medium".into()),
-        }
-    }
+/// Configured provider/model pairs. The pair is the model identity; there is no application alias.
+#[derive(Clone, Debug, Deserialize)]
+struct ModelsConfig {
+    default_provider: String,
+    default_model_id: String,
+    entries: Vec<ModelConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,25 +71,13 @@ impl Default for AgentConfig {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
 struct ServerConfig {
     bind_addr: String,
     web_dist_dir: PathBuf,
     event_store_dir: PathBuf,
     user_store_path: PathBuf,
     web_cookie_secure: bool,
-}
-
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            bind_addr: "127.0.0.1:8080".into(),
-            web_dist_dir: PathBuf::from("./web/dist"),
-            event_store_dir: PathBuf::from("./data/events"),
-            user_store_path: PathBuf::from("./data/users.json"),
-            web_cookie_secure: false,
-        }
-    }
+    web_admin_token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,9 +104,10 @@ async fn main() {
 }
 
 async fn run() -> Result<(), ServerError> {
-    let config = load_runtime_config();
-    let web_token = load_web_admin_token()?;
+    let config = load_runtime_config()?;
+    let web_token = load_web_admin_token(&config.server.web_admin_token)?;
     let prompts = prompts::ServerPromptProvider;
+    let model_registry = build_model_registry(&config)?;
 
     let mut registry = ToolRegistry::default();
     let registered = koi_infra::tools::register_builtin_tools(&mut registry, config.security)
@@ -138,23 +116,6 @@ async fn run() -> Result<(), ServerError> {
         .map_err(|error| ServerError::ToolRegistry(error.to_string()))?;
     let tools = Arc::new(registry);
     let tool_definitions = tools.list_definitions();
-
-    let protocol = parse_model_protocol(&config.model.protocol)?;
-    let model_config =
-        OpenAiCompatibleModelConfig::from_env(config.model.base_url, config.model.name)
-            .with_protocol(protocol)
-            .with_request_timeout_secs(config.model.request_timeout_secs);
-    let model = Arc::new(
-        OpenAiCompatibleModelProvider::new(model_config)
-            .map_err(|error| ServerError::ModelProvider(error.to_string()))?,
-    );
-    let model_options = ModelGenerationOptions {
-        reasoning_effort: config
-            .model
-            .reasoning_effort
-            .filter(|effort| !effort.trim().is_empty()),
-        ..ModelGenerationOptions::default()
-    };
 
     let store = Arc::new(
         JsonlEventStore::open(&config.server.event_store_dir)
@@ -180,7 +141,11 @@ async fn run() -> Result<(), ServerError> {
             tool_definitions,
             config.usage.monthly_budget_usd,
         )
-        .map_err(ServerError::WebApi)?,
+        .map_err(ServerError::WebApi)?
+        .with_model_catalog(
+            model_registry.model_selections().cloned(),
+            model_registry.default_model().clone(),
+        ),
     );
     let auth = WebAuth::new(identities, config.server.web_cookie_secure);
     let mut authorization_providers = SourceAuthorizationRegistry::default();
@@ -208,14 +173,12 @@ async fn run() -> Result<(), ServerError> {
 
     let supervisor = agent_runtime::AgentSupervisor::new(
         Arc::clone(&store),
-        model,
+        Arc::clone(&model_registry),
         tools,
         authorization_providers,
         Arc::new(prompts),
         task_manager,
-        model_options,
         config.agent.max_steps,
-        config.model.max_context_messages,
         config.agent.max_concurrent_tasks,
     );
     let shutdown = CancellationToken::new();
@@ -264,6 +227,56 @@ fn parse_model_protocol(raw: &str) -> Result<ModelProtocol, ServerError> {
     }
 }
 
+fn build_model_registry(config: &RuntimeConfig) -> Result<Arc<ModelProviderRegistry>, ServerError> {
+    if config.models.entries.is_empty() {
+        return Err(ServerError::Configuration(
+            "[models] 至少需要配置一个模型条目".into(),
+        ));
+    }
+    let default_model = ModelSelection::new(
+        config.models.default_provider.clone(),
+        config.models.default_model_id.clone(),
+    )
+    .map_err(|error| ServerError::Configuration(format!("默认模型无效：{error}")))?;
+
+    let mut registry = ModelProviderRegistry::new(default_model)
+        .map_err(|error| ServerError::Configuration(error.to_string()))?;
+    for model in config.models.entries.clone() {
+        let selection = ModelSelection::new(model.provider.clone(), model.model_id.clone())
+            .map_err(|error| ServerError::Configuration(format!("模型条目无效：{error}")))?;
+        let protocol = parse_model_protocol(&model.protocol)?;
+        let api_key = model.api_key.filter(|value| !value.trim().is_empty());
+        let provider_config = OpenAiCompatibleModelConfig::new(
+            model.provider.clone(),
+            model.base_url,
+            model.model_id.clone(),
+            api_key,
+        )
+        .with_protocol(protocol)
+        .with_request_timeout_secs(model.request_timeout_secs);
+        let provider = Arc::new(
+            OpenAiCompatibleModelProvider::new(provider_config)
+                .map_err(|error| ServerError::ModelProvider(format!("{selection}：{error}")))?,
+        );
+        let model_options = ModelGenerationOptions {
+            reasoning_effort: model
+                .reasoning_effort
+                .filter(|effort| !effort.trim().is_empty()),
+            ..ModelGenerationOptions::default()
+        };
+        registry
+            .register(
+                selection,
+                ModelProviderEntry::new(provider, model_options, model.max_context_messages),
+            )
+            .map_err(|error| ServerError::Configuration(error.to_string()))?;
+    }
+    registry
+        .resolve(None)
+        .map_err(|error| ServerError::Configuration(error.to_string()))?;
+    Ok(Arc::new(registry))
+}
+
 /// 若主会话事件流为空，则写入 `TaskCreated` 与 `TaskQueued`，使主会话可以被
 /// Web 输入唤醒并接收 `task.*` 管理工具的审计事件。
 async fn bootstrap_main_session(store: &Arc<JsonlEventStore>) -> Result<(), String> {
@@ -296,30 +309,24 @@ async fn bootstrap_main_session(store: &Arc<JsonlEventStore>) -> Result<(), Stri
     Ok(())
 }
 
-fn load_runtime_config() -> RuntimeConfig {
-    let path = std::env::var("KOI_CONFIG_PATH").unwrap_or_else(|_| "config/agent.toml".into());
-    let Ok(contents) = fs::read_to_string(&path) else {
-        tracing::warn!(path, "未找到运行配置，使用默认的 fail-closed 工具策略");
-        return RuntimeConfig::default();
-    };
-    match toml::from_str::<RuntimeConfig>(&contents) {
-        Ok(config) => config,
-        Err(error) => {
-            tracing::error!(path, %error, "运行配置解析失败，使用默认运行配置");
-            RuntimeConfig::default()
-        }
-    }
+const RUNTIME_CONFIG_PATH: &str = "config/agent.toml";
+
+fn load_runtime_config() -> Result<RuntimeConfig, ServerError> {
+    let contents = fs::read_to_string(RUNTIME_CONFIG_PATH).map_err(|error| {
+        ServerError::Configuration(format!("读取运行配置 {RUNTIME_CONFIG_PATH} 失败：{error}"))
+    })?;
+    toml::from_str::<RuntimeConfig>(&contents)
+        .map_err(|error| ServerError::Configuration(format!("运行配置解析失败：{error}")))
 }
 
-fn load_web_admin_token() -> Result<String, ServerError> {
-    let token = std::env::var("KOI_WEB_ADMIN_TOKEN")
-        .map_err(|_| ServerError::Configuration("缺少 KOI_WEB_ADMIN_TOKEN".into()))?;
+fn load_web_admin_token(configured_token: &str) -> Result<String, ServerError> {
+    let token = configured_token.trim();
     if token.trim().is_empty() || token == "change-me-to-a-long-random-token" {
         return Err(ServerError::Configuration(
-            "KOI_WEB_ADMIN_TOKEN 必须设置为非示例值".into(),
+            "[server].web_admin_token 必须设置为非示例值".into(),
         ));
     }
-    Ok(token)
+    Ok(token.to_owned())
 }
 
 #[derive(Debug, Error)]
@@ -342,4 +349,66 @@ enum ServerError {
     Serve(#[source] std::io::Error),
     #[error("接收关闭信号失败：{0}")]
     Signal(#[source] std::io::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_provider_model_entries_and_builds_registry() {
+        let config: RuntimeConfig = toml::from_str(
+            r#"
+                [server]
+                bind_addr = "127.0.0.1:8080"
+                web_dist_dir = "./web/dist"
+                event_store_dir = "./data/events"
+                user_store_path = "./data/users.json"
+                web_cookie_secure = false
+                web_admin_token = "test-token"
+
+                [models]
+                default_provider = "deepseek"
+                default_model_id = "deepseek-chat"
+
+                [[models.entries]]
+                provider = "openai"
+                base_url = "http://127.0.0.1:1/v1"
+                model_id = "gpt-5-mini"
+                protocol = "chat_completions"
+                request_timeout_secs = 60
+                max_context_messages = 24
+
+                [[models.entries]]
+                provider = "deepseek"
+                base_url = "http://127.0.0.1:1/v1"
+                model_id = "deepseek-chat"
+                protocol = "responses"
+                request_timeout_secs = 60
+                max_context_messages = 8
+            "#,
+        )
+        .unwrap();
+
+        let registry = build_model_registry(&config).unwrap();
+        assert_eq!(
+            registry.default_model(),
+            &ModelSelection::new("deepseek", "deepseek-chat").unwrap()
+        );
+        assert_eq!(
+            registry.model_selections().collect::<Vec<_>>(),
+            [
+                &ModelSelection::new("deepseek", "deepseek-chat").unwrap(),
+                &ModelSelection::new("openai", "gpt-5-mini").unwrap()
+            ]
+        );
+        assert_eq!(registry.resolve(None).unwrap().1.max_context_messages, 8);
+        assert_eq!(
+            registry
+                .resolve(Some(&ModelSelection::new("openai", "gpt-5-mini").unwrap()))
+                .unwrap()
+                .0,
+            &ModelSelection::new("openai", "gpt-5-mini").unwrap()
+        );
+    }
 }

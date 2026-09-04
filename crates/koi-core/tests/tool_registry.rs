@@ -1,4 +1,4 @@
-﻿use std::sync::{
+use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
@@ -28,7 +28,8 @@ impl EchoTool {
                 side_effect: ToolSideEffect::ReadOnly,
                 timeout_ms: 5_000,
                 model_visible: true,
-                main_session_only: false,            },
+                main_session_only: false,
+            },
             calls: AtomicUsize::new(0),
         }
     }

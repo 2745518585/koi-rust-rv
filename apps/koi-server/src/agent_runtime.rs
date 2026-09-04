@@ -12,13 +12,14 @@ use koi_core::agent::{
     TaskManager, TaskRuntime,
 };
 use koi_core::domain::{
-    AgentEvent, EventEnvelope, IngressEvent, ModelContextItem, ModelGenerationOptions,
-    ModelInputRole, ModelOutputContract, TaskId, TaskStatus, ToolEvent,
+    AgentEvent, EventEnvelope, IngressEvent, ModelContextItem, ModelError, ModelErrorKind,
+    ModelInputRole, ModelOutputContract, ModelSelection, TaskId, TaskStatus, ToolEvent,
 };
 use koi_core::ports::{
     EventStore, ModelProvider, SourceAuthorizationRegistry, SystemPromptProvider, ToolRegistry,
 };
 use koi_infra::event_store::JsonlEventStore;
+use koi_infra::llm::{ModelProviderEntry, ModelProviderRegistry, ModelRegistryError};
 use tokio_util::sync::CancellationToken;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -31,16 +32,15 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// 回传为主会话中的工具事件。
 pub struct AgentSupervisor {
     store: Arc<JsonlEventStore>,
-    model: Arc<dyn ModelProvider>,
+    models: Arc<ModelProviderRegistry>,
     tools: Arc<ToolRegistry>,
     authorization_providers: Arc<SourceAuthorizationRegistry>,
     prompts: Arc<dyn SystemPromptProvider>,
     task_manager: Arc<TaskManager<Arc<JsonlEventStore>>>,
-    model_options: ModelGenerationOptions,
     max_model_turns: u16,
-    max_context_messages: usize,
     max_concurrent_tasks: usize,
     active: Mutex<HashMap<TaskId, CancellationToken>>,
+    last_models: Mutex<HashMap<TaskId, ModelSelection>>,
 }
 
 impl AgentSupervisor {
@@ -48,28 +48,25 @@ impl AgentSupervisor {
     #[must_use]
     pub fn new(
         store: Arc<JsonlEventStore>,
-        model: Arc<dyn ModelProvider>,
+        models: Arc<ModelProviderRegistry>,
         tools: Arc<ToolRegistry>,
         authorization_providers: Arc<SourceAuthorizationRegistry>,
         prompts: Arc<dyn SystemPromptProvider>,
         task_manager: Arc<TaskManager<Arc<JsonlEventStore>>>,
-        model_options: ModelGenerationOptions,
         max_model_turns: u16,
-        max_context_messages: usize,
         max_concurrent_tasks: usize,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
-            model,
+            models,
             tools,
             authorization_providers,
             prompts,
             task_manager,
-            model_options,
             max_model_turns: max_model_turns.max(1),
-            max_context_messages: max_context_messages.max(1),
             max_concurrent_tasks: max_concurrent_tasks.max(1),
             active: Mutex::new(HashMap::new()),
+            last_models: Mutex::new(HashMap::new()),
         })
     }
 
@@ -114,7 +111,9 @@ impl AgentSupervisor {
             };
             match runtime.projection().status {
                 TaskStatus::New | TaskStatus::Queued => {
-                    let input_events = context_events(&events, self.max_context_messages);
+                    let context_limit =
+                        self.context_limit(task_id, runtime.projection().selected_model.as_ref());
+                    let input_events = context_events(&events, context_limit);
                     // Web/工具建任务会先写入生命周期事件，再写入首条输入；没有输入时不
                     // 应让模型凭空启动，也避免与仍在提交首条输入的请求竞争事件序号。
                     if !input_events.is_empty() {
@@ -129,8 +128,9 @@ impl AgentSupervisor {
                     // 主会话持续存在：新输入或子任务回传的工具结果都会唤醒一次续跑。
                     // 已完成的一轮模型调用已经消费了此前所有上下文。只传入其后的
                     // Web 输入，避免主会话在空闲时每 250ms 重复执行同一条请求。
-                    let input_events =
-                        context_events_since_last_model(&events, self.max_context_messages);
+                    let context_limit =
+                        self.context_limit(task_id, runtime.projection().selected_model.as_ref());
+                    let input_events = context_events_since_last_model(&events, context_limit);
                     let tool_results = pending_tool_results(&events);
                     if !input_events.is_empty() || !tool_results.is_empty() {
                         self.spawn_main(task_id, input_events, tool_results);
@@ -142,13 +142,25 @@ impl AgentSupervisor {
                             self.spawn_main_resume(
                                 task_id,
                                 approval_event_id,
-                                context_events(&events, self.max_context_messages),
+                                context_events(
+                                    &events,
+                                    self.context_limit(
+                                        task_id,
+                                        runtime.projection().selected_model.as_ref(),
+                                    ),
+                                ),
                             );
                         } else {
                             self.spawn_resume(
                                 task_id,
                                 approval_event_id,
-                                context_events(&events, self.max_context_messages),
+                                context_events(
+                                    &events,
+                                    self.context_limit(
+                                        task_id,
+                                        runtime.projection().selected_model.as_ref(),
+                                    ),
+                                ),
                             );
                         }
                     }
@@ -269,10 +281,11 @@ impl AgentSupervisor {
 
     fn build_agent<'a>(
         &'a self,
+        model: &'a dyn ModelProvider,
         resolver: &'a PersistedAuthorizationEvidenceResolver<'a, JsonlEventStore>,
     ) -> AgentLoop<'a, Arc<JsonlEventStore>> {
         AgentLoop::new(
-            self.model.as_ref(),
+            model,
             self.tools.as_ref(),
             resolver,
             self.authorization_providers.as_ref(),
@@ -283,9 +296,10 @@ impl AgentSupervisor {
 
     fn build_main_agent<'a>(
         &'a self,
+        model: &'a dyn ModelProvider,
         resolver: &'a PersistedAuthorizationEvidenceResolver<'a, JsonlEventStore>,
     ) -> AgentLoop<'a, Arc<JsonlEventStore>> {
-        self.build_agent(resolver)
+        self.build_agent(model, resolver)
             .with_task_manager(self.task_manager.as_ref())
     }
 
@@ -298,9 +312,14 @@ impl AgentSupervisor {
         let mut runtime = TaskRuntime::recover(Arc::clone(&self.store), task_id)
             .await
             .map_err(koi_core::agent::AgentLoopError::from)?;
+        let model = self.resolve_model(task_id, runtime.projection().selected_model.as_ref())?;
         let resolver = PersistedAuthorizationEvidenceResolver::new(self.store.as_ref());
-        self.build_agent(&resolver)
-            .run(&mut runtime, self.request(input_events, Vec::new()), cancel)
+        self.build_agent(model.provider.as_ref(), &resolver)
+            .run(
+                &mut runtime,
+                self.request(model, input_events, Vec::new()),
+                cancel,
+            )
             .await
     }
 
@@ -314,11 +333,12 @@ impl AgentSupervisor {
         let mut runtime = TaskRuntime::recover(Arc::clone(&self.store), task_id)
             .await
             .map_err(koi_core::agent::AgentLoopError::from)?;
+        let model = self.resolve_model(task_id, runtime.projection().selected_model.as_ref())?;
         let resolver = PersistedAuthorizationEvidenceResolver::new(self.store.as_ref());
-        self.build_agent(&resolver)
+        self.build_agent(model.provider.as_ref(), &resolver)
             .resume_after_approval(
                 &mut runtime,
-                self.request(input_events, Vec::new()),
+                self.request(model, input_events, Vec::new()),
                 approval_event_id,
                 cancel,
             )
@@ -335,11 +355,12 @@ impl AgentSupervisor {
         let mut runtime = TaskRuntime::recover(Arc::clone(&self.store), task_id)
             .await
             .map_err(koi_core::agent::AgentLoopError::from)?;
+        let model = self.resolve_model(task_id, runtime.projection().selected_model.as_ref())?;
         let resolver = PersistedAuthorizationEvidenceResolver::new(self.store.as_ref());
-        self.build_main_agent(&resolver)
+        self.build_main_agent(model.provider.as_ref(), &resolver)
             .run_main(
                 &mut runtime,
-                self.request(input_events, tool_results),
+                self.request(model, input_events, tool_results),
                 cancel,
             )
             .await
@@ -355,11 +376,12 @@ impl AgentSupervisor {
         let mut runtime = TaskRuntime::recover(Arc::clone(&self.store), task_id)
             .await
             .map_err(koi_core::agent::AgentLoopError::from)?;
+        let model = self.resolve_model(task_id, runtime.projection().selected_model.as_ref())?;
         let resolver = PersistedAuthorizationEvidenceResolver::new(self.store.as_ref());
-        self.build_main_agent(&resolver)
+        self.build_main_agent(model.provider.as_ref(), &resolver)
             .resume_after_approval(
                 &mut runtime,
-                self.request(input_events, Vec::new()),
+                self.request(model, input_events, Vec::new()),
                 approval_event_id,
                 cancel,
             )
@@ -433,6 +455,7 @@ impl AgentSupervisor {
 
     fn request(
         &self,
+        model: &ModelProviderEntry,
         input_events: Vec<EventEnvelope>,
         tool_results: Vec<ModelContextItem>,
     ) -> AgentRunRequest {
@@ -445,8 +468,46 @@ impl AgentSupervisor {
             input_events,
             memory_query: None,
             output_contract: ModelOutputContract::Text,
-            model_options: self.model_options.clone(),
+            model_options: model.model_options.clone(),
             max_model_turns: self.max_model_turns,
+        }
+    }
+
+    fn resolve_model(
+        &self,
+        task_id: TaskId,
+        selected_model: Option<&ModelSelection>,
+    ) -> Result<&ModelProviderEntry, koi_core::agent::AgentLoopError> {
+        let (selection, entry) = self
+            .models
+            .resolve(selected_model)
+            .map_err(model_selection_error)?;
+        let changed = self
+            .last_models
+            .lock()
+            .map(|mut last_models| {
+                let changed = last_models
+                    .get(&task_id)
+                    .is_some_and(|previous| previous != selection);
+                last_models.insert(task_id, selection.clone());
+                changed
+            })
+            .unwrap_or(false);
+        if changed {
+            self.models.reset_task(task_id);
+        }
+        Ok(entry)
+    }
+
+    fn context_limit(&self, task_id: TaskId, selected_model: Option<&ModelSelection>) -> usize {
+        match self.resolve_model(task_id, selected_model) {
+            Ok(entry) => entry.max_context_messages,
+            Err(error) => {
+                tracing::warn!(%task_id, %error, "任务选择的模型不可用，将使用默认模型上下文上限进行检查");
+                self.models
+                    .default_entry()
+                    .map_or(1, |entry| entry.max_context_messages)
+            }
         }
     }
 
@@ -482,6 +543,15 @@ impl AgentSupervisor {
             .ok()
             .and_then(|active| active.get(&task_id).cloned())
     }
+}
+
+fn model_selection_error(error: ModelRegistryError) -> koi_core::agent::AgentLoopError {
+    ModelError::new(
+        ModelErrorKind::InvalidResponse,
+        format!("会话模型选择无效：{error}"),
+        false,
+    )
+    .into()
 }
 
 fn context_events(events: &[EventEnvelope], limit: usize) -> Vec<EventEnvelope> {

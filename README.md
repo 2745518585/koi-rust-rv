@@ -2,16 +2,16 @@
 
 Koi Rust Remastered Version：一个面向小型服务器运维群的 QQ 协作式故障初诊 Agent。
 
-当前仓库提供可编译的 Rust workspace、运行配置模板、人格模板、环境变量模板、数据库迁移约定和一组带权限边界的内置运维工具。
+当前仓库提供可编译的 Rust workspace、运行配置模板、人格模板、数据库迁移约定和一组带权限边界的内置运维工具。
 
 ## Quick start
 
-1. Copy `.env.example` to `.env` and fill in secrets.
-2. Copy `config/agent.example.toml` to `config/agent.toml`.
-3. Copy `config/persona.example.toml` to `config/persona.toml`.
+1. Copy `config/agent.example.toml` to `config/agent.toml`.
+2. Copy `config/persona.example.toml` to `config/persona.toml`.
+3. Fill in the local TOML credentials, including `[server].web_admin_token` and each model entry's `api_key` when required.
 4. Run `cargo check --workspace`.
 
-`config/agent.toml` and `config/persona.toml` are local runtime files and should not contain secrets. API keys and QQ credentials remain in `.env`.
+`config/agent.toml` and `config/persona.toml` are local runtime files and are ignored by Git. Model and Web credentials belong in the local TOML file; the repository only tracks the example template.
 
 ## Built-in operations tools
 

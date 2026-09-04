@@ -17,7 +17,7 @@ impl ModelProvider for FakeProvider {
     fn descriptor(&self) -> ModelProviderDescriptor {
         ModelProviderDescriptor {
             provider: "fake".into(),
-            model: "fake-model".into(),
+            model_id: "fake-model".into(),
             protocol: ModelProtocol::ChatCompletions,
             capabilities: ModelCapabilities::new([ModelCapability::Streaming]),
         }

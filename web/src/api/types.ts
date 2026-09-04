@@ -39,6 +39,11 @@ export interface UsageTotals {
   reasoningTokens: number;
 }
 
+export interface ModelSelection {
+  provider: string;
+  modelId: string;
+}
+
 export interface TaskSummary {
   taskId: string;
   isMain: boolean;
@@ -51,6 +56,7 @@ export interface TaskSummary {
   lastEventKind: EventKind;
   lastEventSummary: string;
   minimumControlPermission: PermissionLevel;
+  selectedModel: ModelSelection | null;
   usage: UsageTotals;
   eventCount: number;
 }
@@ -123,6 +129,8 @@ export interface SystemSnapshot {
   approvals: ApprovalRequest[];
   recentEvents: TaskEvent[];
   tools: ToolDefinition[];
+  models: ModelSelection[];
+  defaultModel: ModelSelection | null;
   usage: UsageSummary;
 }
 
@@ -135,6 +143,13 @@ export interface ApprovalSubmission {
   approved: boolean;
   reason?: string;
 }
+
+export type TaskControlRequest =
+  | { action: "pause"; reason?: string }
+  | { action: "resume" }
+  | { action: "cancel"; reason?: string }
+  | { action: "select_model"; provider: string; modelId: string }
+  | { action: "set_minimum_permission"; minimumPermission: PermissionLevel };
 
 export type StreamEvent =
   | { type: "task.updated"; task: TaskSummary }

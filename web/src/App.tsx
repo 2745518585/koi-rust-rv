@@ -1168,6 +1168,7 @@ function TaskComposer({
       lastEventKind: "ingress",
       lastEventSummary: "Web 控制台已提交诊断请求，等待主会话接管",
       minimumControlPermission: "User",
+      selectedModel: null,
       usage: { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, reasoningTokens: 0 },
       eventCount: 1,
     });

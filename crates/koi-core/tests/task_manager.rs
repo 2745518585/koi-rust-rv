@@ -119,12 +119,14 @@ async fn completed_child_result_is_delivered_as_tool_event_to_main() {
         .unwrap();
     assert!(delivered.is_none());
     // 主会话事件流中不应出现任何工具结果。
-    assert!(store
-        .load_task(TaskId::MAIN)
-        .await
-        .unwrap()
-        .iter()
-        .all(|event| !matches!(event.payload, AgentEvent::Tool(_))));
+    assert!(
+        store
+            .load_task(TaskId::MAIN)
+            .await
+            .unwrap()
+            .iter()
+            .all(|event| !matches!(event.payload, AgentEvent::Tool(_)))
+    );
 }
 
 #[tokio::test]
@@ -155,10 +157,7 @@ async fn tool_started_child_delivers_final_output_as_tool_event() {
         accepted_event_id,
         mut runtime,
         ..
-    } = manager
-        .request_create_child(&mut main, None)
-        .await
-        .unwrap();
+    } = manager.request_create_child(&mut main, None).await.unwrap();
     runtime
         .record(
             AgentEvent::control(ControlEvent::TaskCreated {
@@ -253,10 +252,7 @@ async fn name_control_and_delete_children_through_main_stream() {
         .await
         .unwrap();
 
-    let mut created = manager
-        .request_create_child(&mut main, None)
-        .await
-        .unwrap();
+    let mut created = manager.request_create_child(&mut main, None).await.unwrap();
     let child_id = created.task_id;
     created
         .runtime

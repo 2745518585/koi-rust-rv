@@ -140,3 +140,53 @@ async fn external_source_cannot_execute_internal_lifecycle_control() {
 
     assert!(matches!(error, ControlExecutionError::InternalControlEvent));
 }
+
+#[tokio::test]
+async fn model_selection_is_a_direct_control_event_and_updates_projection() {
+    let mut runtime = running_runtime().await;
+
+    let selected = ControlExecutor::execute(
+        &mut runtime,
+        ControlExecutionRequest {
+            event: ControlEvent::ModelSelected {
+                provider: "deepseek".into(),
+                model_id: "deepseek-chat".into(),
+            },
+            authority: authority(PermissionLevel::User),
+            causation_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        runtime.projection().selected_model,
+        Some(koi_core::domain::ModelSelection::new("deepseek", "deepseek-chat").unwrap())
+    );
+    assert_eq!(selected.provenance.creator.as_str(), "qq");
+}
+
+#[tokio::test]
+async fn model_selection_rejects_invalid_ids_before_persistence() {
+    let mut runtime = running_runtime().await;
+
+    let error = ControlExecutor::execute(
+        &mut runtime,
+        ControlExecutionRequest {
+            event: ControlEvent::ModelSelected {
+                provider: "deepseek".into(),
+                model_id: "not a model".into(),
+            },
+            authority: authority(PermissionLevel::User),
+            causation_id: None,
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ControlExecutionError::InvalidModelSelection(_)
+    ));
+    assert_eq!(runtime.projection().selected_model, None);
+}

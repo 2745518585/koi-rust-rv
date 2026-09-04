@@ -21,7 +21,8 @@ fn restart_definition() -> ToolDefinition {
         side_effect: ToolSideEffect::Stateful,
         timeout_ms: 10_000,
         model_visible: true,
-                main_session_only: false,    }
+        main_session_only: false,
+    }
 }
 
 fn evidence(

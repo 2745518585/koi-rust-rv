@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashSet};
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -184,6 +185,140 @@ pub enum ModelProtocol {
     ChatCompletions,
 }
 
+/// Maximum length of a provider identifier used in configuration and control events.
+pub const MODEL_PROVIDER_MAX_LENGTH: usize = 128;
+
+/// Maximum length of a provider-owned model identifier used in configuration and control events.
+pub const MODEL_ID_MAX_LENGTH: usize = 256;
+
+/// Stable identity of a configured model.
+///
+/// This is intentionally a pair rather than an application-owned alias: the same vendor model
+/// ID can be offered by more than one provider, and the audit log must retain both parts.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSelection {
+    pub provider: String,
+    pub model_id: String,
+}
+
+impl ModelSelection {
+    /// Creates a validated provider/model identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either component is empty, too long, contains whitespace, or
+    /// contains control characters.
+    pub fn new(
+        provider: impl Into<String>,
+        model_id: impl Into<String>,
+    ) -> Result<Self, ModelSelectionValidationError> {
+        let selection = Self {
+            provider: provider.into(),
+            model_id: model_id.into(),
+        };
+        validate_model_selection(&selection.provider, &selection.model_id)?;
+        Ok(selection)
+    }
+}
+
+impl fmt::Display for ModelSelection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}", self.provider, self.model_id)
+    }
+}
+
+/// Validates the provider part of a model identity.
+pub fn validate_model_provider(provider: &str) -> Result<(), ModelSelectionValidationError> {
+    validate_model_component(
+        provider,
+        MODEL_PROVIDER_MAX_LENGTH,
+        ModelSelectionComponent::Provider,
+    )
+}
+
+/// Validates the stable identifier used to select a configured model.
+///
+/// Model identifiers are deliberately narrower than arbitrary labels because they appear in
+/// configuration, audit events, and control commands. Vendor model IDs may contain characters
+/// such as `/`, `:`, and `@`, so validation rejects whitespace and control characters while
+/// preserving vendor-specific punctuation.
+///
+/// # Errors
+///
+/// Returns an error when the ID is empty, too long, contains surrounding whitespace, or contains
+/// control characters.
+pub fn validate_model_id(model_id: &str) -> Result<(), ModelSelectionValidationError> {
+    validate_model_component(
+        model_id,
+        MODEL_ID_MAX_LENGTH,
+        ModelSelectionComponent::ModelId,
+    )
+}
+
+/// Validates both parts of a provider/model identity.
+pub fn validate_model_selection(
+    provider: &str,
+    model_id: &str,
+) -> Result<(), ModelSelectionValidationError> {
+    validate_model_provider(provider)?;
+    validate_model_id(model_id)?;
+    Ok(())
+}
+
+fn validate_model_component(
+    value: &str,
+    max_length: usize,
+    component: ModelSelectionComponent,
+) -> Result<(), ModelSelectionValidationError> {
+    if value.is_empty() {
+        return Err(ModelSelectionValidationError::Empty(component));
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err(ModelSelectionValidationError::Whitespace(component));
+    }
+    if value.chars().count() > max_length {
+        return Err(ModelSelectionValidationError::TooLong {
+            component,
+            max_length,
+        });
+    }
+    if value.chars().any(char::is_control) {
+        return Err(ModelSelectionValidationError::ControlCharacters(component));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelSelectionComponent {
+    Provider,
+    ModelId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum ModelSelectionValidationError {
+    #[error("{0} 不能为空")]
+    Empty(ModelSelectionComponent),
+    #[error("{0} 不能包含空白字符")]
+    Whitespace(ModelSelectionComponent),
+    #[error("{component} 长度不能超过 {max_length} 个字符")]
+    TooLong {
+        component: ModelSelectionComponent,
+        max_length: usize,
+    },
+    #[error("{0} 不能包含控制字符")]
+    ControlCharacters(ModelSelectionComponent),
+}
+
+impl fmt::Display for ModelSelectionComponent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Provider => "供应商",
+            Self::ModelId => "模型 ID",
+        })
+    }
+}
+
 /// Provider 可提供的单项能力。能力只影响请求编码，不授予工具权限。
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum ModelCapability {
@@ -217,7 +352,7 @@ impl ModelCapabilities {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModelProviderDescriptor {
     pub provider: String,
-    pub model: String,
+    pub model_id: String,
     pub protocol: ModelProtocol,
     pub capabilities: ModelCapabilities,
 }

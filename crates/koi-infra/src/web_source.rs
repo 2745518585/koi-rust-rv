@@ -14,9 +14,9 @@ use chrono::Utc;
 use koi_api::{
     AppendContextCommand, ApprovalCommand, ApprovalDto, CancellationRequestCommand,
     CreateTaskCommand, DailyUsageDto, DashboardDto, DeletedTaskDto, ElevationRequestDto, EventDto,
-    HealthDto, NameTaskCommand, ScopeDto, TaskControlAction, TaskControlCommand, TaskDto, ToolDto,
-    UsageDto, UsageSummaryDto, WEB_SOURCE_NAME, WebApiError, WebCommandPort, WebContextKind,
-    WebEventPort, WebPrincipal, WebQueryPort, WebStreamEvent,
+    HealthDto, ModelSelectionDto, NameTaskCommand, ScopeDto, TaskControlAction, TaskControlCommand,
+    TaskDto, ToolDto, UsageDto, UsageSummaryDto, WEB_SOURCE_NAME, WebApiError, WebCommandPort,
+    WebContextKind, WebEventPort, WebPrincipal, WebQueryPort, WebStreamEvent,
 };
 use koi_core::agent::{
     ControlExecutionRequest, ControlExecutor, DirectControlAuthority, TaskManager,
@@ -25,8 +25,8 @@ use koi_core::agent::{
 use koi_core::domain::{
     AgentEvent, ContextEnvelope, ContextKind, ContextOrigin, ContextPayload, ControlEvent,
     EventEnvelope, EventId, EventSource, IngressDraft, IngressEvent, IngressSubject,
-    PermissionLevel, Principal, Scope, SourceName, TaskId, TaskProjection, ToolDefinition,
-    ToolEvent,
+    ModelSelection, PermissionLevel, Principal, Scope, SourceName, TaskId, TaskProjection,
+    ToolDefinition, ToolEvent,
 };
 use koi_core::domain::{AuthorizationRequest, AuthorizationRequestResult};
 use koi_core::ports::{
@@ -46,6 +46,8 @@ pub struct KoiWebSource {
     write_lock: Mutex<()>,
     events: broadcast::Sender<WebStreamEvent>,
     tools: Vec<ToolDefinition>,
+    models: Vec<ModelSelection>,
+    default_model: Option<ModelSelection>,
     monthly_budget_usd: f64,
 }
 
@@ -87,8 +89,25 @@ impl KoiWebSource {
             write_lock: Mutex::new(()),
             events,
             tools,
+            models: Vec::new(),
+            default_model: None,
             monthly_budget_usd,
         })
+    }
+
+    /// Supplies the provider/model identities configured by the application runtime.
+    ///
+    /// Keeping this as a builder preserves the adapter constructor used by embedded callers and
+    /// tests while allowing the HTTP dashboard to advertise the available selections.
+    #[must_use]
+    pub fn with_model_catalog(
+        mut self,
+        models: impl IntoIterator<Item = ModelSelection>,
+        default_model: ModelSelection,
+    ) -> Self {
+        self.models = models.into_iter().collect();
+        self.default_model = Some(default_model);
+        self
     }
 
     fn validate_principal(&self, principal: &WebPrincipal) -> Result<(), WebApiError> {
@@ -466,6 +485,8 @@ impl WebQueryPort for KoiWebSource {
             approvals: self.approval_dtos(&records),
             recent_events,
             tools: self.tool_dtos(),
+            models: self.models.iter().map(model_selection_dto).collect(),
+            default_model: self.default_model.as_ref().map(model_selection_dto),
             usage: UsageSummaryDto {
                 input_tokens_today,
                 output_tokens_today,
@@ -733,6 +754,26 @@ impl WebCommandPort for KoiWebSource {
                 })?;
                 ControlEvent::MinimumControlPermissionChanged { minimum_permission }
             }
+            TaskControlAction::SelectModel => {
+                let provider = command
+                    .provider
+                    .ok_or_else(|| WebApiError::validation("选择模型时必须提供 provider"))?;
+                let model_id = command
+                    .model_id
+                    .ok_or_else(|| WebApiError::validation("选择模型时必须提供 modelId"))?;
+                let selection = ModelSelection::new(provider, model_id).map_err(|error| {
+                    WebApiError::validation(format!("provider/modelId 无效：{error}"))
+                })?;
+                if !self.models.contains(&selection) {
+                    return Err(WebApiError::validation(format!(
+                        "供应商模型未配置：{selection}"
+                    )));
+                }
+                ControlEvent::ModelSelected {
+                    provider: selection.provider,
+                    model_id: selection.model_id,
+                }
+            }
         };
         let authority = DirectControlAuthority::external(
             SourceName::new(WEB_SOURCE_NAME)
@@ -986,6 +1027,7 @@ fn task_dto(task_id: TaskId, events: &[EventEnvelope], projection: &TaskProjecti
         last_event_summary: last_event
             .map_or_else(|| "任务尚未写入事件".into(), |event| event.summary),
         minimum_control_permission: permission_name(projection.minimum_control_permission),
+        selected_model: projection.selected_model.as_ref().map(model_selection_dto),
         usage: UsageDto {
             input_tokens: projection.usage.input_tokens,
             output_tokens: projection.usage.output_tokens,
@@ -993,6 +1035,13 @@ fn task_dto(task_id: TaskId, events: &[EventEnvelope], projection: &TaskProjecti
             reasoning_tokens: projection.usage.reasoning_tokens,
         },
         event_count: events.len(),
+    }
+}
+
+fn model_selection_dto(selection: &ModelSelection) -> ModelSelectionDto {
+    ModelSelectionDto {
+        provider: selection.provider.clone(),
+        model_id: selection.model_id.clone(),
     }
 }
 
@@ -1110,6 +1159,11 @@ fn event_description(event: &AgentEvent) -> (&'static str, String, String) {
             ControlEvent::TaskNamed { name } => {
                 ("control", "任务已命名".into(), truncate(name, 180))
             }
+            ControlEvent::ModelSelected { provider, model_id } => (
+                "control",
+                "会话模型已切换".into(),
+                format!("后续模型调用使用 {provider}/{model_id}"),
+            ),
             ControlEvent::TaskCancelled { reason } => {
                 ("control", "任务已取消".into(), truncate(reason, 180))
             }
@@ -1156,9 +1210,13 @@ fn event_description(event: &AgentEvent) -> (&'static str, String, String) {
             ),
         },
         AgentEvent::Model(model) => match model.as_ref() {
-            koi_core::domain::ModelEvent::CallStarted { model, .. } => {
-                ("model", "模型调用开始".into(), format!("正在调用 {model}"))
-            }
+            koi_core::domain::ModelEvent::CallStarted {
+                provider, model_id, ..
+            } => (
+                "model",
+                "模型调用开始".into(),
+                format!("正在调用 {provider}/{model_id}"),
+            ),
             koi_core::domain::ModelEvent::Delta { content, .. } => {
                 ("model", "模型输出增量".into(), truncate(content, 180))
             }
@@ -1490,7 +1548,14 @@ mod tests {
                 Vec::new(),
                 10.0,
             )
-            .unwrap(),
+            .unwrap()
+            .with_model_catalog(
+                [
+                    ModelSelection::new("openai", "gpt-5-mini").unwrap(),
+                    ModelSelection::new("deepseek", "deepseek-chat").unwrap(),
+                ],
+                ModelSelection::new("openai", "gpt-5-mini").unwrap(),
+            ),
         );
         let admin = WebPrincipal::admin("web-admin", Some("Web Admin".into()));
         let task = source
@@ -1507,6 +1572,40 @@ mod tests {
             .await
             .unwrap();
         let task_id = uuid::Uuid::parse_str(&task.task_id).map(TaskId).unwrap();
+
+        let selected = source
+            .control_task(
+                admin.clone(),
+                task_id,
+                TaskControlCommand {
+                    action: TaskControlAction::SelectModel,
+                    reason: None,
+                    minimum_permission: None,
+                    provider: Some("deepseek".into()),
+                    model_id: Some("deepseek-chat".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            selected.selected_model,
+            Some(ModelSelectionDto {
+                provider: "deepseek".into(),
+                model_id: "deepseek-chat".into(),
+            })
+        );
+        let task_events = store.load_task(task_id).await.unwrap();
+        assert!(task_events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                AgentEvent::Control(control)
+                    if matches!(
+                        control.as_ref(),
+                        ControlEvent::ModelSelected { provider, model_id }
+                            if provider == "deepseek" && model_id == "deepseek-chat"
+                    )
+            )
+        }));
 
         // 命名：返回的 DTO 标题来自 TaskNamed 投影。
         let named = source

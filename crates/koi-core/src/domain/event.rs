@@ -406,7 +406,7 @@ pub enum ModelEvent {
         context_event_ids: Vec<EventId>,
         context_hash: String,
         provider: String,
-        model: String,
+        model_id: String,
     },
     Delta {
         call_started_event_id: EventId,
@@ -541,6 +541,11 @@ pub enum ControlEvent {
     /// 为任务设置稳定显示名称；只能由任务管理操作写入。
     TaskNamed {
         name: String,
+    },
+    /// 选择任务后续模型调用使用的已配置模型。
+    ModelSelected {
+        provider: String,
+        model_id: String,
     },
     /// 修改任务后续控制指令所需的最低权限。
     MinimumControlPermissionChanged {

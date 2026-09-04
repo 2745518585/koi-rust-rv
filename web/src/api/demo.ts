@@ -42,6 +42,7 @@ function task(
     lastEventKind,
     lastEventSummary,
     minimumControlPermission: status === "WaitingApproval" ? "Operator" : "User",
+    selectedModel: null,
     usage: {
       inputTokens: 4800 + eventCount * 68,
       outputTokens: 1200 + eventCount * 17,
@@ -280,6 +281,8 @@ export function createDemoSnapshot(): SystemSnapshot {
       tool("git.reset", "恢复仓库到指定提交或工作树状态", "Admin", "Destructive"),
       tool("system.command", "执行结构化 Admin 命令入口", "Admin", "Destructive", false),
     ],
+    models: [],
+    defaultModel: null,
     usage: {
       inputTokensToday: 128_640,
       outputTokensToday: 34_820,

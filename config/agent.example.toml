@@ -1,4 +1,4 @@
-# 非敏感运行配置。复制为 agent.toml 后按部署环境调整。
+# 运行配置示例。复制为 agent.toml 后按部署环境调整；实际 agent.toml 只保存在本机。
 
 [server]
 bind_addr = "127.0.0.1:8080"
@@ -8,6 +8,8 @@ event_store_dir = "./data/events"
 user_store_path = "./data/users.json"
 # Set true whenever the Web console is served over HTTPS.
 web_cookie_secure = false
+# 管理端访问令牌；请在本机配置中替换为随机值。
+web_admin_token = "change-me-to-a-long-random-token"
 
 [qq]
 api_base_url = "https://api.bot.qq.com"
@@ -16,13 +18,33 @@ intents = 33554432
 request_timeout_secs = 10
 max_retries = 2
 
-[model]
+[models]
+# 会话未显式选择模型时使用这组供应商和供应商模型 ID。
+default_provider = "openai"
+default_model_id = "gpt-5-mini"
+
+[[models.entries]]
+provider = "openai"
 base_url = "https://api.openai.com/v1"
-name = "gpt-5-mini"
+model_id = "gpt-5-mini"
+# 当前模型的供应商 API 密钥；没有鉴权的本地网关可以留空。
+api_key = ""
 protocol = "responses" # responses 或 chat_completions；学校接口可切换为 chat_completions
 request_timeout_secs = 60
 max_context_messages = 32
 reasoning_effort = "medium"
+
+[[models.entries]]
+# 同一个模型 ID 可以由不同供应商分别提供；控制事件始终携带两者。
+provider = "deepseek"
+base_url = "https://api.deepseek.com/v1"
+model_id = "deepseek-chat"
+# 当前模型的供应商 API 密钥；只写入本机 agent.toml，不要提交。
+api_key = ""
+protocol = "responses"
+request_timeout_secs = 30
+max_context_messages = 16
+reasoning_effort = "low"
 
 [agent]
 max_steps = 8

@@ -60,6 +60,8 @@ pub struct TaskProjection {
     pub minimum_control_permission: super::PermissionLevel,
     /// 由任务管理操作设置的稳定显示名称；为空时由调用方按事件流推断。
     pub title: Option<String>,
+    /// 当前任务显式选择的模型；为空时由运行器使用配置的默认模型。
+    pub selected_model: Option<super::ModelSelection>,
     pub last_sequence: u64,
     pub last_event_id: Option<EventId>,
     pub usage: UsageTotals,
@@ -74,6 +76,7 @@ impl TaskProjection {
             status: TaskStatus::New,
             minimum_control_permission: super::PermissionLevel::User,
             title: None,
+            selected_model: None,
             last_sequence: 0,
             last_event_id: None,
             usage: UsageTotals::default(),
@@ -122,6 +125,13 @@ impl TaskProjection {
                 ControlEvent::TaskResumed => self.transition(TaskStatus::Running)?,
                 ControlEvent::TaskNamed { name } => {
                     self.title = Some(name.clone());
+                }
+                ControlEvent::ModelSelected { provider, model_id } => {
+                    self.selected_model = Some(
+                        super::ModelSelection::new(provider.clone(), model_id.clone()).map_err(
+                            |error| TaskProjectionError::InvalidModelSelection(error.to_string()),
+                        )?,
+                    );
                 }
                 ControlEvent::MinimumControlPermissionChanged { minimum_permission } => {
                     self.minimum_control_permission = *minimum_permission;
@@ -235,4 +245,6 @@ pub enum TaskProjectionError {
     TerminalTask(TaskStatus),
     #[error("invalid task transition from {from:?} to {to:?}")]
     InvalidTransition { from: TaskStatus, to: TaskStatus },
+    #[error("invalid provider/model identity in task event: {0}")]
+    InvalidModelSelection(String),
 }

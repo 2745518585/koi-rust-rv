@@ -46,7 +46,7 @@ async fn task_runtime_records_a_replayable_approval_flow() {
                 context_event_ids: vec![],
                 context_hash: "test-context".into(),
                 provider: "responses".into(),
-                model: "test-model".into(),
+                model_id: "test-model".into(),
             }),
             None,
         )
@@ -118,7 +118,7 @@ async fn model_usage_is_accumulated_in_the_projection() {
                 context_event_ids: vec![],
                 context_hash: "test-context".into(),
                 provider: "responses".into(),
-                model: "test-model".into(),
+                model_id: "test-model".into(),
             }),
             None,
         )

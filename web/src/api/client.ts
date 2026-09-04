@@ -4,12 +4,12 @@ import type {
   CreateTaskRequest,
   StreamEvent,
   SystemSnapshot,
+  TaskControlRequest,
   TaskEvent,
   TaskSummary,
 } from "./types";
 
 const configuredBase = import.meta.env.VITE_KOI_API_BASE ?? "/api/v1";
-const configuredToken = import.meta.env.VITE_KOI_WEB_TOKEN?.trim();
 
 function normalizeBase(base: string): string {
   return base.replace(/\/+$/, "");
@@ -51,7 +51,6 @@ export class KoiApiClient {
 
   constructor(baseUrl = configuredBase) {
     this.baseUrl = normalizeBase(baseUrl);
-    this.token = configuredToken;
   }
 
   hasToken(): boolean {
@@ -108,6 +107,13 @@ export class KoiApiClient {
 
   async createTask(request: CreateTaskRequest): Promise<TaskSummary> {
     return this.request<TaskSummary>("/tasks", {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+  }
+
+  async controlTask(taskId: string, request: TaskControlRequest): Promise<TaskSummary> {
+    return this.request<TaskSummary>(`/tasks/${encodeURIComponent(taskId)}/controls`, {
       method: "POST",
       body: JSON.stringify(request),
     });

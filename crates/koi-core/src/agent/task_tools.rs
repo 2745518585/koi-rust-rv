@@ -12,8 +12,8 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::domain::{
-    AuthorizedToolInvocation, ControlEvent, PermissionLevel, TaskId, ToolDefinition, ToolError,
-    ToolErrorKind, ToolResult, ToolSideEffect,
+    AuthorizedToolInvocation, ControlEvent, ModelSelection, PermissionLevel, TaskId,
+    ToolDefinition, ToolError, ToolErrorKind, ToolResult, ToolSideEffect,
 };
 use crate::ports::{ToolExecutor, ToolRegistrationError, ToolRegistry};
 
@@ -97,13 +97,15 @@ fn start_definition() -> ToolDefinition {
 fn control_definition() -> ToolDefinition {
     ToolDefinition {
         name: TASK_CONTROL_TOOL.into(),
-        description: "向一个任务会话发送控制事件：pause、resume、cancel 或 set_minimum_permission。".into(),
+        description: "向一个任务会话发送控制事件：pause、resume、cancel、select_model 或 set_minimum_permission。".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "task_id": {"type": "string", "format": "uuid"},
-                "action": {"type": "string", "enum": ["pause", "resume", "cancel", "set_minimum_permission"]},
+                "action": {"type": "string", "enum": ["pause", "resume", "cancel", "select_model", "set_minimum_permission"]},
                 "reason": {"type": "string"},
+                "provider": {"type": "string", "minLength": 1, "maxLength": 128},
+                "model_id": {"type": "string", "minLength": 1, "maxLength": 256},
                 "minimum_permission": {"type": "string", "enum": ["User", "Operator", "Admin"]}
             },
             "required": ["task_id", "action"]
@@ -244,14 +246,29 @@ pub fn parse_task_control(value: &Value) -> Result<TaskControlArguments, TaskToo
         "cancel" => ControlEvent::TaskCancelled {
             reason: reason("由主会话发起取消")?,
         },
+        "select_model" => {
+            let provider = value
+                .get("provider")
+                .and_then(Value::as_str)
+                .ok_or_else(|| TaskToolArgumentsError("select_model 需要 provider".into()))?;
+            let model_id = value
+                .get("model_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| TaskToolArgumentsError("select_model 需要 model_id".into()))?;
+            ModelSelection::new(provider, model_id).map_err(|error| {
+                TaskToolArgumentsError(format!("provider/model_id 无效：{error}"))
+            })?;
+            ControlEvent::ModelSelected {
+                provider: provider.to_owned(),
+                model_id: model_id.to_owned(),
+            }
+        }
         "set_minimum_permission" => {
             let raw = value
                 .get("minimum_permission")
                 .and_then(Value::as_str)
                 .ok_or_else(|| {
-                    TaskToolArgumentsError(
-                        "set_minimum_permission 需要 minimum_permission".into(),
-                    )
+                    TaskToolArgumentsError("set_minimum_permission 需要 minimum_permission".into())
                 })?;
             let minimum_permission = match raw {
                 "User" => PermissionLevel::User,
@@ -261,9 +278,7 @@ pub fn parse_task_control(value: &Value) -> Result<TaskControlArguments, TaskToo
                     return Err(TaskToolArgumentsError(format!("未知最低权限：{other}")));
                 }
             };
-            ControlEvent::MinimumControlPermissionChanged {
-                minimum_permission,
-            }
+            ControlEvent::MinimumControlPermissionChanged { minimum_permission }
         }
         other => return Err(TaskToolArgumentsError(format!("未知控制动作：{other}"))),
     };
@@ -302,4 +317,29 @@ pub fn parse_task_delete(value: &Value) -> Result<TaskDeleteArguments, TaskToolA
         return Err(TaskToolArgumentsError("reason 最多 512 个字符".into()));
     }
     Ok(TaskDeleteArguments { task_id, reason })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_select_model_control() {
+        let task_id = uuid::Uuid::new_v4();
+        let arguments = serde_json::json!({
+            "task_id": task_id.to_string(),
+            "action": "select_model",
+            "provider": "deepseek",
+            "model_id": "deepseek-chat"
+        });
+        let parsed = parse_task_control(&arguments).unwrap();
+        assert_eq!(parsed.task_id, TaskId(task_id));
+        assert_eq!(
+            parsed.control,
+            ControlEvent::ModelSelected {
+                provider: "deepseek".into(),
+                model_id: "deepseek-chat".into()
+            }
+        );
+    }
 }

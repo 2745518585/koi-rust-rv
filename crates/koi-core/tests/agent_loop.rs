@@ -56,7 +56,7 @@ impl ModelProvider for TwoTurnModel {
     fn descriptor(&self) -> ModelProviderDescriptor {
         ModelProviderDescriptor {
             provider: "test".into(),
-            model: "test-model".into(),
+            model_id: "test-model".into(),
             protocol: ModelProtocol::Responses,
             capabilities: ModelCapabilities::default(),
         }
@@ -168,7 +168,8 @@ impl StatusTool {
                 side_effect: ToolSideEffect::ReadOnly,
                 timeout_ms: 1_000,
                 model_visible: true,
-                main_session_only: false,            },
+                main_session_only: false,
+            },
             calls: AtomicUsize::new(0),
         }
     }
@@ -365,7 +366,7 @@ impl ModelProvider for TaskStartModel {
     fn descriptor(&self) -> ModelProviderDescriptor {
         ModelProviderDescriptor {
             provider: "test".into(),
-            model: "test-model".into(),
+            model_id: "test-model".into(),
             protocol: ModelProtocol::Responses,
             capabilities: ModelCapabilities::default(),
         }
@@ -377,8 +378,8 @@ impl ModelProvider for TaskStartModel {
         _cancel: CancellationToken,
     ) -> Result<ModelEventStream, ModelError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(Box::pin(stream::iter(vec![Ok(ModelStreamEvent::Completed(
-            koi_core::domain::ModelTurn {
+        Ok(Box::pin(stream::iter(vec![Ok(
+            ModelStreamEvent::Completed(koi_core::domain::ModelTurn {
                 outputs: vec![ModelOutput::ToolCall(ToolCall {
                     name: "task.start".into(),
                     arguments: json!({"message": "巡检磁盘空间并汇报"}),
@@ -392,12 +393,13 @@ impl ModelProvider for TaskStartModel {
                     reasoning_tokens: None,
                 },
                 provider_response_id: None,
-            },
-        ))])))
+            }),
+        )])))
     }
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn main_session_task_start_creates_child_and_returns_pending_external() {
     use koi_core::agent::TaskManager;
     use koi_core::domain::{ControlEvent, IngressEvent, ToolEvent};
@@ -421,9 +423,8 @@ async fn main_session_task_start_creates_child_and_returns_pending_external() {
     };
     let providers = SourceAuthorizationRegistry::default();
     let prompts = TestPromptProvider;
-    let agent =
-        AgentLoop::new(&model, &tools, &resolver, &providers, None, &prompts)
-            .with_task_manager(&manager);
+    let agent = AgentLoop::new(&model, &tools, &resolver, &providers, None, &prompts)
+        .with_task_manager(&manager);
 
     let outcome = agent
         .run_main(
@@ -459,9 +460,11 @@ async fn main_session_task_start_creates_child_and_returns_pending_external() {
         .iter()
         .find_map(|event| match &event.payload {
             AgentEvent::Control(control) => match control.as_ref() {
-                ControlEvent::TaskOperationAccepted {
-                    target_task_id, ..
-                } if *target_task_id == task_id => Some(event.id),
+                ControlEvent::TaskOperationAccepted { target_task_id, .. }
+                    if *target_task_id == task_id =>
+                {
+                    Some(event.id)
+                }
                 _ => None,
             },
             _ => None,
@@ -495,7 +498,8 @@ async fn main_session_task_start_creates_child_and_returns_pending_external() {
     } = (match &child_events[0].payload {
         AgentEvent::Control(control) => control.as_ref(),
         _ => panic!("子任务首事件必须是 TaskCreated"),
-    }) else {
+    })
+    else {
         panic!("子任务 TaskCreated 必须绑定主会话 task.start 审计事件");
     };
     assert_eq!(*trigger, accepted);
@@ -506,7 +510,11 @@ async fn main_session_task_start_creates_child_and_returns_pending_external() {
         matches!(&child_events[2].payload, AgentEvent::Ingress(ingress) if matches!(ingress.as_ref(), IngressEvent::ContextReceived { .. }))
     );
     // 子任务尚未运行：不应有任何模型事件。
-    assert!(child_events.iter().all(|event| !matches!(event.payload, AgentEvent::Model(_))));
+    assert!(
+        child_events
+            .iter()
+            .all(|event| !matches!(event.payload, AgentEvent::Model(_)))
+    );
 }
 
 struct TextModel {
@@ -518,7 +526,7 @@ impl ModelProvider for TextModel {
     fn descriptor(&self) -> ModelProviderDescriptor {
         ModelProviderDescriptor {
             provider: "test".into(),
-            model: "test-model".into(),
+            model_id: "test-model".into(),
             protocol: ModelProtocol::Responses,
             capabilities: ModelCapabilities::default(),
         }
@@ -530,8 +538,8 @@ impl ModelProvider for TextModel {
         _cancel: CancellationToken,
     ) -> Result<ModelEventStream, ModelError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(Box::pin(stream::iter(vec![Ok(ModelStreamEvent::Completed(
-            koi_core::domain::ModelTurn {
+        Ok(Box::pin(stream::iter(vec![Ok(
+            ModelStreamEvent::Completed(koi_core::domain::ModelTurn {
                 outputs: vec![ModelOutput::Text {
                     text: "收到".into(),
                 }],
@@ -542,8 +550,8 @@ impl ModelProvider for TextModel {
                     reasoning_tokens: None,
                 },
                 provider_response_id: None,
-            },
-        ))])))
+            }),
+        )])))
     }
 }
 
@@ -576,9 +584,7 @@ fn external_message_event(
             causation_id: None,
             content_hash: "test".into(),
         }),
-        assessment: koi_core::domain::PermissionAssessment::new(
-            permission, permission, permission,
-        ),
+        assessment: koi_core::domain::PermissionAssessment::new(permission, permission, permission),
     })
 }
 
@@ -627,11 +633,7 @@ async fn instruction_input_below_session_minimum_is_skipped_not_injected() {
         .unwrap();
     let above_minimum = runtime
         .record_with_provenance(
-            external_message_event(
-                PermissionLevel::Admin,
-                "message-above",
-                "管理员的合法指令",
-            ),
+            external_message_event(PermissionLevel::Admin, "message-above", "管理员的合法指令"),
             None,
             external_provenance(PermissionLevel::Admin),
         )

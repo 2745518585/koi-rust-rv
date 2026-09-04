@@ -15,8 +15,7 @@ use crate::domain::{
 use crate::ports::EventStore;
 
 /// 进程内任务管理器。跨任务写操作仅接受 `MainTaskLease`。
-pub struct TaskManager<S: EventStore>
-{
+pub struct TaskManager<S: EventStore> {
     store: Arc<S>,
     tasks: Arc<Mutex<HashMap<TaskId, ManagedTask>>>,
 }
@@ -25,8 +24,7 @@ struct ManagedTask {
     cancel: CancellationToken,
 }
 
-impl<S: EventStore> TaskManager<S>
-{
+impl<S: EventStore> TaskManager<S> {
     #[must_use]
     pub fn new(store: Arc<S>) -> Self {
         Self {
@@ -68,7 +66,11 @@ impl<S: EventStore> TaskManager<S>
         causation_id: Option<EventId>,
     ) -> Result<ChildTaskLease<S>, TaskManagerError> {
         let request = self
-            .record_request(&mut main.0.runtime, TaskOperation::CreateChild, causation_id)
+            .record_request(
+                &mut main.0.runtime,
+                TaskOperation::CreateChild,
+                causation_id,
+            )
             .await?;
         let task_id = TaskId::new();
         let cancel = CancellationToken::new();
@@ -126,7 +128,7 @@ impl<S: EventStore> TaskManager<S>
             Err(error) => {
                 return self
                     .reject(&mut main.0.runtime, request.id, error.to_string())
-                    .await
+                    .await;
             }
         };
         let cancel = CancellationToken::new();
@@ -184,11 +186,16 @@ impl<S: EventStore> TaskManager<S>
         };
         let Some(cancel) = cancel else {
             return self
-                .reject(&mut main.0.runtime, request.id, "目标子任务未在当前进程运行")
+                .reject(
+                    &mut main.0.runtime,
+                    request.id,
+                    "目标子任务未在当前进程运行",
+                )
                 .await;
         };
         cancel.cancel();
-        self.accept(&mut main.0.runtime, request.id, task_id).await?;
+        self.accept(&mut main.0.runtime, request.id, task_id)
+            .await?;
         Ok(())
     }
 
@@ -351,7 +358,7 @@ impl<S: EventStore> TaskManager<S>
     ) -> Result<(), TaskManagerError> {
         if !is_manageable_control(&control) {
             return Err(TaskManagerError::OperationRejected(
-                "主会话只能向子任务投递暂停、恢复、取消或最低权限控制事件".into(),
+                "主会话只能向子任务投递暂停、恢复、取消、模型选择或最低权限控制事件".into(),
             ));
         }
         let request = self
@@ -587,16 +594,14 @@ impl<S: EventStore> TaskManager<S>
     }
 }
 
-struct TaskLease<S: EventStore>
-{
+struct TaskLease<S: EventStore> {
     task_id: TaskId,
     runtime: TaskRuntime<Arc<S>>,
     cancel: CancellationToken,
     tasks: Arc<Mutex<HashMap<TaskId, ManagedTask>>>,
 }
 
-impl<S: EventStore> TaskLease<S>
-{
+impl<S: EventStore> TaskLease<S> {
     fn new(
         task_id: TaskId,
         runtime: TaskRuntime<Arc<S>>,
@@ -612,8 +617,7 @@ impl<S: EventStore> TaskLease<S>
     }
 }
 
-impl<S: EventStore> Drop for TaskLease<S>
-{
+impl<S: EventStore> Drop for TaskLease<S> {
     fn drop(&mut self) {
         if let Ok(mut tasks) = self.tasks.lock() {
             tasks.remove(&self.task_id);
@@ -624,8 +628,7 @@ impl<S: EventStore> Drop for TaskLease<S>
 /// 主会话唯一可取得的任务管理能力。
 pub struct MainTaskLease<S: EventStore>(TaskLease<S>);
 
-impl<S: EventStore> MainTaskLease<S>
-{
+impl<S: EventStore> MainTaskLease<S> {
     #[must_use]
     pub fn runtime(&self) -> &TaskRuntime<Arc<S>> {
         &self.0.runtime
@@ -642,8 +645,7 @@ impl<S: EventStore> MainTaskLease<S>
 /// 子任务租约不暴露跨任务管理能力。
 pub struct ChildTaskLease<S: EventStore>(TaskLease<S>);
 
-impl<S: EventStore> ChildTaskLease<S>
-{
+impl<S: EventStore> ChildTaskLease<S> {
     #[must_use]
     pub const fn task_id(&self) -> TaskId {
         self.0.task_id
@@ -669,8 +671,7 @@ pub struct ActiveTask {
 }
 
 /// `TaskManager::request_create_child` 的返回值。
-pub struct CreatedChild<S: EventStore>
-{
+pub struct CreatedChild<S: EventStore> {
     pub task_id: TaskId,
     pub requested_event_id: EventId,
     pub accepted_event_id: EventId,
@@ -693,6 +694,7 @@ fn is_manageable_control(control: &ControlEvent) -> bool {
         ControlEvent::TaskPaused { .. }
             | ControlEvent::TaskResumed
             | ControlEvent::TaskCancelled { .. }
+            | ControlEvent::ModelSelected { .. }
             | ControlEvent::MinimumControlPermissionChanged { .. }
     )
 }
