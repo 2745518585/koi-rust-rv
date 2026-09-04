@@ -31,6 +31,7 @@ const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 4 * 1024 * 1024;
 const AUTHORITY_PARENT_FIELD: &str = "__koi_authority_parent_event_id";
+const AUTHORITY_PARENT_DESCRIPTION: &str = "授权此调用的 KOI_CONTEXT event_id；无可用授权事件时必须传 null，不能编造。";
 
 /// Configuration for an OpenAI-compatible model endpoint.
 ///
@@ -509,7 +510,7 @@ fn responses_input(
             input.push(responses_message(
                 responses_role(item.role),
                 responses_content_type(item.role),
-                &item.content,
+                &model_context_content(item),
             ));
         }
     }
@@ -549,7 +550,7 @@ fn chat_messages(
         } else {
             messages.push(json!({
                 "role": chat_role(item.role),
-                "content": item.content,
+                "content": model_context_content(item),
             }));
         }
     }
@@ -639,12 +640,27 @@ fn chat_role(role: ModelInputRole) -> &'static str {
     }
 }
 
+/// 为模型渲染上下文。只有用户/告警类、且本身具有授权能力的输入才公开可引用的事件 ID。
+///
+/// `event_id` 不是从消息正文提取的用户数据，而是核心绑定到上下文项的持久化事件标识。
+/// 其他角色即使有内部事件 ID，也不能成为工具授权的父节点，因此不向模型声明为证据。
+fn model_context_content(item: &ModelContextItem) -> String {
+    if item.role == ModelInputRole::User && item.permission.can_authorize() {
+        format!(
+            "[KOI_CONTEXT event_id={} permission={:?}]\n{}",
+            item.event_id, item.permission, item.content
+        )
+    } else {
+        item.content.clone()
+    }
+}
+
 fn responses_tool(tool: &ModelToolDefinition) -> Value {
     json!({
         "type": "function",
         "name": tool.name,
         "description": tool.description,
-        "parameters": tool.input_schema,
+        "parameters": model_tool_schema(tool),
         "strict": tool.strict,
     })
 }
@@ -655,10 +671,41 @@ fn chat_tool(tool: &ModelToolDefinition) -> Value {
         "function": {
             "name": tool.name,
             "description": tool.description,
-            "parameters": tool.input_schema,
+            "parameters": model_tool_schema(tool),
             "strict": tool.strict,
         },
     })
+}
+
+/// 扩展每个模型可见工具的 wire schema，使严格 schema 模式下模型也能显式选择授权证据。
+/// 核心解析响应时会移除这个保留字段，因此实际工具实现不会收到它。
+fn model_tool_schema(tool: &ModelToolDefinition) -> Value {
+    let mut schema = tool.input_schema.clone();
+    let Some(root) = schema.as_object_mut() else {
+        return schema;
+    };
+    let properties = root
+        .entry("properties")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(properties) = properties.as_object_mut() else {
+        return schema;
+    };
+    properties.insert(
+        AUTHORITY_PARENT_FIELD.into(),
+        json!({
+            "type": ["string", "null"],
+            "description": AUTHORITY_PARENT_DESCRIPTION,
+        }),
+    );
+    let required = root
+        .entry("required")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Some(required) = required.as_array_mut() {
+        if !required.iter().any(|field| field.as_str() == Some(AUTHORITY_PARENT_FIELD)) {
+            required.push(Value::String(AUTHORITY_PARENT_FIELD.into()));
+        }
+    }
+    schema
 }
 
 fn chat_output_contract(contract: &ModelOutputContract) -> Value {
@@ -1879,6 +1926,42 @@ mod tests {
                 stream,
                 ..ModelGenerationOptions::default()
             },
+        }
+    }
+
+    #[test]
+    fn model_receives_only_eligible_context_ids_and_reserved_tool_field() {
+        let mut request = request(ModelProtocol::Responses, false);
+        let eligible_id = request.context[0].event_id;
+        request.context.push(ModelContextItem {
+            event_id: EventId::new(),
+            role: ModelInputRole::Tool,
+            content: "工具结果".into(),
+            permission: PermissionLevel::None,
+        });
+
+        let responses = responses_input(&request.context, &[]);
+        let response_content = responses[0]["content"][0]["text"].as_str().unwrap();
+        assert!(response_content.contains(&format!("KOI_CONTEXT event_id={eligible_id}")));
+        assert!(!responses[1].to_string().contains("KOI_CONTEXT"));
+
+        let chat = chat_messages(&request.instructions, &request.context, &[]);
+        let chat_content = chat[1]["content"].as_str().unwrap();
+        assert!(chat_content.contains(&format!("KOI_CONTEXT event_id={eligible_id}")));
+
+        for schema in [
+            &responses_tool(&request.tools[0])["parameters"],
+            &chat_tool(&request.tools[0])["function"]["parameters"],
+        ] {
+            assert_eq!(
+                schema["properties"][AUTHORITY_PARENT_FIELD]["type"],
+                json!(["string", "null"])
+            );
+            assert!(schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field.as_str() == Some(AUTHORITY_PARENT_FIELD)));
         }
     }
 
