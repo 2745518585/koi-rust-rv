@@ -33,6 +33,17 @@ impl EventStore for MemoryEventStore {
         self.events.lock().await.push(event.clone());
         Ok(())
     }
+
+    async fn load_task(&self, task_id: TaskId) -> Result<Vec<EventEnvelope>, EventStoreError> {
+        Ok(self
+            .events
+            .lock()
+            .await
+            .iter()
+            .filter(|event| event.task_id == task_id)
+            .cloned()
+            .collect())
+    }
 }
 
 struct TwoTurnModel {
@@ -496,4 +507,188 @@ async fn main_session_task_start_creates_child_and_returns_pending_external() {
     );
     // 子任务尚未运行：不应有任何模型事件。
     assert!(child_events.iter().all(|event| !matches!(event.payload, AgentEvent::Model(_))));
+}
+
+struct TextModel {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl ModelProvider for TextModel {
+    fn descriptor(&self) -> ModelProviderDescriptor {
+        ModelProviderDescriptor {
+            provider: "test".into(),
+            model: "test-model".into(),
+            protocol: ModelProtocol::Responses,
+            capabilities: ModelCapabilities::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        _request: ModelRequest,
+        _cancel: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::pin(stream::iter(vec![Ok(ModelStreamEvent::Completed(
+            koi_core::domain::ModelTurn {
+                outputs: vec![ModelOutput::Text {
+                    text: "收到".into(),
+                }],
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cached_input_tokens: None,
+                    reasoning_tokens: None,
+                },
+                provider_response_id: None,
+            },
+        ))])))
+    }
+}
+
+fn external_message_event(
+    permission: PermissionLevel,
+    native_event_id: &str,
+    text: &str,
+) -> AgentEvent {
+    use koi_core::domain::{ContextEnvelope, ContextKind, ContextOrigin, ContextPayload};
+    let now = chrono::Utc::now();
+    AgentEvent::ingress(koi_core::domain::IngressEvent::ContextReceived {
+        context: Box::new(ContextEnvelope {
+            schema_version: 1,
+            kind: ContextKind::UserMessage,
+            origin: ContextOrigin {
+                source: "qq".into(),
+                source_instance: "group-42".into(),
+                native_event_id: native_event_id.into(),
+            },
+            actor: Some(Principal::new("qq", "10001")),
+            scope: koi_core::domain::Scope::new("qq_group", "42"),
+            occurred_at: now,
+            received_at: now,
+            position: None,
+            permission,
+            payload: ContextPayload::Text {
+                text: text.into(),
+                mentions: vec!["bot".into()],
+            },
+            causation_id: None,
+            content_hash: "test".into(),
+        }),
+        assessment: koi_core::domain::PermissionAssessment::new(
+            permission, permission, permission,
+        ),
+    })
+}
+
+fn external_provenance(permission: PermissionLevel) -> koi_core::domain::EventProvenance {
+    koi_core::domain::EventProvenance {
+        creator: EventSource::External(SourceName::new("qq").unwrap()),
+        direct_permission: Some(permission),
+        authority_parent_event_id: None,
+        expires_at: None,
+    }
+}
+
+#[tokio::test]
+async fn instruction_input_below_session_minimum_is_skipped_not_injected() {
+    use koi_core::domain::ControlEvent;
+    use koi_core::domain::ModelEvent;
+
+    let model = TextModel {
+        calls: AtomicUsize::new(0),
+    };
+    let tools = ToolRegistry::default();
+    let store = MemoryEventStore::default();
+    let events = Arc::clone(&store.events);
+    let mut runtime = TaskRuntime::new(store, TaskId::MAIN);
+    // 会话最低控制权限升到 Operator：User 输入不再满足指令门槛。
+    runtime
+        .record(
+            AgentEvent::control(ControlEvent::MinimumControlPermissionChanged {
+                minimum_permission: PermissionLevel::Operator,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    let below_minimum = runtime
+        .record_with_provenance(
+            external_message_event(
+                PermissionLevel::User,
+                "message-below",
+                "普通用户的低权限指令",
+            ),
+            None,
+            external_provenance(PermissionLevel::User),
+        )
+        .await
+        .unwrap();
+    let above_minimum = runtime
+        .record_with_provenance(
+            external_message_event(
+                PermissionLevel::Admin,
+                "message-above",
+                "管理员的合法指令",
+            ),
+            None,
+            external_provenance(PermissionLevel::Admin),
+        )
+        .await
+        .unwrap();
+
+    let resolver = EvidenceResolver {
+        ingress_event_id: above_minimum.id,
+    };
+    let providers = SourceAuthorizationRegistry::default();
+    let prompts = TestPromptProvider;
+    let agent = AgentLoop::new(&model, &tools, &resolver, &providers, None, &prompts);
+    let outcome = agent
+        .run_main(
+            &mut runtime,
+            AgentRunRequest {
+                trigger_event_id: Some(above_minimum.id),
+                context: vec![],
+                input_events: vec![below_minimum.clone(), above_minimum.clone()],
+                memory_query: None,
+                output_contract: ModelOutputContract::Text,
+                model_options: ModelGenerationOptions::default(),
+                max_model_turns: 2,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        AgentRunOutcome::Completed {
+            response: Some("收到".into()),
+        }
+    );
+    // 低权限输入被拒绝注入但不中断任务；高权限输入照常进入模型上下文。
+    let call_started = events
+        .lock()
+        .await
+        .iter()
+        .find(|event| {
+            matches!(
+                event.payload,
+                AgentEvent::Model(ref model) if matches!(model.as_ref(), ModelEvent::CallStarted { .. })
+            )
+        })
+        .unwrap()
+        .clone();
+    let AgentEvent::Model(model_event) = &call_started.payload else {
+        unreachable!();
+    };
+    let ModelEvent::CallStarted {
+        context_event_ids, ..
+    } = model_event.as_ref()
+    else {
+        unreachable!();
+    };
+    assert!(!context_event_ids.contains(&below_minimum.id));
+    assert!(context_event_ids.contains(&above_minimum.id));
 }

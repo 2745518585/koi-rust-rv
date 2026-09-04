@@ -500,6 +500,10 @@ fn context_events(events: &[EventEnvelope], limit: usize) -> Vec<EventEnvelope> 
 ///
 /// 只有最近一次模型完成之后新写入的 `ToolEvent::Finished` 才是模型尚未看到的；同一次
 /// 运行内已经继续推理过的工具结果都会被后续的模型完成事件覆盖。
+///
+/// 工具结果进入会话是一条显式的无权限限制通道：不经过会话最低控制权限审查。安全性
+/// 由授权规则保证——工具事件以 `None` 权限持久化且永远不能作为权限父节点，只能被
+/// 模型阅读，不能参与提权。
 fn pending_tool_results(events: &[EventEnvelope]) -> Vec<ModelContextItem> {
     let last_model_completed = events
         .iter()

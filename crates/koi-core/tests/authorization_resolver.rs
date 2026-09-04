@@ -65,3 +65,72 @@ async fn resolver_returns_persisted_source_limit_and_effective_permission() {
     assert_eq!(evidence.permission, PermissionLevel::Operator);
     assert_eq!(evidence.principal, Some(Principal::new("qq", "10001")));
 }
+
+fn system_internal_ingress_event(
+    task_id: TaskId,
+    kind: ContextKind,
+    sequence: u64,
+) -> EventEnvelope {
+    let now = Utc::now();
+    let mut event = EventEnvelope::new(
+        task_id,
+        sequence,
+        None,
+        AgentEvent::ingress(IngressEvent::ContextReceived {
+            context: Box::new(ContextEnvelope {
+                schema_version: 1,
+                kind,
+                origin: ContextOrigin {
+                    source: "internal-task".into(),
+                    source_instance: "core".into(),
+                    native_event_id: format!("internal-{sequence}"),
+                },
+                actor: None,
+                scope: Scope::new("task", task_id.to_string()),
+                occurred_at: now,
+                received_at: now,
+                position: None,
+                permission: PermissionLevel::None,
+                payload: ContextPayload::Text {
+                    text: "核心内部事件".into(),
+                    mentions: vec![],
+                },
+                causation_id: None,
+                content_hash: "test".into(),
+            }),
+            assessment: PermissionAssessment::new(
+                PermissionLevel::None,
+                PermissionLevel::None,
+                PermissionLevel::None,
+            ),
+        }),
+    );
+    event.provenance = EventProvenance {
+        creator: EventSource::System,
+        direct_permission: Some(PermissionLevel::System),
+        authority_parent_event_id: None,
+        expires_at: None,
+    };
+    event
+}
+
+#[tokio::test]
+async fn system_internal_events_hold_system_permission_but_cannot_be_authority_parents() {
+    let store = InMemoryEventStore::default();
+    let task_id = TaskId::new();
+    let goal = system_internal_ingress_event(task_id, ContextKind::SystemEvent, 1);
+    let tool_result = system_internal_ingress_event(task_id, ContextKind::ToolResult, 2);
+    store.append(&goal).await.unwrap();
+    store.append(&tool_result).await.unwrap();
+    let resolver = PersistedAuthorizationEvidenceResolver::new(&store);
+
+    // 核心内部事件显式拥有 System 权限。
+    let goal_evidence = resolver.resolve(task_id, goal.id).await.unwrap();
+    assert_eq!(goal_evidence.permission, PermissionLevel::System);
+    assert!(!goal_evidence.can_be_authority_parent());
+
+    // 工具结果回传保持无权限，仅供分析。
+    let result_evidence = resolver.resolve(task_id, tool_result.id).await.unwrap();
+    assert_eq!(result_evidence.permission, PermissionLevel::None);
+    assert!(!result_evidence.can_be_authority_parent());
+}

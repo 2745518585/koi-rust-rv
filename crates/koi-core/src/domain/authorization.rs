@@ -7,8 +7,6 @@ use thiserror::Error;
 use super::{EventId, EventSource, PermissionLevel, Principal, TaskId, ToolDefinition};
 
 /// 授权证据对应事件的顶级类别。
-///
-/// 控制事件可由其直接来源取得权限并用于控制操作，但不能成为任何事件的权限父节点。
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum AuthorizationEvidenceEventKind {
     Ingress,
@@ -17,17 +15,13 @@ pub enum AuthorizationEvidenceEventKind {
     Tool,
 }
 
-impl AuthorizationEvidenceEventKind {
-    #[must_use]
-    pub const fn can_be_authority_parent(self) -> bool {
-        !matches!(self, Self::Control)
-    }
-}
-
 /// 一条可用于工具授权的、已由事件读取层验证的输入证据。
 ///
-/// 控制事件自身可带有直接来源权限，但不能作为 `authority_parent_event_id` 的目标；模型、
-/// 工具来源在没有合法上级来源时不能获得权限。
+/// 控制事件与 System 来源的核心内部事件可以携带很高的直接权限（例如 `System`），
+/// 但这些权限只服务于核心自身的运转判定：它们永远不能作为 `authority_parent_event_id`
+/// 的目标参与模型的提权审查。工具事件回传以 `None` 权限持久化，可以无条件进入会话
+/// 供模型分析，但同样不能带来权限提升。模型、工具来源在没有合法上级来源时不能获得
+/// 权限。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AuthorizationEvidence {
     pub event_id: EventId,
@@ -64,6 +58,17 @@ impl AuthorizationEvidence {
     pub fn is_expired(&self) -> bool {
         self.expires_at
             .is_some_and(|expires_at| expires_at <= Utc::now())
+    }
+
+    /// 该证据对应的事件能否作为其他事件的权限父节点（提权审查的上级）。
+    ///
+    /// 两类事件被显式排除：控制事件（类别级规则），以及 System 来源的核心内部事件
+    /// （来源级规则，例如主会话引导输入与核心写人的控制指令）。它们携带的权限只用
+    /// 于核心自身运转，模型与工具永远不能借用。
+    #[must_use]
+    pub const fn can_be_authority_parent(&self) -> bool {
+        !matches!(self.event_kind, AuthorizationEvidenceEventKind::Control)
+            && !matches!(self.source, EventSource::System)
     }
 }
 

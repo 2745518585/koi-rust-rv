@@ -1,4 +1,4 @@
-﻿use std::sync::Arc;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use koi_core::domain::{
@@ -43,9 +43,24 @@ fn evidence(
 }
 
 #[test]
-fn control_event_cannot_be_an_authority_parent() {
-    assert!(!AuthorizationEvidenceEventKind::Control.can_be_authority_parent());
-    assert!(AuthorizationEvidenceEventKind::Ingress.can_be_authority_parent());
+fn internal_events_cannot_be_authority_parents() {
+    // 控制事件：类别级限制，即使它携带 System 直接权限。
+    let control = AuthorizationEvidence {
+        event_kind: AuthorizationEvidenceEventKind::Control,
+        ..evidence(PermissionLevel::System, AuthorizationEvidenceStatus::Active)
+    };
+    assert!(!control.can_be_authority_parent());
+    // System 来源的核心内部事件（例如子任务引导输入）：来源级限制。
+    let system_ingress = AuthorizationEvidence {
+        source: EventSource::System,
+        ..evidence(PermissionLevel::System, AuthorizationEvidenceStatus::Active)
+    };
+    assert!(!system_ingress.can_be_authority_parent());
+    // 外部输入是合法的权限父节点。
+    assert!(
+        evidence(PermissionLevel::User, AuthorizationEvidenceStatus::Active)
+            .can_be_authority_parent()
+    );
 }
 
 #[test]

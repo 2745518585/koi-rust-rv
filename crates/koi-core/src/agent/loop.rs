@@ -12,7 +12,7 @@ use crate::agent::{
 };
 use crate::domain::{
     AgentEvent, AuthorizationRequest, AuthorizationRequestResult, AuthorizedToolInvocation,
-    ContextEnvelope, ContextKind, ContextOrigin, ContextPayload, ControlEvent, EventId, EventSource,
+    ContextEnvelope, ContextKind, ContextOrigin, ContextPayload, ControlEvent, EventId,
     IngressEvent, MemoryContextBuilder, MemoryQuery, ModelContextItem, ModelError, ModelEvent,
     ModelGenerationOptions, ModelInputRole, ModelOutput, ModelOutputContract, ModelRequest,
     ModelStreamEvent, PermissionAssessment, PermissionCheckResult, PermissionChecker,
@@ -218,7 +218,7 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
         let binding = approval_binding(&events, approval_submission_event_id)?;
         let is_main_session = task_id.is_main();
 
-        let mut context = self.build_initial_context(task_id, &request).await?;
+        let mut context = self.build_initial_context(runtime, &request).await?;
         let available_evidence = context
             .iter()
             .map(|item| item.event_id)
@@ -320,9 +320,7 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
         } else if status.is_terminal() || (!is_main_session && status != TaskStatus::Queued) {
             return Err(AgentLoopError::TaskNotNew(runtime.projection().status));
         }
-        let context = self
-            .build_initial_context(runtime.projection().task_id, &request)
-            .await?;
+        let context = self.build_initial_context(runtime, &request).await?;
 
         self.run_turns(runtime, request, cancel, is_main_session, context)
             .await
@@ -446,13 +444,37 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
         Ok(())
     }
 
+    /// 构建首轮模型上下文，并在注入前完成输入事件的权限检查。
+    ///
+    /// 检查分两层：
+    /// 1. 持久化完整性——输入事件必须已存在于事件存储且与持久化内容一致，否则其
+    ///    事件 ID 可能被模型当作伪造的授权证据引用（权限提升通道）；
+    /// 2. 会话最低控制权限——指令性输入（用户消息与告警）的权限结论必须满足任务
+    ///    投影的最低控制权限。不满足的输入被拒绝注入但不中断任务，事件保留在流中
+    ///    供审计；其余输入照常注入。内部回声（系统事件、核心回传工具结果）豁免。
     async fn build_initial_context(
         &self,
-        task_id: crate::domain::TaskId,
+        runtime: &TaskRuntime<S>,
         request: &AgentRunRequest,
-    ) -> Result<Vec<ModelContextItem>, AgentLoopError> {
+    ) -> Result<Vec<ModelContextItem>, AgentLoopError>
+    where
+        S: EventStore,
+    {
+        let task_id = runtime.projection().task_id;
         let mut context = request.context.clone();
-        context.extend(InputInjector::default().inject_many(task_id, &request.input_events)?);
+        if !request.input_events.is_empty() {
+            let stored = runtime.load_events().await?;
+            InputInjector::verify_persisted_events(&request.input_events, &stored)?;
+            let injector = InputInjector::default();
+            let minimum_control_permission = runtime.projection().minimum_control_permission;
+            for event in &request.input_events {
+                match injector.inject(task_id, event, minimum_control_permission) {
+                    Ok(item) => context.push(item),
+                    Err(InputInjectionError::InsufficientControlPermission { .. }) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
         if let (Some(memory), Some(query)) = (self.memory, request.memory_query.as_ref()) {
             let results = memory.search(query.clone()).await?;
             context.extend(MemoryContextBuilder::build(query, results));
@@ -747,9 +769,10 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                 .resolve(task_id, current_event_id)
                 .await
                 .ok()?;
-            // 从工具提议事件自身开始逐层审查。控制事件只允许自身接受直接来源权限，不能
-            // 被模型、工具或其他事件作为权限父节点借用。
-            if !event.event_kind.can_be_authority_parent() {
+            // 从工具提议事件自身开始逐层审查。控制事件与 System 来源的核心内部事件
+            // 只承载核心自身运转所需的权限，不能被模型、工具或其他事件作为权限父节点
+            // 借用；工具事件回传可以无条件进入会话，但其权限为 None，同样不能提权。
+            if !event.can_be_authority_parent() {
                 return None;
             }
             if event.status != crate::domain::AuthorizationEvidenceStatus::Active
@@ -1144,6 +1167,11 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
     }
 
     /// 为新子任务写入生命周期事件与首条系统指令输入。
+    ///
+    /// 系统事件是一种输入事件：它与用户消息走同一条注入管线、受同一权限审查，但它
+    /// 携带的 `System` 权限是最高等级，对任何会话最低控制权限都满足，因此核心写入的
+    /// 系统事件一定能注入上下文。同时它以 System 来源持久化，永远不能被模型当作
+    /// 权限父节点借用（见 `AuthorizationEvidence::can_be_authority_parent`）。
     async fn bootstrap_child_task(
         &self,
         created: &mut crate::agent::CreatedChild<S>,
@@ -1164,9 +1192,9 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
             .await?;
         let now = chrono::Utc::now();
         let assessment = PermissionAssessment::new(
-            PermissionLevel::None,
-            PermissionLevel::None,
-            PermissionLevel::None,
+            PermissionLevel::System,
+            PermissionLevel::System,
+            PermissionLevel::System,
         );
         child
             .record_with_provenance(
@@ -1184,7 +1212,7 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                         occurred_at: now,
                         received_at: now,
                         position: None,
-                        permission: PermissionLevel::None,
+                        permission: PermissionLevel::System,
                         payload: ContextPayload::Text {
                             text: message,
                             mentions: Vec::new(),
@@ -1195,12 +1223,7 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                     assessment,
                 }),
                 Some(started_event_id),
-                crate::domain::EventProvenance {
-                    creator: EventSource::System,
-                    direct_permission: Some(PermissionLevel::None),
-                    authority_parent_event_id: None,
-                    expires_at: None,
-                },
+                crate::domain::EventProvenance::system(),
             )
             .await?;
         Ok(())
