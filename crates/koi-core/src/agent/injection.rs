@@ -85,6 +85,11 @@ impl InputInjector {
         if context.permission != assessment.effective_permission {
             return Err(InputInjectionError::PermissionMismatch(event.id));
         }
+        if context.kind == ContextKind::ToolResult
+            && assessment.effective_permission != PermissionLevel::None
+        {
+            return Err(InputInjectionError::ToolResultHasPermission(event.id));
+        }
         validate_ingress_creator(
             event,
             &context.origin.source,
@@ -262,6 +267,8 @@ pub enum InputInjectionError {
     PermissionAssessmentInconsistent(crate::domain::EventId),
     #[error("输入事件权限结论与上下文不一致：{0}")]
     PermissionMismatch(crate::domain::EventId),
+    #[error("工具结果必须是不具备授权能力的 None 权限：{0}")]
+    ToolResultHasPermission(crate::domain::EventId),
     #[error("输入事件的创建者无权使用该上下文类型：{0}")]
     InvalidIngressCreator(crate::domain::EventId),
     #[error("输入事件来源与上下文来源不一致：{0}")]

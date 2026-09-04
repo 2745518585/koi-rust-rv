@@ -294,6 +294,34 @@ fn tool_result_echo_enters_session_without_permission_limits() {
 }
 
 #[test]
+fn rejects_tool_result_with_non_none_permission() {
+    let task_id = TaskId::new();
+    let mut event = user_input_event(task_id);
+    if let AgentEvent::Ingress(ingress) = &mut event.payload {
+        if let IngressEvent::ContextReceived {
+            context,
+            assessment,
+        } = ingress.as_mut()
+        {
+            context.kind = ContextKind::ToolResult;
+            context.permission = PermissionLevel::Admin;
+            assessment.suggested_permission = PermissionLevel::Admin;
+            assessment.source_maximum_permission = PermissionLevel::Admin;
+            assessment.identity_maximum_permission = PermissionLevel::Admin;
+            assessment.effective_permission = PermissionLevel::Admin;
+        }
+    }
+
+    let error = InputInjector::default()
+        .inject(task_id, &event, PermissionLevel::Admin)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        InputInjectionError::ToolResultHasPermission(event_id) if event_id == event.id
+    ));
+}
+
+#[test]
 fn rejects_inconsistent_permission_assessment_before_injection() {
     let task_id = TaskId::new();
     let mut event = user_input_event(task_id);
@@ -329,8 +357,11 @@ fn verify_persisted_events_rejects_missing_and_tampered_inputs() {
     let unknown = user_input_event(task_id);
 
     // 与持久化内容一致：通过。
-    InputInjector::verify_persisted_events(std::slice::from_ref(&persisted), std::slice::from_ref(&persisted))
-        .unwrap();
+    InputInjector::verify_persisted_events(
+        std::slice::from_ref(&persisted),
+        std::slice::from_ref(&persisted),
+    )
+    .unwrap();
     // 未持久化：拒绝。
     assert!(matches!(
         InputInjector::verify_persisted_events(std::slice::from_ref(&unknown), std::slice::from_ref(&persisted)),

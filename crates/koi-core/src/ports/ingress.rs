@@ -5,8 +5,9 @@ use thiserror::Error;
 
 use crate::agent::{RuntimeError, TaskRuntime};
 use crate::domain::{
-    AgentEvent, EventEnvelope, EventId, EventProvenance, EventSource, IngressDraft, IngressEvent,
-    IngressSubject, PermissionAssessment, PermissionLevel, SourceName, SourceNameError, TaskId,
+    AgentEvent, ContextKind, EventEnvelope, EventId, EventProvenance, EventSource, IngressDraft,
+    IngressEvent, IngressSubject, PermissionAssessment, PermissionLevel, SourceName,
+    SourceNameError, TaskId,
 };
 use crate::ports::EventStore;
 
@@ -131,8 +132,16 @@ impl<'a> IngressRegistrar<'a> {
     ) -> Result<PermissionAssessment, IngressRegistrationError> {
         let identity_maximum_permission =
             self.permissions.maximum_permission(draft.subject()).await?;
+        // 工具回传只用于向模型提供执行结果，不能表达用户意图或作为工具授权证据。
+        // 即使外部适配器错误地建议高权限，也必须在事件落库前归零。
+        let suggested_permission = match draft {
+            IngressDraft::Context { context, .. } if context.kind == ContextKind::ToolResult => {
+                PermissionLevel::None
+            }
+            _ => draft.suggested_permission(),
+        };
         Ok(PermissionAssessment::new(
-            draft.suggested_permission(),
+            suggested_permission,
             source.maximum_permission,
             identity_maximum_permission,
         ))

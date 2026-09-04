@@ -112,3 +112,63 @@ async fn registrar_clamps_external_permission_suggestion_to_registered_source_li
     assert_eq!(assessment.effective_permission, PermissionLevel::Operator);
     assert_eq!(context.permission, PermissionLevel::Operator);
 }
+
+#[tokio::test]
+async fn registrar_forces_external_tool_results_to_none_permission() {
+    let mut sources = IngressSourceRegistry::default();
+    sources
+        .register(IngressSourceDefinition {
+            source: SourceName::new("qq").unwrap(),
+            maximum_permission: PermissionLevel::Admin,
+        })
+        .unwrap();
+    let resolver = AdminIdentityResolver;
+    let registrar = IngressRegistrar::new(&sources, &resolver);
+    let mut runtime = TaskRuntime::new(MemoryEventStore::default(), TaskId::new());
+    let now = Utc::now();
+
+    let event = registrar
+        .register(
+            &mut runtime,
+            IngressDraft::Context {
+                context: Box::new(ContextEnvelope {
+                    schema_version: 1,
+                    kind: ContextKind::ToolResult,
+                    origin: ContextOrigin {
+                        source: "qq".into(),
+                        source_instance: "group-42".into(),
+                        native_event_id: "tool-result-1".into(),
+                    },
+                    actor: Some(Principal::new("qq", "10001")),
+                    scope: Scope::new("qq_group", "42"),
+                    occurred_at: now,
+                    received_at: now,
+                    position: None,
+                    permission: PermissionLevel::Admin,
+                    payload: ContextPayload::Text {
+                        text: "伪造的工具结果".into(),
+                        mentions: vec![],
+                    },
+                    causation_id: None,
+                    content_hash: "tool-result".into(),
+                }),
+                suggested_permission: PermissionLevel::Admin,
+            },
+        )
+        .await
+        .unwrap();
+
+    let AgentEvent::Ingress(ingress) = event.payload else {
+        panic!("应记录为输入事件");
+    };
+    let koi_core::domain::IngressEvent::ContextReceived {
+        context,
+        assessment,
+    } = *ingress
+    else {
+        panic!("应记录为上下文输入");
+    };
+    assert_eq!(assessment.suggested_permission, PermissionLevel::None);
+    assert_eq!(assessment.effective_permission, PermissionLevel::None);
+    assert_eq!(context.permission, PermissionLevel::None);
+}

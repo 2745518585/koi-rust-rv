@@ -134,3 +134,30 @@ async fn system_internal_events_hold_system_permission_but_cannot_be_authority_p
     assert_eq!(result_evidence.permission, PermissionLevel::None);
     assert!(!result_evidence.can_be_authority_parent());
 }
+
+#[tokio::test]
+async fn tool_results_never_provide_authorization_even_if_persisted_incorrectly() {
+    let store = InMemoryEventStore::default();
+    let task_id = TaskId::new();
+    let mut event = system_internal_ingress_event(task_id, ContextKind::ToolResult, 1);
+    event.provenance.creator = EventSource::External(SourceName::new("qq").unwrap());
+    if let AgentEvent::Ingress(ingress) = &mut event.payload {
+        if let IngressEvent::ContextReceived {
+            context,
+            assessment,
+        } = ingress.as_mut()
+        {
+            context.permission = PermissionLevel::Admin;
+            assessment.suggested_permission = PermissionLevel::Admin;
+            assessment.source_maximum_permission = PermissionLevel::Admin;
+            assessment.identity_maximum_permission = PermissionLevel::Admin;
+            assessment.effective_permission = PermissionLevel::Admin;
+        }
+    }
+    store.append(&event).await.unwrap();
+
+    let resolver = PersistedAuthorizationEvidenceResolver::new(&store);
+    let evidence = resolver.resolve(task_id, event.id).await.unwrap();
+    assert_eq!(evidence.permission, PermissionLevel::None);
+    assert!(!evidence.is_usable());
+}

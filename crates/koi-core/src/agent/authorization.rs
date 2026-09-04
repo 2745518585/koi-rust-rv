@@ -107,6 +107,20 @@ fn ingress_evidence(
     match ingress {
         IngressEvent::ContextReceived {
             context,
+            assessment: _,
+        } if context.kind == crate::domain::ContextKind::ToolResult => {
+            // 工具结果是数据回传通道，不论其由哪个适配器提交、持久化内容是否异常，都
+            // 绝不能成为工具授权证据。这里再次归零，防御历史脏数据或绕过登记器写入。
+            Ok((
+                AuthorizationEvidenceEventKind::Ingress,
+                None,
+                PermissionLevel::None,
+                PermissionLevel::None,
+                None,
+            ))
+        }
+        IngressEvent::ContextReceived {
+            context,
             assessment,
         } => match creator {
             EventSource::External(_) => Ok((
@@ -118,18 +132,6 @@ fn ingress_evidence(
             )),
             // 工具结果回传必须保持无权限，仅供模型分析；即使评估结论被伪造为高权限，
             // 证据仍按 None 计算。
-            EventSource::System
-                if context.kind == crate::domain::ContextKind::ToolResult
-                    && assessment.effective_permission == PermissionLevel::None =>
-            {
-                Ok((
-                    AuthorizationEvidenceEventKind::Ingress,
-                    None,
-                    PermissionLevel::None,
-                    PermissionLevel::None,
-                    None,
-                ))
-            }
             // 其余核心内部事件（例如子任务引导输入）拥有 System 直接权限：该权限只
             // 代表事件由核心创建并可用于核心自身的运转判定。System 来源事件永远不能
             // 作为权限父节点参与模型的提权审查（见 `can_be_authority_parent`），因此
@@ -141,9 +143,9 @@ fn ingress_evidence(
                 PermissionLevel::System,
                 None,
             )),
-            EventSource::Model | EventSource::Tool => Err(AuthorizationError::new(
-                "输入事件必须由外部来源或核心创建",
-            )),
+            EventSource::Model | EventSource::Tool => {
+                Err(AuthorizationError::new("输入事件必须由外部来源或核心创建"))
+            }
         },
         IngressEvent::ApprovalSubmitted {
             approval_request_event_id,
