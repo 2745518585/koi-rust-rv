@@ -112,11 +112,39 @@ export class KoiApiClient {
     });
   }
 
+  async appendTaskContext(
+    taskId: string,
+    request: { message: string; kind?: "user_message" | "alert" },
+  ): Promise<TaskEvent> {
+    return this.request<TaskEvent>(`/tasks/${encodeURIComponent(taskId)}/events`, {
+      method: "POST",
+      body: JSON.stringify({ kind: "user_message", ...request }),
+    });
+  }
+
+  async requestCancellation(taskId: string, reason: string): Promise<TaskEvent> {
+    return this.request<TaskEvent>(`/tasks/${encodeURIComponent(taskId)}/cancellation-requests`, {
+      method: "POST",
+      body: JSON.stringify({ reason }),
+    });
+  }
+
   async controlTask(taskId: string, request: TaskControlRequest): Promise<TaskSummary> {
     return this.request<TaskSummary>(`/tasks/${encodeURIComponent(taskId)}/controls`, {
       method: "POST",
       body: JSON.stringify(request),
     });
+  }
+
+  async nameTask(taskId: string, name: string): Promise<TaskSummary> {
+    return this.request<TaskSummary>(`/tasks/${encodeURIComponent(taskId)}/name`, {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    });
+  }
+
+  async deleteTask(taskId: string): Promise<void> {
+    await this.request<void>(`/tasks/${encodeURIComponent(taskId)}`, { method: "DELETE" });
   }
 
   async submitApproval(

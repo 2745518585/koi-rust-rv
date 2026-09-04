@@ -30,6 +30,7 @@ import {
   Plus,
   RefreshCw,
   Search,
+  Send,
   Server,
   Settings2,
   ShieldAlert,
@@ -37,6 +38,7 @@ import {
   Sparkles,
   Terminal,
   TicketCheck,
+  Trash2,
   Wifi,
   Wrench,
   X,
@@ -62,7 +64,7 @@ import type {
 } from "./api/types";
 import { useI18n } from "./i18n";
 
-type ViewKey = "overview" | "tasks" | "approvals" | "tools" | "audit";
+type ViewKey = "overview" | "conversations" | "tasks" | "approvals" | "tools" | "audit";
 
 interface NavItem {
   key: ViewKey;
@@ -72,7 +74,7 @@ interface NavItem {
 }
 
 const navIcons: Array<Pick<NavItem, "key" | "icon">> = [
-  { key: "overview", icon: LayoutDashboard }, { key: "tasks", icon: Command },
+  { key: "overview", icon: LayoutDashboard }, { key: "conversations", icon: MessageSquare }, { key: "tasks", icon: Command },
   { key: "approvals", icon: TicketCheck }, { key: "tools", icon: Wrench },
   { key: "audit", icon: FileClock },
 ];
@@ -380,6 +382,23 @@ function App() {
     setToast("诊断任务已加入队列");
   }
 
+  function handleTaskUpdated(task: TaskSummary) {
+    setSnapshot((current) => ({
+      ...current,
+      tasks: current.tasks.map((item) => item.taskId === task.taskId ? task : item),
+    }));
+  }
+
+  function handleTaskDeleted(taskId: string) {
+    setSnapshot((current) => ({
+      ...current,
+      tasks: current.tasks.filter((task) => task.taskId !== taskId),
+      recentEvents: current.recentEvents.filter((event) => event.taskId !== taskId),
+      approvals: current.approvals.filter((approval) => approval.taskId !== taskId),
+    }));
+    setSelectedTaskId(MAIN_TASK_ID);
+  }
+
   const navWithCounts: NavItem[] = navIcons.map((item) => ({ ...item, label: t(item.key) })).map((item) =>
     item.key === "approvals" ? { ...item, count: pendingApprovals.length } : item,
   );
@@ -510,6 +529,19 @@ function App() {
               onRefresh={refreshSnapshot}
               refreshing={refreshing}
               onNewTask={() => setComposerOpen(true)}
+            />
+          ) : null}
+          {view === "conversations" ? (
+            <ConversationWorkspace
+              api={api}
+              tasks={snapshot.tasks}
+              selectedTaskId={selectedTaskId}
+              isLive={isLive}
+              onSelectTask={setSelectedTaskId}
+              onTaskUpdated={handleTaskUpdated}
+              onTaskDeleted={handleTaskDeleted}
+              onRefresh={refreshSnapshot}
+              onToast={setToast}
             />
           ) : null}
           {view === "tasks" ? (
@@ -990,6 +1022,192 @@ function TaskTable({
 
 function EmptyState({ icon: Icon, title, description }: { icon: LucideIcon; title: string; description: string }) {
   return <div className="empty-state"><span className="empty-icon"><Icon size={21} /></span><strong>{title}</strong><p>{description}</p></div>;
+}
+
+function ConversationWorkspace({
+  api,
+  tasks,
+  selectedTaskId,
+  isLive,
+  onSelectTask,
+  onTaskUpdated,
+  onTaskDeleted,
+  onRefresh,
+  onToast,
+}: {
+  api: ReturnType<typeof createKoiApiClient>;
+  tasks: TaskSummary[];
+  selectedTaskId: string;
+  isLive: boolean;
+  onSelectTask: (taskId: string) => void;
+  onTaskUpdated: (task: TaskSummary) => void;
+  onTaskDeleted: (taskId: string) => void;
+  onRefresh: () => Promise<void>;
+  onToast: (message: string) => void;
+}) {
+  const { locale } = useI18n();
+  const copy = locale === "en" ? {
+    title: "Conversation workspace", subtitle: "Continue an agent task, inspect the complete event record, or manage a task session.",
+    sessions: "Sessions", main: "Main session", task: "Task sessions", empty: "No accessible task sessions yet.",
+    conversation: "Conversation", events: "Events", type: "Message the agent…", send: "Send", sending: "Sending…",
+    pause: "Pause", resume: "Resume", stop: "Request stop", rename: "Rename", remove: "Delete",
+    allEvents: "All events", loading: "Loading session…", noMessages: "No conversational events yet.",
+    requestStop: "Web user requested task interruption", renamed: "Task renamed", deleted: "Task deleted",
+    controlFailed: "Task action could not be completed", inputFailed: "Message could not be sent",
+    mainNotice: "The main session appears only when your account is authorized to access it.",
+  } : {
+    title: "会话工作台", subtitle: "持续和 Agent 对话、查看完整事件记录，并通过受审计的任务会话控制完成管理。",
+    sessions: "会话", main: "主会话", task: "任务会话", empty: "还没有可访问的任务会话。",
+    conversation: "对话", events: "事件", type: "输入要交给 Agent 的内容…", send: "发送", sending: "发送中…",
+    pause: "暂停", resume: "恢复", stop: "请求中止", rename: "重命名", remove: "删除",
+    allEvents: "全部事件", loading: "正在读取会话…", noMessages: "当前还没有可显示的对话事件。",
+    requestStop: "Web 用户请求中止该任务", renamed: "任务已重命名", deleted: "任务已删除",
+    controlFailed: "无法完成任务操作", inputFailed: "消息发送失败", mainNotice: "只有获授权访问主会话的账户才会在这里看到主会话。",
+  };
+  const [mode, setMode] = useState<"conversation" | "events">("conversation");
+  const [events, setEvents] = useState<TaskEvent[]>([]);
+  const [message, setMessage] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const selected = tasks.find((task) => task.taskId === selectedTaskId) ?? tasks[0];
+  const mainSession = tasks.find((task) => task.isMain);
+  const children = tasks.filter((task) => !task.isMain);
+
+  useEffect(() => {
+    if (!selected || !isLive) {
+      setEvents([]);
+      return;
+    }
+    let active = true;
+    setLoading(true);
+    api.getTaskEvents(selected.taskId)
+      .then((next) => { if (active) setEvents(next.sort((a, b) => a.sequence - b.sequence)); })
+      .catch(() => { if (active) setEvents([]); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [api, isLive, selected?.taskId]);
+
+  async function refreshSession() {
+    await onRefresh();
+    if (selected && isLive) {
+      try { setEvents((await api.getTaskEvents(selected.taskId)).sort((a, b) => a.sequence - b.sequence)); } catch { /* snapshot refresh remains authoritative */ }
+    }
+  }
+
+  async function sendMessage(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selected || !message.trim() || submitting) return;
+    setSubmitting(true);
+    try {
+      const recorded = await api.appendTaskContext(selected.taskId, { message: message.trim() });
+      setEvents((current) => [...current, recorded]);
+      setMessage("");
+      await refreshSession();
+    } catch {
+      onToast(copy.inputFailed);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function control(action: "pause" | "resume") {
+    if (!selected) return;
+    setSubmitting(true);
+    try {
+      onTaskUpdated(await api.controlTask(selected.taskId, { action }));
+      await refreshSession();
+    } catch { onToast(copy.controlFailed); } finally { setSubmitting(false); }
+  }
+
+  async function stop() {
+    if (!selected) return;
+    setSubmitting(true);
+    try {
+      await api.requestCancellation(selected.taskId, copy.requestStop);
+      await refreshSession();
+    } catch { onToast(copy.controlFailed); } finally { setSubmitting(false); }
+  }
+
+  async function rename() {
+    if (!selected || selected.isMain) return;
+    const name = window.prompt(copy.rename, selected.title)?.trim();
+    if (!name) return;
+    setSubmitting(true);
+    try {
+      onTaskUpdated(await api.nameTask(selected.taskId, name));
+      onToast(copy.renamed);
+    } catch { onToast(copy.controlFailed); } finally { setSubmitting(false); }
+  }
+
+  async function remove() {
+    if (!selected || selected.isMain || !window.confirm(`${copy.remove} “${selected.title}”?`)) return;
+    setSubmitting(true);
+    try {
+      await api.deleteTask(selected.taskId);
+      onTaskDeleted(selected.taskId);
+      onToast(copy.deleted);
+    } catch { onToast(copy.controlFailed); } finally { setSubmitting(false); }
+  }
+
+  const displayedEvents = mode === "conversation"
+    ? events.filter((event) => event.kind === "ingress" || event.kind === "model" || event.kind === "tool")
+    : events;
+
+  return <section className="conversation-workspace">
+    <header className="conversation-header">
+      <div><div className="page-eyebrow">AGENT SESSION</div><h1>{copy.title}</h1><p>{copy.subtitle}</p></div>
+      <button className="button button-secondary" onClick={() => void refreshSession()} disabled={loading}><RefreshCw className={loading ? "spin" : ""} size={16} />{locale === "en" ? "Refresh" : "刷新"}</button>
+    </header>
+    <div className="conversation-layout">
+      <aside className="session-list" aria-label={copy.sessions}>
+        <div className="session-list-heading"><span>{copy.sessions}</span><span>{tasks.length}</span></div>
+        {mainSession ? <><div className="session-group-label">{copy.main}</div><SessionItem task={mainSession} selected={selected?.taskId === mainSession.taskId} onSelect={onSelectTask} /></> : <p className="session-main-notice">{copy.mainNotice}</p>}
+        <div className="session-group-label">{copy.task}</div>
+        <div className="session-list-items">{children.length ? children.map((task) => <SessionItem task={task} selected={selected?.taskId === task.taskId} onSelect={onSelectTask} key={task.taskId} />) : <p className="session-empty">{copy.empty}</p>}</div>
+      </aside>
+      <div className="conversation-panel">
+        {selected ? <>
+          <div className="conversation-panel-head">
+            <div><div className="conversation-task-title"><Bot size={17} /> <strong>{selected.title}</strong></div><span>{scopeLabel(selected)} · {selected.eventCount} {locale === "en" ? "events" : "个事件"}</span></div>
+            <span className={`status-badge ${statusMeta[selected.status].className}`}>{statusMeta[selected.status].label}</span>
+          </div>
+          <div className="conversation-toolbar">
+            <div className="segment-control"><button className={mode === "conversation" ? "segment-active" : ""} onClick={() => setMode("conversation")}><MessageSquare size={15} />{copy.conversation}</button><button className={mode === "events" ? "segment-active" : ""} onClick={() => setMode("events")}><FileClock size={15} />{copy.events}</button></div>
+            <div className="task-controls">
+              {selected.status === "Paused" ? <button onClick={() => void control("resume")} disabled={submitting}><Play size={14} />{copy.resume}</button> : <button onClick={() => void control("pause")} disabled={submitting || selected.status === "Completed" || selected.status === "Cancelled" || selected.status === "Failed"}><Pause size={14} />{copy.pause}</button>}
+              <button className="task-control-warning" onClick={() => void stop()} disabled={submitting}><CircleStop size={14} />{copy.stop}</button>
+              {!selected.isMain && <button onClick={() => void rename()} disabled={submitting}>{copy.rename}</button>}
+              {!selected.isMain && <button className="task-control-danger" onClick={() => void remove()} disabled={submitting}><Trash2 size={14} />{copy.remove}</button>}
+            </div>
+          </div>
+          <div className={`session-feed ${mode === "events" ? "session-feed-events" : ""}`}>
+            {loading ? <div className="session-loading"><LoaderCircle className="spin" size={18} />{copy.loading}</div> : displayedEvents.length ? displayedEvents.map((item) => mode === "conversation" ? <ConversationMessage event={item} key={item.id} /> : <SessionEvent event={item} key={item.id} />) : <EmptyState icon={Inbox} title={copy.noMessages} description={mode === "events" ? copy.allEvents : copy.type} />}
+          </div>
+          <form className="session-composer" onSubmit={sendMessage}>
+            <textarea value={message} onChange={(event) => setMessage(event.target.value)} placeholder={copy.type} rows={2} disabled={submitting} />
+            <button className="button button-primary" type="submit" disabled={submitting || !message.trim()}>{submitting ? <LoaderCircle className="spin" size={16} /> : <Send size={16} />}{submitting ? copy.sending : copy.send}</button>
+          </form>
+        </> : <EmptyState icon={MessageSquare} title={copy.empty} description={copy.mainNotice} />}
+      </div>
+    </div>
+  </section>;
+}
+
+function SessionItem({ task, selected, onSelect }: { task: TaskSummary; selected: boolean; onSelect: (taskId: string) => void }) {
+  const Icon = task.isMain ? Command : Bot;
+  return <button className={`session-item ${selected ? "session-item-active" : ""}`} onClick={() => onSelect(task.taskId)}><span className={`session-item-icon ${task.isMain ? "session-item-icon-main" : ""}`}><Icon size={15} /></span><span><strong>{task.title}</strong><small>{statusMeta[task.status].label} · {compactId(task.taskId)}</small></span></button>;
+}
+
+function ConversationMessage({ event }: { event: TaskEvent }) {
+  const isUser = event.kind === "ingress";
+  const isTool = event.kind === "tool";
+  return <article className={`conversation-message ${isUser ? "conversation-message-user" : ""} ${isTool ? "conversation-message-tool" : ""}`}><div className="conversation-message-meta"><span>{isUser ? "YOU" : isTool ? "TOOL" : "AGENT"}</span><time>{formatRelative(event.occurredAt)}</time></div><strong>{event.title}</strong><p>{event.summary}</p></article>;
+}
+
+function SessionEvent({ event }: { event: TaskEvent }) {
+  const meta = eventKindMeta[event.kind] ?? eventKindMeta.system;
+  const Icon = meta.icon;
+  return <article className="session-event"><span className={`event-icon ${meta.className}`}><Icon size={15} /></span><div><div><strong>{event.sequence.toString().padStart(3, "0")} · {event.title}</strong><time>{formatRelative(event.occurredAt)}</time></div><p>{event.summary}</p><small>{event.source} · {event.permission}</small></div></article>;
 }
 
 function TasksView({
