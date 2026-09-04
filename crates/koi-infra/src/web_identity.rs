@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Mutex, RwLock};
+use std::time::{Duration, SystemTime};
 
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
@@ -25,7 +26,7 @@ const ADMIN_SUBJECT: &str = "web-admin";
 pub struct WebUserStore {
     path: PathBuf,
     users: RwLock<BTreeMap<String, StoredUser>>,
-    sessions: Mutex<BTreeMap<String, String>>,
+    sessions: Mutex<BTreeMap<String, StoredSession>>,
     admin_token: String,
 }
 
@@ -41,6 +42,14 @@ struct StoredUser {
     username: String,
     password_hash: String,
 }
+
+#[derive(Clone, Debug)]
+struct StoredSession {
+    username: String,
+    expires_at: SystemTime,
+}
+
+const SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 
 impl WebUserStore {
     /// Opens (or creates on first registration) a local account database.
@@ -120,7 +129,13 @@ impl WebUserStore {
         self.sessions
             .lock()
             .map_err(|_| WebApiError::Unavailable("用户会话锁不可用".into()))?
-            .insert(token.clone(), user.username.clone());
+            .insert(
+                token.clone(),
+                StoredSession {
+                    username: user.username.clone(),
+                    expires_at: SystemTime::now() + SESSION_TTL,
+                },
+            );
         Ok(WebSession {
             token,
             principal: principal_for(user),
@@ -133,7 +148,13 @@ impl WebUserStore {
         self.sessions
             .lock()
             .map_err(|_| WebApiError::Unavailable("用户会话锁不可用".into()))?
-            .insert(token.clone(), ADMIN_SUBJECT.into());
+            .insert(
+                token.clone(),
+                StoredSession {
+                    username: ADMIN_SUBJECT.into(),
+                    expires_at: SystemTime::now() + SESSION_TTL,
+                },
+            );
         Ok(WebSession {
             token,
             principal: WebPrincipal::admin(ADMIN_SUBJECT, Some("Web Admin".into())),
@@ -188,13 +209,17 @@ impl WebIdentityProvider for WebUserStore {
     }
 
     fn authenticate_session(&self, token: &str) -> Result<WebSession, WebApiError> {
-        let username = self
-            .sessions
-            .lock()
-            .map_err(|_| WebApiError::Unavailable("用户会话锁不可用".into()))?
-            .get(token)
-            .cloned()
-            .ok_or_else(|| WebApiError::Forbidden("Web 会话已失效".into()))?;
+        let username = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| WebApiError::Unavailable("用户会话锁不可用".into()))?;
+            sessions.retain(|_, session| session.expires_at > SystemTime::now());
+            sessions
+                .get(token)
+                .map(|session| session.username.clone())
+                .ok_or_else(|| WebApiError::Forbidden("Web 会话已失效".into()))?
+        };
         if username == ADMIN_SUBJECT {
             return Ok(WebSession {
                 token: token.into(),
@@ -221,6 +246,14 @@ impl WebIdentityProvider for WebUserStore {
             return Err(WebApiError::Forbidden("无效的 Bearer 访问令牌".into()));
         }
         self.create_admin_session()
+    }
+
+    fn logout(&self, token: &str) -> Result<(), WebApiError> {
+        self.sessions
+            .lock()
+            .map_err(|_| WebApiError::Unavailable("用户会话锁不可用".into()))?
+            .remove(token);
+        Ok(())
     }
 }
 

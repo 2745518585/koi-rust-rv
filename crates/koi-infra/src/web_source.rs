@@ -187,6 +187,7 @@ impl KoiWebSource {
                 .map_err(|error| WebApiError::internal(error.to_string()))?;
             records.push(TaskRecord {
                 task_id,
+                owner_subject: task_owner(&events),
                 summary: task_dto(task_id, &events, runtime.projection()),
                 events,
             });
@@ -195,10 +196,41 @@ impl KoiWebSource {
         Ok(records)
     }
 
-    /// 恢复主会话运行时。Web 侧所有跨任务管理操作都以主会话事件流为审计骨架。
-    async fn recover_main_runtime(
+    fn can_access_record(principal: &WebPrincipal, record: &TaskRecord) -> bool {
+        principal.permission == PermissionLevel::Admin
+            || record.owner_subject.as_deref() == Some(principal.subject.as_str())
+    }
+
+    async fn load_accessible_task(
         &self,
-    ) -> Result<TaskRuntime<Arc<JsonlEventStore>>, WebApiError> {
+        principal: &WebPrincipal,
+        task_id: TaskId,
+    ) -> Result<TaskRecord, WebApiError> {
+        let events = self
+            .store
+            .load_task(task_id)
+            .await
+            .map_err(|error| WebApiError::internal(error.to_string()))?;
+        if events.is_empty() {
+            return Err(WebApiError::not_found("任务不存在"));
+        }
+        let runtime = TaskRuntime::recover(Arc::clone(&self.store), task_id)
+            .await
+            .map_err(|error| WebApiError::internal(error.to_string()))?;
+        let record = TaskRecord {
+            task_id,
+            owner_subject: task_owner(&events),
+            summary: task_dto(task_id, &events, runtime.projection()),
+            events,
+        };
+        if !Self::can_access_record(principal, &record) {
+            return Err(WebApiError::not_found("任务不存在"));
+        }
+        Ok(record)
+    }
+
+    /// 恢复主会话运行时。Web 侧所有跨任务管理操作都以主会话事件流为审计骨架。
+    async fn recover_main_runtime(&self) -> Result<TaskRuntime<Arc<JsonlEventStore>>, WebApiError> {
         TaskRuntime::recover(Arc::clone(&self.store), TaskId::MAIN)
             .await
             .map_err(|_| WebApiError::unavailable("主会话尚未初始化，无法执行任务管理操作"))
@@ -396,9 +428,15 @@ impl KoiWebSource {
 
 #[async_trait]
 impl WebQueryPort for KoiWebSource {
-    async fn dashboard(&self) -> Result<DashboardDto, WebApiError> {
+    async fn dashboard(&self, principal: &WebPrincipal) -> Result<DashboardDto, WebApiError> {
+        self.validate_principal(principal)?;
         let _guard = self.write_lock.lock().await;
-        let records = self.task_records().await?;
+        let records = self
+            .task_records()
+            .await?
+            .into_iter()
+            .filter(|record| Self::can_access_record(principal, record))
+            .collect::<Vec<_>>();
         let mut recent_events = records
             .iter()
             .flat_map(|record| record.events.iter().map(event_dto))
@@ -418,8 +456,7 @@ impl WebQueryPort for KoiWebSource {
             health: HealthDto {
                 api: "healthy".into(),
                 event_store: "healthy".into(),
-                // The model adapter is intentionally not invented by this HTTP server.
-                model_provider: "degraded".into(),
+                model_provider: "healthy".into(),
                 last_heartbeat_at: Utc::now().to_rfc3339(),
             },
             tasks: records
@@ -443,27 +480,37 @@ impl WebQueryPort for KoiWebSource {
         })
     }
 
-    async fn list_tasks(&self) -> Result<Vec<TaskDto>, WebApiError> {
+    async fn list_tasks(&self, principal: &WebPrincipal) -> Result<Vec<TaskDto>, WebApiError> {
+        self.validate_principal(principal)?;
         let _guard = self.write_lock.lock().await;
         Ok(self
             .task_records()
             .await?
             .into_iter()
+            .filter(|record| Self::can_access_record(principal, record))
             .map(|record| record.summary)
             .collect())
     }
 
-    async fn task_events(&self, task_id: TaskId) -> Result<Vec<EventDto>, WebApiError> {
+    async fn task_events(
+        &self,
+        principal: &WebPrincipal,
+        task_id: TaskId,
+    ) -> Result<Vec<EventDto>, WebApiError> {
+        self.validate_principal(principal)?;
         let _guard = self.write_lock.lock().await;
-        let events = self
-            .store
-            .load_task(task_id)
-            .await
-            .map_err(|error| WebApiError::internal(error.to_string()))?;
-        if events.is_empty() {
-            return Err(WebApiError::not_found(format!("任务 {task_id}")));
-        }
-        Ok(events.iter().map(event_dto).collect())
+        Ok(self
+            .load_accessible_task(principal, task_id)
+            .await?
+            .events
+            .iter()
+            .map(event_dto)
+            .collect())
+    }
+
+    async fn can_access_task(&self, principal: &WebPrincipal, task_id: TaskId) -> bool {
+        self.validate_principal(principal).is_ok()
+            && self.load_accessible_task(principal, task_id).await.is_ok()
     }
 }
 
@@ -523,15 +570,8 @@ impl WebCommandPort for KoiWebSource {
         self.validate_principal(&principal)?;
         validate_context_command(&command)?;
         let _guard = self.write_lock.lock().await;
-        let events = self
-            .store
-            .load_task(task_id)
-            .await
-            .map_err(|error| WebApiError::internal(error.to_string()))?;
-        if events.is_empty() {
-            return Err(WebApiError::not_found(format!("任务 {task_id}")));
-        }
-        let scope = task_scope(task_id, &events);
+        let record = self.load_accessible_task(&principal, task_id).await?;
+        let scope = task_scope(task_id, &record.events);
         let mut runtime = TaskRuntime::recover(Arc::clone(&self.store), task_id)
             .await
             .map_err(|error| WebApiError::internal(error.to_string()))?;
@@ -567,15 +607,8 @@ impl WebCommandPort for KoiWebSource {
         self.validate_principal(&principal)?;
         validate_reason(&command.reason, "取消原因")?;
         let _guard = self.write_lock.lock().await;
-        let events = self
-            .store
-            .load_task(task_id)
-            .await
-            .map_err(|error| WebApiError::internal(error.to_string()))?;
-        if events.is_empty() {
-            return Err(WebApiError::not_found(format!("任务 {task_id}")));
-        }
-        let scope = task_scope(task_id, &events);
+        let record = self.load_accessible_task(&principal, task_id).await?;
+        let scope = task_scope(task_id, &record.events);
         let mut runtime = TaskRuntime::recover(Arc::clone(&self.store), task_id)
             .await
             .map_err(|error| WebApiError::internal(error.to_string()))?;
@@ -614,6 +647,9 @@ impl WebCommandPort for KoiWebSource {
             return Err(WebApiError::not_found("授权请求事件不存在"));
         };
         let record = &records[record_index];
+        if !Self::can_access_record(&principal, record) {
+            return Err(WebApiError::not_found("授权请求事件不存在"));
+        }
         let is_approval_request = record.events.iter().any(|event| {
             event.id == approval_request_event_id
                 && matches!(event.payload, AgentEvent::Tool(ref tool) if matches!(tool.as_ref(), ToolEvent::ApprovalRequested { .. }))
@@ -655,6 +691,7 @@ impl WebCommandPort for KoiWebSource {
         updated_events.push(submitted);
         records[record_index] = TaskRecord {
             task_id: record.task_id,
+            owner_subject: record.owner_subject.clone(),
             summary: task_dto(record.task_id, &updated_events, runtime.projection()),
             events: updated_events,
         };
@@ -674,6 +711,7 @@ impl WebCommandPort for KoiWebSource {
     ) -> Result<TaskDto, WebApiError> {
         self.validate_principal(&principal)?;
         let _guard = self.write_lock.lock().await;
+        self.load_accessible_task(&principal, task_id).await?;
         let mut runtime = TaskRuntime::recover(Arc::clone(&self.store), task_id)
             .await
             .map_err(|_| WebApiError::not_found(format!("任务 {task_id}")))?;
@@ -736,6 +774,7 @@ impl WebCommandPort for KoiWebSource {
             return Err(WebApiError::validation("任务名称必须为 1 到 128 个字符"));
         }
         let _guard = self.write_lock.lock().await;
+        self.load_accessible_task(&principal, task_id).await?;
         let mut main = self.recover_main_runtime().await?;
         self.task_manager
             .request_name_child(&mut main, task_id, &name, None)
@@ -768,6 +807,7 @@ impl WebCommandPort for KoiWebSource {
             ));
         }
         let _guard = self.write_lock.lock().await;
+        self.load_accessible_task(&principal, task_id).await?;
         let mut main = self.recover_main_runtime().await?;
         self.task_manager
             .request_delete_child(&mut main, task_id, "由 Web 控制台删除", None)
@@ -807,8 +847,26 @@ impl SourceAuthorizationProvider for WebAuthorizationProvider {
 #[derive(Clone)]
 struct TaskRecord {
     task_id: TaskId,
+    owner_subject: Option<String>,
     summary: TaskDto,
     events: Vec<EventEnvelope>,
+}
+
+/// A Web-created task belongs to the actor of its first Web context ingress. Ownership is derived
+/// from immutable core evidence instead of a parallel Web-only database, so replay and audit use
+/// the same source of truth. Tasks created by other sources remain admin-only in the Web console.
+fn task_owner(events: &[EventEnvelope]) -> Option<String> {
+    events.iter().find_map(|event| {
+        let AgentEvent::Ingress(ingress) = &event.payload else {
+            return None;
+        };
+        let IngressEvent::ContextReceived { context, .. } = ingress.as_ref() else {
+            return None;
+        };
+        (context.origin.source == WEB_SOURCE_NAME)
+            .then(|| context.actor.as_ref().map(|actor| actor.subject.clone()))
+            .flatten()
+    })
 }
 
 struct WebPermissionResolver {
@@ -1049,11 +1107,9 @@ fn event_description(event: &AgentEvent) -> (&'static str, String, String) {
                 "任务已恢复".into(),
                 "任务已恢复为运行状态".into(),
             ),
-            ControlEvent::TaskNamed { name } => (
-                "control",
-                "任务已命名".into(),
-                truncate(name, 180),
-            ),
+            ControlEvent::TaskNamed { name } => {
+                ("control", "任务已命名".into(), truncate(name, 180))
+            }
             ControlEvent::TaskCancelled { reason } => {
                 ("control", "任务已取消".into(), truncate(reason, 180))
             }
@@ -1182,6 +1238,7 @@ fn truncate(input: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use koi_api::{RegisterUserCommand, WebIdentityProvider};
 
     /// 测试辅助：构造与生产一致的共享任务管理器。
     fn test_task_manager(store: &Arc<JsonlEventStore>) -> Arc<TaskManager<Arc<JsonlEventStore>>> {
@@ -1364,6 +1421,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_can_only_read_tasks_owned_by_their_core_subject() {
+        let directory = std::env::temp_dir().join(format!("koi-web-owner-{}", EventId::new()));
+        let store = Arc::new(JsonlEventStore::open(&directory).unwrap());
+        bootstrap_main_session(&store).await;
+        let identities =
+            Arc::new(WebUserStore::open(directory.join("users.json"), "test-admin").unwrap());
+        let alice = identities
+            .register(RegisterUserCommand {
+                email: "alice@example.test".into(),
+                username: "alice_ops".into(),
+                password: "correct horse battery staple".into(),
+            })
+            .unwrap()
+            .principal;
+        let bob = identities
+            .register(RegisterUserCommand {
+                email: "bob@example.test".into(),
+                username: "bob_ops".into(),
+                password: "correct horse battery staple".into(),
+            })
+            .unwrap()
+            .principal;
+        let source = KoiWebSource::new(
+            Arc::clone(&store),
+            identities,
+            test_task_manager(&store),
+            Vec::new(),
+            10.0,
+        )
+        .unwrap();
+        let task = source
+            .create_task(
+                alice.clone(),
+                CreateTaskCommand {
+                    message: "检查订单服务".into(),
+                    scope: ScopeDto {
+                        kind: "service".into(),
+                        id: "orders".into(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let task_id = uuid::Uuid::parse_str(&task.task_id).map(TaskId).unwrap();
+
+        assert_eq!(source.list_tasks(&alice).await.unwrap().len(), 1);
+        assert!(source.list_tasks(&bob).await.unwrap().is_empty());
+        assert!(source.task_events(&bob, task_id).await.is_err());
+        assert!(source.can_access_task(&alice, task_id).await);
+        assert!(!source.can_access_task(&bob, task_id).await);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
     async fn web_source_names_and_deletes_children_through_task_manager() {
         let directory = std::env::temp_dir().join(format!("koi-web-manage-{}", EventId::new()));
         let store = Arc::new(JsonlEventStore::open(&directory).unwrap());
@@ -1410,17 +1522,24 @@ mod tests {
         assert_eq!(named.title, "磁盘巡检");
 
         // 主会话不可命名、不可删除。
-        assert!(source
-            .name_task(
-                admin.clone(),
-                TaskId::MAIN,
-                NameTaskCommand {
-                    name: "主会话".into()
-                },
-            )
-            .await
-            .is_err());
-        assert!(source.delete_task(admin.clone(), TaskId::MAIN).await.is_err());
+        assert!(
+            source
+                .name_task(
+                    admin.clone(),
+                    TaskId::MAIN,
+                    NameTaskCommand {
+                        name: "主会话".into()
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            source
+                .delete_task(admin.clone(), TaskId::MAIN)
+                .await
+                .is_err()
+        );
 
         // 未终止的子任务不能删除。
         assert!(source.delete_task(admin.clone(), task_id).await.is_err());

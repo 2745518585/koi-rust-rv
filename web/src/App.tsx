@@ -60,6 +60,7 @@ import type {
   ToolDefinition,
   ToolSideEffect,
 } from "./api/types";
+import { useI18n } from "./i18n";
 
 type ViewKey = "overview" | "tasks" | "approvals" | "tools" | "audit";
 
@@ -70,12 +71,10 @@ interface NavItem {
   count?: number;
 }
 
-const navItems: Array<Omit<NavItem, "count">> = [
-  { key: "overview", label: "总览", icon: LayoutDashboard },
-  { key: "tasks", label: "任务队列", icon: Command },
-  { key: "approvals", label: "待处理审批", icon: TicketCheck },
-  { key: "tools", label: "工具目录", icon: Wrench },
-  { key: "audit", label: "事件审计", icon: FileClock },
+const navIcons: Array<Pick<NavItem, "key" | "icon">> = [
+  { key: "overview", icon: LayoutDashboard }, { key: "tasks", icon: Command },
+  { key: "approvals", icon: TicketCheck }, { key: "tools", icon: Wrench },
+  { key: "audit", icon: FileClock },
 ];
 
 const statusMeta: Record<
@@ -188,6 +187,7 @@ function AuthScreen({
   api: ReturnType<typeof createKoiApiClient>;
   onAuthenticated: (user: AuthUser) => void;
 }) {
+  const { t, locale } = useI18n();
   const [mode, setMode] = useState<"login" | "register">("login");
   const [email, setEmail] = useState("");
   const [username, setUsername] = useState("");
@@ -206,7 +206,7 @@ function AuthScreen({
           : await api.login({ email, password });
       onAuthenticated(user);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "无法完成身份验证");
+      setError(reason instanceof Error ? reason.message : "Unable to authenticate");
     } finally {
       setBusy(false);
     }
@@ -217,30 +217,30 @@ function AuthScreen({
       <section className="auth-card">
         <div className="brand-mark">K</div>
         <p className="eyebrow">KOI OPERATIONS</p>
-        <h1>{mode === "login" ? "登录控制台" : "创建你的账户"}</h1>
+        <h1>{mode === "login" ? t("loginTitle") : t("registerTitle")}</h1>
         <p className="auth-copy">
           {mode === "login"
-            ? "使用邮箱和密码继续。"
-            : "用户名将作为写入 Koi 核心事件的稳定用户标识。"}
+            ? (locale === "en" ? "Continue with your email and password." : "使用邮箱和密码继续。")
+            : (locale === "en" ? "Your username is the stable identity recorded in Koi core events." : "用户名将作为写入 Koi 核心事件的稳定用户标识。")}
         </p>
         <form onSubmit={submit} className="auth-form">
           <label>
-            邮箱
+            {t("email")}
             <input type="email" value={email} onChange={(event) => setEmail(event.target.value)} required />
           </label>
           {mode === "register" && (
             <label>
-              用户名
+              {t("username")}
               <input value={username} onChange={(event) => setUsername(event.target.value)} minLength={3} maxLength={64} required />
             </label>
           )}
           <label>
-            密码
+            {t("password")}
             <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} minLength={12} required />
           </label>
           {error && <p className="auth-error">{error}</p>}
           <button type="submit" className="primary-button auth-submit" disabled={busy}>
-            {busy ? "处理中…" : mode === "login" ? "登录" : "注册并登录"}
+            {busy ? "…" : mode === "login" ? t("login") : t("register")}
           </button>
         </form>
         <button type="button" className="auth-switch" onClick={() => { setMode(mode === "login" ? "register" : "login"); setError(null); }}>
@@ -252,6 +252,7 @@ function AuthScreen({
 }
 
 function App() {
+  const { locale, setLocale, t } = useI18n();
   const api = useMemo(() => createKoiApiClient(), []);
   const [snapshot, setSnapshot] = useState<SystemSnapshot>(() => createDemoSnapshot());
   const [view, setView] = useState<ViewKey>("overview");
@@ -276,13 +277,20 @@ function App() {
   }, [toast]);
 
   useEffect(() => {
-    api.currentUser().then(setUser).catch(() => undefined).finally(() => setAuthChecked(true));
+    api.currentUser()
+      .then(async (currentUser) => {
+        setUser(currentUser);
+        setSnapshot(await api.getSnapshot());
+        setIsLive(true);
+      })
+      .catch(() => undefined)
+      .finally(() => setAuthChecked(true));
   }, [api]);
 
   useEffect(() => {
-    if (!isLive || !selectedTask) return;
+    if (!isLive) return;
     return api.openEventStream(
-      selectedTask.taskId,
+      undefined,
       (event) => {
         setSnapshot((current) => applyStreamEvent(current, event));
         if (event.type === "authorization.requested") {
@@ -298,36 +306,10 @@ function App() {
       },
       () => undefined,
     );
-  }, [api, isLive, selectedTask]);
-
-  async function toggleDataSource() {
-    if (isLive) {
-      setIsLive(false);
-      setToast("已切回演示数据");
-      return;
-    }
-
-    setRefreshing(true);
-    try {
-      if (!user && !api.hasToken()) {
-        const token = window.prompt("请输入 Web 管理访问令牌（仅保留在当前页面内存中）");
-        if (!token) return;
-        api.setToken(token);
-      }
-      if (!user) await api.establishSession();
-      const liveSnapshot = await api.getSnapshot();
-      setSnapshot(liveSnapshot);
-      setIsLive(true);
-      setToast("已连接 Koi API，正在接收实时事件");
-    } catch {
-      setToast("API 暂不可用，继续使用演示数据");
-    } finally {
-      setRefreshing(false);
-    }
-  }
+  }, [api, isLive]);
 
   if (!authChecked) {
-    return <main className="auth-shell"><p className="auth-loading">正在恢复安全会话…</p></main>;
+    return <main className="auth-shell"><p className="auth-loading">{t("loadingSession")}</p></main>;
   }
 
   if (!user) {
@@ -398,7 +380,7 @@ function App() {
     setToast("诊断任务已加入队列");
   }
 
-  const navWithCounts: NavItem[] = navItems.map((item) =>
+  const navWithCounts: NavItem[] = navIcons.map((item) => ({ ...item, label: t(item.key) })).map((item) =>
     item.key === "approvals" ? { ...item, count: pendingApprovals.length } : item,
   );
 
@@ -424,7 +406,7 @@ function App() {
           </button>
         </div>
 
-        <div className="sidebar-section-label">工作空间</div>
+        <div className="sidebar-section-label">{t("workspace")}</div>
         <nav className="sidebar-nav" aria-label="主导航">
           {navWithCounts.map((item) => {
             const Icon = item.icon;
@@ -464,10 +446,10 @@ function App() {
         </div>
 
         <div className="profile-row">
-          <div className="avatar avatar-coral">L</div>
+          <div className="avatar avatar-coral">{user.username.slice(0, 1).toUpperCase()}</div>
           <div className="profile-copy">
-            <strong>Lin · 值班中</strong>
-            <span>Operator workspace</span>
+            <strong>{user.username}</strong>
+            <span>{t("userWorkspace")}</span>
           </div>
           <ChevronDown size={15} />
         </div>
@@ -496,19 +478,19 @@ function App() {
           <div className="topbar-actions">
             <button
               className={`data-source-pill ${isLive ? "data-source-live" : ""}`}
-              onClick={toggleDataSource}
-              disabled={refreshing}
-              title={isLive ? "切换到演示数据" : "连接真实 API"}
+              disabled
+              title={t("live")}
             >
               <span className="source-dot" />
-              {isLive ? "API 已连接" : "演示数据"}
+              {isLive ? t("connected") : t("disconnected")}
             </button>
             <button className="icon-button topbar-icon" aria-label="通知">
               <Bell size={18} />
               <span className="notification-dot" />
             </button>
             <div className="topbar-divider" />
-            <button className="topbar-avatar" aria-label="账户菜单">L</button>
+            <button className="topbar-avatar" aria-label="账户菜单" onClick={() => void api.logout().finally(() => { setUser(null); setIsLive(false); })}>{user.username.slice(0, 1).toUpperCase()}</button>
+            <button className="icon-button topbar-icon" onClick={() => setLocale(locale === "zh-CN" ? "en" : "zh-CN")} aria-label="Language">{t("language")}</button>
           </div>
         </header>
 

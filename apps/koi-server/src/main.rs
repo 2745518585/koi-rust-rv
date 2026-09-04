@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use koi_api::{WebApi, WebAuth};
 use koi_core::domain::{EventSource, ModelGenerationOptions, ModelProtocol};
-use koi_core::ports::{EventStore, SourceAuthorizationRegistry, ToolRegistry};use koi_infra::event_store::JsonlEventStore;
+use koi_core::ports::{EventStore, SourceAuthorizationRegistry, ToolRegistry};
+use koi_infra::event_store::JsonlEventStore;
 use koi_infra::llm::{OpenAiCompatibleModelConfig, OpenAiCompatibleModelProvider};
 use koi_infra::tools::ToolPolicy;
 use koi_infra::web_identity::WebUserStore;
@@ -87,6 +88,7 @@ struct ServerConfig {
     web_dist_dir: PathBuf,
     event_store_dir: PathBuf,
     user_store_path: PathBuf,
+    web_cookie_secure: bool,
 }
 
 impl Default for ServerConfig {
@@ -96,6 +98,7 @@ impl Default for ServerConfig {
             web_dist_dir: PathBuf::from("./web/dist"),
             event_store_dir: PathBuf::from("./data/events"),
             user_store_path: PathBuf::from("./data/users.json"),
+            web_cookie_secure: false,
         }
     }
 }
@@ -179,7 +182,7 @@ async fn run() -> Result<(), ServerError> {
         )
         .map_err(ServerError::WebApi)?,
     );
-    let auth = WebAuth::new(identities);
+    let auth = WebAuth::new(identities, config.server.web_cookie_secure);
     let mut authorization_providers = SourceAuthorizationRegistry::default();
     authorization_providers
         .register(source.authorization_provider())

@@ -108,6 +108,8 @@ pub trait WebIdentityProvider: Send + Sync {
     ///
     /// 当令牌无效或访问令牌未配置时返回错误。
     fn authenticate_bearer(&self, token: &str) -> Result<WebSession, WebApiError>;
+    /// 使当前不透明会话令牌立即失效。
+    fn logout(&self, token: &str) -> Result<(), WebApiError>;
 }
 
 /// Request body for a Web-originated diagnostic task.
@@ -188,9 +190,15 @@ pub enum TaskControlAction {
 /// cannot accidentally be granted a capability to append core events.
 #[async_trait]
 pub trait WebQueryPort: Send + Sync {
-    async fn dashboard(&self) -> Result<DashboardDto, WebApiError>;
-    async fn list_tasks(&self) -> Result<Vec<TaskDto>, WebApiError>;
-    async fn task_events(&self, task_id: TaskId) -> Result<Vec<EventDto>, WebApiError>;
+    async fn dashboard(&self, principal: &WebPrincipal) -> Result<DashboardDto, WebApiError>;
+    async fn list_tasks(&self, principal: &WebPrincipal) -> Result<Vec<TaskDto>, WebApiError>;
+    async fn task_events(
+        &self,
+        principal: &WebPrincipal,
+        task_id: TaskId,
+    ) -> Result<Vec<EventDto>, WebApiError>;
+    /// Tests task visibility without revealing the existence of a task to an unauthorized user.
+    async fn can_access_task(&self, principal: &WebPrincipal, task_id: TaskId) -> bool;
 }
 
 /// The only command surface exposed to the Web transport.
@@ -453,6 +461,7 @@ impl WebApiError {
 #[derive(Clone)]
 pub struct WebAuth {
     identities: Arc<dyn WebIdentityProvider>,
+    secure_cookie: bool,
 }
 
 impl WebAuth {
@@ -462,8 +471,11 @@ impl WebAuth {
     /// # Errors
     ///
     /// Returns an error for an empty token so the HTTP boundary fails closed.
-    pub fn new(identities: Arc<dyn WebIdentityProvider>) -> Self {
-        Self { identities }
+    pub fn new(identities: Arc<dyn WebIdentityProvider>, secure_cookie: bool) -> Self {
+        Self {
+            identities,
+            secure_cookie,
+        }
     }
 
     fn authenticate(&self, headers: &HeaderMap) -> Result<WebPrincipal, ApiError> {
@@ -510,8 +522,11 @@ impl WebAuth {
             })
     }
 
-    fn session_cookie(token: &str) -> String {
-        format!("{WEB_SESSION_COOKIE}={token}; HttpOnly; Path=/; SameSite=Strict; Max-Age=28800")
+    fn session_cookie(&self, token: &str) -> String {
+        let secure = self.secure_cookie.then_some("; Secure").unwrap_or_default();
+        format!(
+            "{WEB_SESSION_COOKIE}={token}; HttpOnly; Path=/; SameSite=Strict; Max-Age=28800{secure}"
+        )
     }
 }
 
@@ -547,6 +562,7 @@ pub fn router(api: Arc<dyn WebApi>, auth: WebAuth) -> Router {
         .route("/api/v1/auth/register", post(register))
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/me", get(current_user))
+        .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/session", post(create_session))
         .route("/api/v1/dashboard", get(dashboard))
         .route("/api/v1/tasks", get(list_tasks).post(create_task))
@@ -591,8 +607,8 @@ struct SessionDto {
     user: WebUserDto,
 }
 
-fn session_response(_state: &HttpState, session: WebSession) -> Result<Response, ApiError> {
-    let cookie = HeaderValue::from_str(&WebAuth::session_cookie(&session.token))
+fn session_response(state: &HttpState, session: WebSession) -> Result<Response, ApiError> {
+    let cookie = HeaderValue::from_str(&state.auth.session_cookie(&session.token))
         .map_err(|_| ApiError::bad_request("无法创建 Web 会话 Cookie"))?;
     let mut response = Json(ApiEnvelope {
         data: SessionDto { user: session.user },
@@ -636,6 +652,27 @@ async fn current_user(
     }))
 }
 
+async fn logout(State(state): State<HttpState>, headers: HeaderMap) -> Result<Response, ApiError> {
+    let token = session_cookie(&headers).ok_or_else(|| ApiError::unauthorized("缺少 Web 会话"))?;
+    state
+        .auth
+        .identities
+        .logout(token)
+        .map_err(ApiError::from)?;
+    let secure = state
+        .auth
+        .secure_cookie
+        .then_some("; Secure")
+        .unwrap_or_default();
+    let cookie = HeaderValue::from_str(&format!(
+        "{WEB_SESSION_COOKIE}=; HttpOnly; Path=/; SameSite=Strict; Max-Age=0{secure}"
+    ))
+    .map_err(|_| ApiError::bad_request("无法清除 Web 会话 Cookie"))?;
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().insert(header::SET_COOKIE, cookie);
+    Ok(response)
+}
+
 async fn create_session(
     State(state): State<HttpState>,
     headers: HeaderMap,
@@ -648,9 +685,13 @@ async fn dashboard(
     State(state): State<HttpState>,
     headers: HeaderMap,
 ) -> Result<Json<ApiEnvelope<DashboardDto>>, ApiError> {
-    state.auth.authenticate(&headers)?;
+    let principal = state.auth.authenticate(&headers)?;
     Ok(Json(ApiEnvelope {
-        data: state.api.dashboard().await.map_err(ApiError::from)?,
+        data: state
+            .api
+            .dashboard(&principal)
+            .await
+            .map_err(ApiError::from)?,
     }))
 }
 
@@ -658,9 +699,13 @@ async fn list_tasks(
     State(state): State<HttpState>,
     headers: HeaderMap,
 ) -> Result<Json<ApiEnvelope<Vec<TaskDto>>>, ApiError> {
-    state.auth.authenticate(&headers)?;
+    let principal = state.auth.authenticate(&headers)?;
     Ok(Json(ApiEnvelope {
-        data: state.api.list_tasks().await.map_err(ApiError::from)?,
+        data: state
+            .api
+            .list_tasks(&principal)
+            .await
+            .map_err(ApiError::from)?,
     }))
 }
 
@@ -669,11 +714,11 @@ async fn task_events(
     headers: HeaderMap,
     Path(task_id): Path<String>,
 ) -> Result<Json<ApiEnvelope<Vec<EventDto>>>, ApiError> {
-    state.auth.authenticate(&headers)?;
+    let principal = state.auth.authenticate(&headers)?;
     Ok(Json(ApiEnvelope {
         data: state
             .api
-            .task_events(parse_task_id(&task_id)?)
+            .task_events(&principal, parse_task_id(&task_id)?)
             .await
             .map_err(ApiError::from)?,
     }))
@@ -803,22 +848,34 @@ async fn event_stream(
     headers: HeaderMap,
     Query(query): Query<StreamQuery>,
 ) -> Result<Response, ApiError> {
-    state.auth.authenticate(&headers)?;
+    let principal = state.auth.authenticate(&headers)?;
     if let Some(task_id) = query.task_id.as_deref() {
-        parse_task_id(task_id)?;
+        let task_id = parse_task_id(task_id)?;
+        if !state.api.can_access_task(&principal, task_id).await {
+            return Err(ApiError::from(WebApiError::not_found("任务不存在")));
+        }
     }
     let requested_task_id = query.task_id;
     let receiver = state.api.subscribe();
+    let api = Arc::clone(&state.api);
     let events = stream::unfold(receiver, move |mut receiver| {
         let requested_task_id = requested_task_id.clone();
+        let principal = principal.clone();
+        let api = Arc::clone(&api);
         async move {
             loop {
                 match receiver.recv().await {
-                    Ok(stream_event)
-                        if requested_task_id
+                    Ok(stream_event) => {
+                        let matches_filter = requested_task_id
                             .as_deref()
-                            .is_none_or(|task_id| task_id == stream_event.task_id()) =>
-                    {
+                            .is_none_or(|task_id| task_id == stream_event.task_id());
+                        let visible = match Uuid::parse_str(stream_event.task_id()) {
+                            Ok(task_id) => api.can_access_task(&principal, TaskId(task_id)).await,
+                            Err(_) => false,
+                        };
+                        if !matches_filter || !visible {
+                            continue;
+                        }
                         let Ok(event) =
                             Event::default().event("koi.event").json_data(&stream_event)
                         else {
@@ -826,7 +883,7 @@ async fn event_stream(
                         };
                         return Some((Ok::<Event, Infallible>(event), receiver));
                     }
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => return None,
                 }
             }

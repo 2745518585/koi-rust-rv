@@ -93,6 +93,11 @@ export class KoiApiClient {
     return session.user;
   }
 
+  async logout(): Promise<void> {
+    await this.request<void>("/auth/logout", { method: "POST" });
+    this.token = undefined;
+  }
+
   async getSnapshot(signal?: AbortSignal): Promise<SystemSnapshot> {
     return this.request<SystemSnapshot>("/dashboard", { signal });
   }
@@ -122,12 +127,12 @@ export class KoiApiClient {
   }
 
   openEventStream(
-    taskId: string,
+    taskId: string | undefined,
     onMessage: StreamMessageHandler,
     onError?: () => void,
   ): () => void {
     const streamUrl = new URL(`${this.baseUrl}/events/stream`, window.location.origin);
-    streamUrl.searchParams.set("task_id", taskId);
+    if (taskId) streamUrl.searchParams.set("task_id", taskId);
     const source = new EventSource(streamUrl.toString(), { withCredentials: true });
 
     const handleMessage = (message: MessageEvent<string>) => {

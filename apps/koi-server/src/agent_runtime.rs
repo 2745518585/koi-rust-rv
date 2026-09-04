@@ -127,7 +127,10 @@ impl AgentSupervisor {
                 }
                 TaskStatus::Running if task_id.is_main() && !self.is_active(task_id) => {
                     // 主会话持续存在：新输入或子任务回传的工具结果都会唤醒一次续跑。
-                    let input_events = context_events(&events, self.max_context_messages);
+                    // 已完成的一轮模型调用已经消费了此前所有上下文。只传入其后的
+                    // Web 输入，避免主会话在空闲时每 250ms 重复执行同一条请求。
+                    let input_events =
+                        context_events_since_last_model(&events, self.max_context_messages);
                     let tool_results = pending_tool_results(&events);
                     if !input_events.is_empty() || !tool_results.is_empty() {
                         self.spawn_main(task_id, input_events, tool_results);
@@ -334,7 +337,11 @@ impl AgentSupervisor {
             .map_err(koi_core::agent::AgentLoopError::from)?;
         let resolver = PersistedAuthorizationEvidenceResolver::new(self.store.as_ref());
         self.build_main_agent(&resolver)
-            .run_main(&mut runtime, self.request(input_events, tool_results), cancel)
+            .run_main(
+                &mut runtime,
+                self.request(input_events, tool_results),
+                cancel,
+            )
             .await
     }
 
@@ -494,6 +501,28 @@ fn context_events(events: &[EventEnvelope], limit: usize) -> Vec<EventEnvelope> 
         contexts.drain(..first);
     }
     contexts
+}
+
+fn context_events_since_last_model(events: &[EventEnvelope], limit: usize) -> Vec<EventEnvelope> {
+    let last_model_completed = events
+        .iter()
+        .rev()
+        .find(|event| {
+            matches!(
+                event.payload,
+                AgentEvent::Model(ref model)
+                    if matches!(model.as_ref(), koi_core::domain::ModelEvent::Completed { .. })
+            )
+        })
+        .map_or(0, |event| event.sequence);
+    context_events(
+        &events
+            .iter()
+            .filter(|event| event.sequence > last_model_completed)
+            .cloned()
+            .collect::<Vec<_>>(),
+        limit,
+    )
 }
 
 /// 主会话续跑时待注入的工具结果上下文。

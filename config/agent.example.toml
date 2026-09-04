@@ -6,6 +6,8 @@ web_dist_dir = "./web/dist"
 # JSONL event store for the single-process API adapter. A database adapter can replace it later.
 event_store_dir = "./data/events"
 user_store_path = "./data/users.json"
+# Set true whenever the Web console is served over HTTPS.
+web_cookie_secure = false
 
 [qq]
 api_base_url = "https://api.bot.qq.com"
