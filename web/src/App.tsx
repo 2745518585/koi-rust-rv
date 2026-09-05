@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import type { FormEvent } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { FormEvent, UIEvent } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -46,7 +46,7 @@ import {
   Zap,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import { createDemoSnapshot, MAIN_TASK_ID } from "./api/demo";
+import { createEmptySnapshot, MAIN_TASK_ID } from "./api/demo";
 import { createKoiApiClient } from "./api/client";
 import type { AuthUser } from "./api/client";
 import type {
@@ -104,6 +104,21 @@ const permissionMeta: Record<PermissionLevel, { label: string; className: string
   System: { label: "System", className: "permission-system" },
 };
 
+const suggestedPermissionLevels: PermissionLevel[] = ["User", "Operator", "Admin"];
+const permissionRank: Record<PermissionLevel, number> = {
+  None: 0,
+  User: 1,
+  Operator: 2,
+  Admin: 3,
+  System: 4,
+};
+
+function suggestedPermissionOptions(maximum: PermissionLevel): PermissionLevel[] {
+  return suggestedPermissionLevels.filter(
+    (permission) => permissionRank[permission] <= permissionRank[maximum],
+  );
+}
+
 const eventKindMeta: Record<EventKind, { label: string; className: string; icon: LucideIcon }> = {
   ingress: { label: "输入", className: "event-ingress", icon: MessageSquare },
   model: { label: "模型", className: "event-model", icon: Bot },
@@ -144,11 +159,14 @@ function scopeLabel(task: Pick<TaskSummary, "scope">): string {
 
 function applyStreamEvent(snapshot: SystemSnapshot, streamEvent: StreamEvent): SystemSnapshot {
   if (streamEvent.type === "task.updated") {
+    const existing = snapshot.tasks.some((task) => task.taskId === streamEvent.task.taskId);
     return {
       ...snapshot,
-      tasks: snapshot.tasks.map((task) =>
-        task.taskId === streamEvent.task.taskId ? streamEvent.task : task,
-      ),
+      tasks: existing
+        ? snapshot.tasks.map((task) =>
+            task.taskId === streamEvent.task.taskId ? streamEvent.task : task,
+          )
+        : [streamEvent.task, ...snapshot.tasks],
     };
   }
 
@@ -253,10 +271,43 @@ function AuthScreen({
   );
 }
 
+function PermissionSelector({
+  value,
+  maximum,
+  onChange,
+}: {
+  value: PermissionLevel;
+  maximum: PermissionLevel;
+  onChange: (permission: PermissionLevel) => void;
+}) {
+  const options = suggestedPermissionOptions(maximum);
+  const selected = options.includes(value) ? value : options[0] ?? "User";
+  return (
+    <label
+      className="authorization-selector"
+      title="后续 Web 输入事件携带的建议授权等级，不能超过当前身份权限"
+    >
+      <ShieldCheck size={15} />
+      <span>建议授权</span>
+      <select
+        aria-label="建议授权等级"
+        value={selected}
+        onChange={(event) => onChange(event.target.value as PermissionLevel)}
+      >
+        {options.map((permission) => (
+          <option value={permission} key={permission}>
+            {permissionMeta[permission].label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
 function App() {
   const { locale, setLocale, t } = useI18n();
   const api = useMemo(() => createKoiApiClient(), []);
-  const [snapshot, setSnapshot] = useState<SystemSnapshot>(() => createDemoSnapshot());
+  const [snapshot, setSnapshot] = useState<SystemSnapshot>(() => createEmptySnapshot());
   const [view, setView] = useState<ViewKey>("overview");
   const [selectedTaskId, setSelectedTaskId] = useState(MAIN_TASK_ID);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -266,7 +317,10 @@ function App() {
   const [toast, setToast] = useState<string | null>(null);
   const [composerOpen, setComposerOpen] = useState(false);
   const [user, setUser] = useState<AuthUser | null>(null);
+  const [suggestedPermission, setSuggestedPermission] = useState<PermissionLevel>("User");
   const [authChecked, setAuthChecked] = useState(false);
+  const [apiError, setApiError] = useState<string | null>(null);
+  const [eventsRevision, setEventsRevision] = useState(0);
 
   const pendingApprovals = snapshot.approvals.filter((approval) => approval.status === "Pending");
   const selectedTask =
@@ -280,14 +334,39 @@ function App() {
 
   useEffect(() => {
     api.currentUser()
-      .then(async (currentUser) => {
-        setUser(currentUser);
-        setSnapshot(await api.getSnapshot());
-        setIsLive(true);
-      })
+      .then(setUser)
       .catch(() => undefined)
       .finally(() => setAuthChecked(true));
   }, [api]);
+
+  useEffect(() => {
+    if (!user) return;
+    const options = suggestedPermissionOptions(user.permission);
+    setSuggestedPermission((current) =>
+      options.includes(current) ? current : options[0] ?? "User",
+    );
+  }, [user]);
+
+  useEffect(() => {
+    if (!user) return;
+    let active = true;
+    api.getSnapshot()
+      .then((next) => {
+        if (!active) return;
+        setSnapshot(next);
+        setIsLive(true);
+        setApiError(null);
+        if (!next.tasks.some((task) => task.taskId === selectedTaskId)) {
+          setSelectedTaskId(next.tasks.find((task) => task.isMain)?.taskId ?? next.tasks[0]?.taskId ?? MAIN_TASK_ID);
+        }
+      })
+      .catch(() => {
+        if (!active) return;
+        setIsLive(false);
+        setApiError("无法读取后端真实数据。请检查服务日志、登录权限或事件存储状态。");
+      });
+    return () => { active = false; };
+  }, [api, selectedTaskId, user]);
 
   useEffect(() => {
     if (!isLive) return;
@@ -295,6 +374,11 @@ function App() {
       undefined,
       (event) => {
         setSnapshot((current) => applyStreamEvent(current, event));
+        if (event.type === "event.appended" && event.event.taskId === selectedTaskId) {
+          // 事件流只负责通知变化，当前会话详情仍从事件存储重读，避免本地状态漏掉
+          // 模型完成、工具结果或子任务回传等连续事件。
+          setEventsRevision((current) => current + 1);
+        }
         if (event.type === "authorization.requested") {
           void api.getSnapshot().then(setSnapshot).catch(() => undefined);
         }
@@ -308,7 +392,7 @@ function App() {
       },
       () => undefined,
     );
-  }, [api, isLive]);
+  }, [api, isLive, selectedTaskId]);
 
   if (!authChecked) {
     return <main className="auth-shell"><p className="auth-loading">{t("loadingSession")}</p></main>;
@@ -319,17 +403,15 @@ function App() {
   }
 
   async function refreshSnapshot() {
-    if (!isLive) {
-      setSnapshot((current) => ({ ...current, generatedAt: new Date().toISOString() }));
-      setToast("演示数据已刷新");
-      return;
-    }
-
     setRefreshing(true);
     try {
       setSnapshot(await api.getSnapshot());
+      setIsLive(true);
+      setApiError(null);
       setToast("数据已刷新");
     } catch {
+      setIsLive(false);
+      setApiError("无法读取后端真实数据。请检查服务日志、登录权限或事件存储状态。");
       setToast("刷新失败，请检查 API 服务");
     } finally {
       setRefreshing(false);
@@ -338,44 +420,32 @@ function App() {
 
   async function handleApproval(approval: ApprovalRequest, approved: boolean) {
     setApprovalBusy(approval.approvalRequestEventId);
-    if (isLive) {
-      try {
-        const updated = await api.submitApproval(approval.approvalRequestEventId, { approved });
-        setSnapshot((current) => applyStreamEvent(current, { type: "approval.updated", approval: updated }));
-        setToast(approved ? "授权已提交，任务将继续运行" : "已拒绝此次操作");
-      } catch {
-        setToast("审批提交失败，请稍后重试");
-      } finally {
-        setApprovalBusy(null);
-      }
+    if (!isLive) {
+      setApprovalBusy(null);
+      setToast("后端未连接，无法提交审批");
       return;
     }
-
-    setSnapshot((current) => ({
-      ...current,
-      approvals: current.approvals.map((item) =>
-        item.approvalRequestEventId === approval.approvalRequestEventId
-          ? { ...item, status: approved ? "Approved" : "Denied" }
-          : item,
-      ),
-      tasks: current.tasks.map((task) =>
-        task.taskId === approval.taskId && approved
-          ? {
-              ...task,
-              status: "Running",
-              lastEventKind: "tool",
-              lastEventSummary: `${approval.toolName} 已获授权，准备执行`,
-              updatedAt: new Date().toISOString(),
-            }
-          : task,
-      ),
-    }));
-    setApprovalBusy(null);
-    setToast(approved ? "演示授权已通过，任务继续运行" : "演示审批已拒绝");
+    try {
+      const updated = await api.submitApproval(approval.approvalRequestEventId, {
+        approved,
+        suggestedPermission,
+      });
+      setSnapshot((current) => applyStreamEvent(current, { type: "approval.updated", approval: updated }));
+      setToast(approved ? "授权已提交，任务将继续运行" : "已拒绝此次操作");
+    } catch {
+      setToast("审批提交失败，请稍后重试");
+    } finally {
+      setApprovalBusy(null);
+    }
   }
 
   function handleNewTask(task: TaskSummary) {
-    setSnapshot((current) => ({ ...current, tasks: [task, ...current.tasks] }));
+    setSnapshot((current) => ({
+      ...current,
+      tasks: current.tasks.some((item) => item.taskId === task.taskId)
+        ? current.tasks.map((item) => item.taskId === task.taskId ? task : item)
+        : [task, ...current.tasks],
+    }));
     setSelectedTaskId(task.taskId);
     setView("tasks");
     setComposerOpen(false);
@@ -495,6 +565,11 @@ function App() {
             </div>
           </div>
           <div className="topbar-actions">
+            <PermissionSelector
+              value={suggestedPermission}
+              maximum={user.permission}
+              onChange={setSuggestedPermission}
+            />
             <button
               className={`data-source-pill ${isLive ? "data-source-live" : ""}`}
               disabled
@@ -514,6 +589,13 @@ function App() {
         </header>
 
         <div className="content-wrap">
+          {apiError ? (
+            <section className="api-error" role="alert">
+              <strong>控制台未连接到可用后端</strong>
+              <p>{apiError}</p>
+              <button className="button button-secondary" onClick={() => void refreshSnapshot()}>重新连接</button>
+            </section>
+          ) : null}
           {view === "overview" ? (
             <OverviewView
               snapshot={snapshot}
@@ -536,7 +618,9 @@ function App() {
               api={api}
               tasks={snapshot.tasks}
               selectedTaskId={selectedTaskId}
+              suggestedPermission={suggestedPermission}
               isLive={isLive}
+              eventsRevision={eventsRevision}
               onSelectTask={setSelectedTaskId}
               onTaskUpdated={handleTaskUpdated}
               onTaskDeleted={handleTaskDeleted}
@@ -583,6 +667,8 @@ function App() {
         <TaskComposer
           isLive={isLive}
           api={api}
+          permission={user.permission}
+          suggestedPermission={suggestedPermission}
           onClose={() => setComposerOpen(false)}
           onCreated={handleNewTask}
           onToast={setToast}
@@ -1028,7 +1114,9 @@ function ConversationWorkspace({
   api,
   tasks,
   selectedTaskId,
+  suggestedPermission,
   isLive,
+  eventsRevision,
   onSelectTask,
   onTaskUpdated,
   onTaskDeleted,
@@ -1038,7 +1126,9 @@ function ConversationWorkspace({
   api: ReturnType<typeof createKoiApiClient>;
   tasks: TaskSummary[];
   selectedTaskId: string;
+  suggestedPermission: PermissionLevel;
   isLive: boolean;
+  eventsRevision: number;
   onSelectTask: (taskId: string) => void;
   onTaskUpdated: (task: TaskSummary) => void;
   onTaskDeleted: (taskId: string) => void;
@@ -1069,6 +1159,10 @@ function ConversationWorkspace({
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const feedRef = useRef<HTMLDivElement>(null);
+  const shouldStickToBottom = useRef(true);
+  const previousView = useRef<string | null>(null);
+  const wasLoading = useRef(false);
   const selected = tasks.find((task) => task.taskId === selectedTaskId) ?? tasks[0];
   const mainSession = tasks.find((task) => task.isMain);
   const children = tasks.filter((task) => !task.isMain);
@@ -1085,7 +1179,7 @@ function ConversationWorkspace({
       .catch(() => { if (active) setEvents([]); })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [api, isLive, selected?.taskId]);
+  }, [api, eventsRevision, isLive, selected?.taskId]);
 
   async function refreshSession() {
     await onRefresh();
@@ -1099,7 +1193,10 @@ function ConversationWorkspace({
     if (!selected || !message.trim() || submitting) return;
     setSubmitting(true);
     try {
-      const recorded = await api.appendTaskContext(selected.taskId, { message: message.trim() });
+      const recorded = await api.appendTaskContext(selected.taskId, {
+        message: message.trim(),
+        suggestedPermission,
+      });
       setEvents((current) => [...current, recorded]);
       setMessage("");
       await refreshSession();
@@ -1123,7 +1220,7 @@ function ConversationWorkspace({
     if (!selected) return;
     setSubmitting(true);
     try {
-      await api.requestCancellation(selected.taskId, copy.requestStop);
+      await api.requestCancellation(selected.taskId, copy.requestStop, suggestedPermission);
       await refreshSession();
     } catch { onToast(copy.controlFailed); } finally { setSubmitting(false); }
   }
@@ -1150,8 +1247,31 @@ function ConversationWorkspace({
   }
 
   const displayedEvents = mode === "conversation"
-    ? events.filter((event) => event.kind === "ingress" || event.kind === "model" || event.kind === "tool")
+    ? events.filter((event) => {
+      if (event.kind === "ingress" || event.kind === "tool") return true;
+      // 旧版本持久化过 token 级 Delta；对话视图只显示可读的最终答复和失败信息。
+      return event.kind === "model" && (event.title === "Agent 回复" || event.title === "模型调用失败");
+    })
     : events;
+
+  useLayoutEffect(() => {
+    const feed = feedRef.current;
+    if (!feed) return;
+    const view = `${selected?.taskId ?? "none"}:${mode}`;
+    const viewChanged = previousView.current !== view;
+    const finishedLoading = wasLoading.current && !loading;
+    if (viewChanged || finishedLoading || shouldStickToBottom.current) {
+      feed.scrollTop = feed.scrollHeight;
+      shouldStickToBottom.current = true;
+    }
+    previousView.current = view;
+    wasLoading.current = loading;
+  }, [displayedEvents.length, loading, mode, selected?.taskId]);
+
+  function trackFeedScroll(event: UIEvent<HTMLDivElement>) {
+    const feed = event.currentTarget;
+    shouldStickToBottom.current = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 72;
+  }
 
   return <section className="conversation-workspace">
     <header className="conversation-header">
@@ -1180,7 +1300,7 @@ function ConversationWorkspace({
               {!selected.isMain && <button className="task-control-danger" onClick={() => void remove()} disabled={submitting}><Trash2 size={14} />{copy.remove}</button>}
             </div>
           </div>
-          <div className={`session-feed ${mode === "events" ? "session-feed-events" : ""}`}>
+          <div ref={feedRef} onScroll={trackFeedScroll} className={`session-feed ${mode === "events" ? "session-feed-events" : ""}`}>
             {loading ? <div className="session-loading"><LoaderCircle className="spin" size={18} />{copy.loading}</div> : displayedEvents.length ? displayedEvents.map((item) => mode === "conversation" ? <ConversationMessage event={item} key={item.id} /> : <SessionEvent event={item} key={item.id} />) : <EmptyState icon={Inbox} title={copy.noMessages} description={mode === "events" ? copy.allEvents : copy.type} />}
           </div>
           <form className="session-composer" onSubmit={sendMessage}>
@@ -1342,12 +1462,16 @@ function AuditEventRow({ event, task, onSelectTask }: { event: TaskEvent; task?:
 function TaskComposer({
   isLive,
   api,
+  permission,
+  suggestedPermission,
   onClose,
   onCreated,
   onToast,
 }: {
   isLive: boolean;
   api: ReturnType<typeof createKoiApiClient>;
+  permission: string;
+  suggestedPermission: PermissionLevel;
   onClose: () => void;
   onCreated: (task: TaskSummary) => void;
   onToast: (message: string) => void;
@@ -1361,39 +1485,27 @@ function TaskComposer({
     if (!message.trim()) return;
     const [kind = "service", id = "order-api"] = scope.split(":");
     setBusy(true);
-    if (isLive) {
-      try {
-        const created = await api.createTask({ message: message.trim(), scope: { kind, id } });
-        onCreated(created);
-      } catch {
-        onToast("任务创建失败，请检查 API 服务");
-      } finally {
-        setBusy(false);
-      }
+    if (!isLive) {
+      onToast("后端未连接，无法创建任务");
+      setBusy(false);
       return;
     }
-
-    const now = new Date().toISOString();
-    onCreated({
-      taskId: window.crypto.randomUUID(),
-      isMain: false,
-      title: message.trim().slice(0, 28),
-      status: "Queued",
-      source: "web",
-      scope: { kind, id },
-      startedAt: now,
-      updatedAt: now,
-      lastEventKind: "ingress",
-      lastEventSummary: "Web 控制台已提交诊断请求，等待主会话接管",
-      minimumControlPermission: "User",
-      selectedModel: null,
-      usage: { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, reasoningTokens: 0 },
-      eventCount: 1,
-    });
-    setBusy(false);
+    try {
+      const created = await api.createTask({
+        message: message.trim(),
+        scope: { kind, id },
+        suggestedPermission,
+      });
+      onCreated(created);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "请求未成功";
+      onToast(`任务创建失败：${detail}`);
+    } finally {
+      setBusy(false);
+    }
   }
 
-  return <div className="modal-layer" role="presentation"><button className="modal-backdrop" onClick={onClose} aria-label="关闭新建任务" /><form className="composer-modal" onSubmit={submit}><div className="modal-head"><div><div className="section-kicker"><Sparkles size={14} />新建诊断</div><h2>把现场交给 Koi</h2></div><button type="button" className="icon-button subtle-button" onClick={onClose} aria-label="关闭"><X size={18} /></button></div><p className="modal-copy">描述你观察到的现象，Agent 会携带来源与范围进入可审计的任务流。</p><label className="field-label" htmlFor="task-message">问题描述</label><textarea id="task-message" autoFocus value={message} onChange={(event) => setMessage(event.target.value)} placeholder="例如：检查 order-api 最近 10 分钟的 5xx 与连接池状态" rows={4} /><label className="field-label" htmlFor="task-scope">作用域</label><div className="scope-input"><span>scope</span><input id="task-scope" value={scope} onChange={(event) => setScope(event.target.value)} /></div><div className="modal-foot"><span><ShieldCheck size={14} />当前身份：Operator</span><button className="button button-primary" type="submit" disabled={busy || !message.trim()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}开始诊断</button></div></form></div>;
+  return <div className="modal-layer" role="presentation"><button className="modal-backdrop" onClick={onClose} aria-label="关闭新建任务" /><form className="composer-modal" onSubmit={submit}><div className="modal-head"><div><div className="section-kicker"><Sparkles size={14} />新建诊断</div><h2>把现场交给 Koi</h2></div><button type="button" className="icon-button subtle-button" onClick={onClose} aria-label="关闭"><X size={18} /></button></div><p className="modal-copy">描述你观察到的现象，Agent 会携带来源与范围进入可审计的任务流。</p><label className="field-label" htmlFor="task-message">问题描述</label><textarea id="task-message" autoFocus value={message} onChange={(event) => setMessage(event.target.value)} placeholder="例如：检查 order-api 最近 10 分钟的 5xx 与连接池状态" rows={4} /><label className="field-label" htmlFor="task-scope">作用域</label><div className="scope-input"><span>scope</span><input id="task-scope" value={scope} onChange={(event) => setScope(event.target.value)} /></div><div className="modal-foot"><span><ShieldCheck size={14} />当前身份：{permission}</span><button className="button button-primary" type="submit" disabled={busy || !message.trim()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}开始诊断</button></div></form></div>;
 }
 
 export default App;

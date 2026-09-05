@@ -37,6 +37,10 @@ npm run build
 - `POST /api/v1/tasks/:task_id/controls`（暂停、恢复、取消、调整最低控制权限、切换模型）
 - `GET /api/v1/events/stream?task_id=:task_id`（SSE）
 
+顶部的“建议授权”选择器会随新任务、会话输入、取消请求和审批请求发送
+`suggestedPermission`。它只是本次操作的权限上限建议，服务端仍会按当前身份、Web 来源
+上限和核心权限规则重新核定；未提供该字段的旧客户端默认使用当前身份权限。
+
 模型切换使用 `select_model` 控制事件；可用供应商模型组合由 dashboard 响应的 `models` 字段返回：
 
 ```json

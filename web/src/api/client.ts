@@ -2,6 +2,7 @@ import type {
   ApprovalRequest,
   ApprovalSubmission,
   CreateTaskRequest,
+  PermissionLevel,
   StreamEvent,
   SystemSnapshot,
   TaskControlRequest,
@@ -38,7 +39,7 @@ export interface AuthUser {
   userId: string;
   username: string;
   email: string;
-  permission: string;
+  permission: PermissionLevel;
 }
 
 interface AuthSessionResponse {
@@ -114,7 +115,11 @@ export class KoiApiClient {
 
   async appendTaskContext(
     taskId: string,
-    request: { message: string; kind?: "user_message" | "alert" },
+    request: {
+      message: string;
+      kind?: "user_message" | "alert";
+      suggestedPermission?: PermissionLevel;
+    },
   ): Promise<TaskEvent> {
     return this.request<TaskEvent>(`/tasks/${encodeURIComponent(taskId)}/events`, {
       method: "POST",
@@ -122,10 +127,14 @@ export class KoiApiClient {
     });
   }
 
-  async requestCancellation(taskId: string, reason: string): Promise<TaskEvent> {
+  async requestCancellation(
+    taskId: string,
+    reason: string,
+    suggestedPermission?: PermissionLevel,
+  ): Promise<TaskEvent> {
     return this.request<TaskEvent>(`/tasks/${encodeURIComponent(taskId)}/cancellation-requests`, {
       method: "POST",
-      body: JSON.stringify({ reason }),
+      body: JSON.stringify({ reason, suggestedPermission }),
     });
   }
 

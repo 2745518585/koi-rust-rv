@@ -187,9 +187,7 @@ impl KoiWebSource {
     }
 
     async fn task_records(&self) -> Result<Vec<TaskRecord>, WebApiError> {
-        let task_ids = self
-            .store
-            .list_task_ids()
+        let task_ids = JsonlEventStore::list_task_ids(self.store.as_ref())
             .map_err(|error| WebApiError::internal(error.to_string()))?;
         let mut records = Vec::with_capacity(task_ids.len());
         for task_id in task_ids {
@@ -206,7 +204,7 @@ impl KoiWebSource {
                 .map_err(|error| WebApiError::internal(error.to_string()))?;
             records.push(TaskRecord {
                 task_id,
-                owner_subject: task_owner(&events),
+                minimum_control_permission: runtime.projection().minimum_control_permission,
                 summary: task_dto(task_id, &events, runtime.projection()),
                 events,
             });
@@ -216,8 +214,11 @@ impl KoiWebSource {
     }
 
     fn can_access_record(principal: &WebPrincipal, record: &TaskRecord) -> bool {
-        principal.permission == PermissionLevel::Admin
-            || record.owner_subject.as_deref() == Some(principal.subject.as_str())
+        // 会话的最低控制权限同时作为 Web 端的可见性边界：能控制该会话的用户才能
+        // 看到它。这样不会因为创建者、任务来源或管理员特判而绕过会话自身的权限门槛。
+        principal
+            .permission
+            .allows(record.minimum_control_permission)
     }
 
     async fn load_accessible_task(
@@ -238,7 +239,7 @@ impl KoiWebSource {
             .map_err(|error| WebApiError::internal(error.to_string()))?;
         let record = TaskRecord {
             task_id,
-            owner_subject: task_owner(&events),
+            minimum_control_permission: runtime.projection().minimum_control_permission,
             summary: task_dto(task_id, &events, runtime.projection()),
             events,
         };
@@ -264,6 +265,8 @@ impl KoiWebSource {
     where
         RT: EventStore,
     {
+        let suggested_permission =
+            resolve_suggested_permission(principal, command.suggested_permission)?;
         let now = Utc::now();
         let actor = Self::domain_principal(principal);
         let context = ContextEnvelope {
@@ -293,7 +296,7 @@ impl KoiWebSource {
                 runtime,
                 IngressDraft::Context {
                     context: Box::new(context),
-                    suggested_permission: principal.permission,
+                    suggested_permission,
                 },
             )
             .await
@@ -307,6 +310,7 @@ impl KoiWebSource {
         scope: Scope,
         kind: ContextKind,
         message: String,
+        suggested_permission: PermissionLevel,
     ) -> Result<EventEnvelope, WebApiError>
     where
         RT: EventStore,
@@ -338,7 +342,7 @@ impl KoiWebSource {
                 runtime,
                 IngressDraft::Context {
                     context: Box::new(context),
-                    suggested_permission: principal.permission,
+                    suggested_permission,
                 },
             )
             .await
@@ -546,6 +550,8 @@ impl WebCommandPort for KoiWebSource {
     ) -> Result<TaskDto, WebApiError> {
         self.validate_principal(&principal)?;
         validate_create_command(&command)?;
+        // 在创建子任务前先校验建议权限，避免恶意请求留下没有首条输入的孤儿任务。
+        resolve_suggested_permission(&principal, command.suggested_permission)?;
         let _guard = self.write_lock.lock().await;
 
         let mut main = self.recover_main_runtime().await?;
@@ -590,6 +596,8 @@ impl WebCommandPort for KoiWebSource {
     ) -> Result<EventDto, WebApiError> {
         self.validate_principal(&principal)?;
         validate_context_command(&command)?;
+        let suggested_permission =
+            resolve_suggested_permission(&principal, command.suggested_permission)?;
         let _guard = self.write_lock.lock().await;
         let record = self.load_accessible_task(&principal, task_id).await?;
         let scope = task_scope(task_id, &record.events);
@@ -612,6 +620,7 @@ impl WebCommandPort for KoiWebSource {
                 Scope::new(scope.kind, scope.id),
                 kind,
                 command.message,
+                suggested_permission,
             )
             .await?;
         let dto = event_dto(&recorded);
@@ -627,6 +636,8 @@ impl WebCommandPort for KoiWebSource {
     ) -> Result<EventDto, WebApiError> {
         self.validate_principal(&principal)?;
         validate_reason(&command.reason, "取消原因")?;
+        let suggested_permission =
+            resolve_suggested_permission(&principal, command.suggested_permission)?;
         let _guard = self.write_lock.lock().await;
         let record = self.load_accessible_task(&principal, task_id).await?;
         let scope = task_scope(task_id, &record.events);
@@ -639,7 +650,7 @@ impl WebCommandPort for KoiWebSource {
                 IngressDraft::Cancellation {
                     principal: Self::domain_principal(&principal),
                     scope: Scope::new(scope.kind, scope.id),
-                    suggested_permission: principal.permission,
+                    suggested_permission,
                     reason: command.reason,
                 },
             )
@@ -657,6 +668,8 @@ impl WebCommandPort for KoiWebSource {
         command: ApprovalCommand,
     ) -> Result<ApprovalDto, WebApiError> {
         self.validate_principal(&principal)?;
+        let suggested_permission =
+            resolve_suggested_permission(&principal, command.suggested_permission)?;
         let _guard = self.write_lock.lock().await;
         let mut records = self.task_records().await?;
         let Some(record_index) = records.iter().position(|record| {
@@ -700,7 +713,7 @@ impl WebCommandPort for KoiWebSource {
                         record.summary.scope.kind.clone(),
                         record.summary.scope.id.clone(),
                     ),
-                    suggested_permission: principal.permission,
+                    suggested_permission,
                     approved: command.approved,
                 },
             )
@@ -712,7 +725,7 @@ impl WebCommandPort for KoiWebSource {
         updated_events.push(submitted);
         records[record_index] = TaskRecord {
             task_id: record.task_id,
-            owner_subject: record.owner_subject.clone(),
+            minimum_control_permission: runtime.projection().minimum_control_permission,
             summary: task_dto(record.task_id, &updated_events, runtime.projection()),
             events: updated_events,
         };
@@ -888,26 +901,9 @@ impl SourceAuthorizationProvider for WebAuthorizationProvider {
 #[derive(Clone)]
 struct TaskRecord {
     task_id: TaskId,
-    owner_subject: Option<String>,
+    minimum_control_permission: PermissionLevel,
     summary: TaskDto,
     events: Vec<EventEnvelope>,
-}
-
-/// A Web-created task belongs to the actor of its first Web context ingress. Ownership is derived
-/// from immutable core evidence instead of a parallel Web-only database, so replay and audit use
-/// the same source of truth. Tasks created by other sources remain admin-only in the Web console.
-fn task_owner(events: &[EventEnvelope]) -> Option<String> {
-    events.iter().find_map(|event| {
-        let AgentEvent::Ingress(ingress) = &event.payload else {
-            return None;
-        };
-        let IngressEvent::ContextReceived { context, .. } = ingress.as_ref() else {
-            return None;
-        };
-        (context.origin.source == WEB_SOURCE_NAME)
-            .then(|| context.actor.as_ref().map(|actor| actor.subject.clone()))
-            .flatten()
-    })
 }
 
 struct WebPermissionResolver {
@@ -955,6 +951,27 @@ fn validate_create_command(command: &CreateTaskCommand) -> Result<(), WebApiErro
         ));
     }
     Ok(())
+}
+
+/// 校验 Web 请求中携带的建议授权等级。
+///
+/// 该值来自 HTTP 请求，不能作为事实权限直接信任；它只能在当前认证身份权限以内
+/// 选择，之后仍由核心来源注册表和身份解析器再次截断并记录最终权限。
+fn resolve_suggested_permission(
+    principal: &WebPrincipal,
+    suggested_permission: Option<PermissionLevel>,
+) -> Result<PermissionLevel, WebApiError> {
+    let suggested_permission = suggested_permission.unwrap_or(principal.permission);
+    if !suggested_permission.allows(PermissionLevel::User) {
+        return Err(WebApiError::validation("建议授权等级必须为 User 或更高"));
+    }
+    if !principal.permission.allows(suggested_permission) {
+        return Err(WebApiError::Forbidden(format!(
+            "建议授权等级 {suggested_permission:?} 超过当前身份权限 {:?}",
+            principal.permission
+        )));
+    }
+    Ok(suggested_permission)
 }
 
 fn validate_context_command(command: &AppendContextCommand) -> Result<(), WebApiError> {
@@ -1113,6 +1130,7 @@ fn event_dto(event: &EventEnvelope) -> EventDto {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn event_description(event: &AgentEvent) -> (&'static str, String, String) {
     match event {
         AgentEvent::Ingress(ingress) => match ingress.as_ref() {
@@ -1220,11 +1238,26 @@ fn event_description(event: &AgentEvent) -> (&'static str, String, String) {
             koi_core::domain::ModelEvent::Delta { content, .. } => {
                 ("model", "模型输出增量".into(), truncate(content, 180))
             }
-            koi_core::domain::ModelEvent::Completed { .. } => (
-                "model",
-                "模型调用完成".into(),
-                "已记录模型输出与用量".into(),
-            ),
+            koi_core::domain::ModelEvent::Completed { outputs, .. } => {
+                let text = outputs
+                    .iter()
+                    .filter_map(|output| match output {
+                        koi_core::domain::ModelOutput::Text { text } => Some(text.as_str()),
+                        koi_core::domain::ModelOutput::Refusal { reason } => Some(reason.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if text.trim().is_empty() {
+                    (
+                        "model",
+                        "模型调用完成".into(),
+                        "已记录模型输出与用量".into(),
+                    )
+                } else {
+                    ("model", "Agent 回复".into(), truncate(&text, 4_000))
+                }
+            }
             koi_core::domain::ModelEvent::Failed { error, .. } => {
                 ("model", "模型调用失败".into(), truncate(error, 180))
             }
@@ -1346,6 +1379,7 @@ mod tests {
                         kind: "service".into(),
                         id: "order-api".into(),
                     },
+                    suggested_permission: Some(PermissionLevel::User),
                 },
             )
             .await
@@ -1385,7 +1419,7 @@ mod tests {
         );
         assert_eq!(
             events[2].provenance.direct_permission,
-            Some(PermissionLevel::Admin)
+            Some(PermissionLevel::User)
         );
 
         std::fs::remove_dir_all(directory).unwrap();
@@ -1417,6 +1451,7 @@ mod tests {
                         kind: "service".into(),
                         id: "order-api".into(),
                     },
+                    suggested_permission: None,
                 },
             )
             .await
@@ -1479,8 +1514,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_can_only_read_tasks_owned_by_their_core_subject() {
-        let directory = std::env::temp_dir().join(format!("koi-web-owner-{}", EventId::new()));
+    async fn users_can_read_tasks_when_minimum_permission_allows() {
+        let directory = std::env::temp_dir().join(format!("koi-web-visibility-{}", EventId::new()));
         let store = Arc::new(JsonlEventStore::open(&directory).unwrap());
         bootstrap_main_session(&store).await;
         let identities =
@@ -1518,22 +1553,172 @@ mod tests {
                         kind: "service".into(),
                         id: "orders".into(),
                     },
+                    suggested_permission: None,
                 },
             )
             .await
             .unwrap();
         let task_id = uuid::Uuid::parse_str(&task.task_id).map(TaskId).unwrap();
 
-        assert_eq!(source.list_tasks(&alice).await.unwrap().len(), 1);
-        assert!(source.list_tasks(&bob).await.unwrap().is_empty());
-        assert!(source.task_events(&bob, task_id).await.is_err());
+        assert_eq!(source.list_tasks(&alice).await.unwrap().len(), 2);
+        assert_eq!(source.list_tasks(&bob).await.unwrap().len(), 2);
+        assert!(source.task_events(&bob, task_id).await.is_ok());
         assert!(source.can_access_task(&alice, task_id).await);
-        assert!(!source.can_access_task(&bob, task_id).await);
+        assert!(source.can_access_task(&bob, task_id).await);
+
+        source
+            .control_task(
+                WebPrincipal::admin("web-admin", Some("Web Admin".into())),
+                task_id,
+                TaskControlCommand {
+                    action: TaskControlAction::SetMinimumPermission,
+                    reason: None,
+                    minimum_permission: Some(PermissionLevel::Admin),
+                    provider: None,
+                    model_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(source.list_tasks(&alice).await.unwrap().len(), 1);
+        assert_eq!(source.list_tasks(&bob).await.unwrap().len(), 1);
+        assert!(source.task_events(&bob, task_id).await.is_err());
+        assert!(!source.can_access_task(&alice, task_id).await);
+        assert!(
+            source
+                .can_access_task(
+                    &WebPrincipal::admin("web-admin", Some("Web Admin".into())),
+                    task_id,
+                )
+                .await
+        );
 
         std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn users_can_read_tasks_created_by_the_main_model_from_their_web_input() {
+        let directory =
+            std::env::temp_dir().join(format!("koi-web-derived-owner-{}", EventId::new()));
+        let store = Arc::new(JsonlEventStore::open(&directory).unwrap());
+        bootstrap_main_session(&store).await;
+        let identities =
+            Arc::new(WebUserStore::open(directory.join("users.json"), "test-admin").unwrap());
+        let alice = identities
+            .register(RegisterUserCommand {
+                email: "alice@example.test".into(),
+                username: "alice_ops".into(),
+                password: "correct horse battery staple".into(),
+            })
+            .unwrap()
+            .principal;
+        let source = KoiWebSource::new(
+            Arc::clone(&store),
+            identities,
+            test_task_manager(&store),
+            Vec::new(),
+            10.0,
+        )
+        .unwrap();
+
+        let mut main = TaskRuntime::recover(Arc::clone(&store), TaskId::MAIN)
+            .await
+            .unwrap();
+        let ingress = source
+            .record_task_input(
+                &mut main,
+                &alice,
+                &CreateTaskCommand {
+                    message: "请启动一个只读检查子任务".into(),
+                    scope: ScopeDto {
+                        kind: "service".into(),
+                        id: "orders".into(),
+                    },
+                    suggested_permission: None,
+                },
+            )
+            .await
+            .unwrap();
+        let proposed = main
+            .record_with_provenance(
+                AgentEvent::tool(ToolEvent::Proposed {
+                    tool_call: koi_core::domain::ToolCall {
+                        name: "task.start".into(),
+                        arguments: serde_json::json!({ "message": "只读检查" }),
+                        provider_call_id: Some("call-test".into()),
+                        authority_parent_event_id: Some(ingress.id),
+                    },
+                }),
+                None,
+                koi_core::domain::EventProvenance::model(Some(ingress.id)),
+            )
+            .await
+            .unwrap();
+        let validated = main
+            .record(
+                AgentEvent::tool(ToolEvent::Validated {
+                    proposal_event_id: proposed.id,
+                }),
+                Some(proposed.id),
+            )
+            .await
+            .unwrap();
+        let requested = main
+            .record(
+                AgentEvent::control(ControlEvent::TaskOperationRequested {
+                    operation: koi_core::domain::TaskOperation::CreateChild,
+                }),
+                Some(validated.id),
+            )
+            .await
+            .unwrap();
+        let child_id = TaskId::new();
+        let accepted = main
+            .record(
+                AgentEvent::control(ControlEvent::TaskOperationAccepted {
+                    request_event_id: requested.id,
+                    target_task_id: child_id,
+                }),
+                Some(requested.id),
+            )
+            .await
+            .unwrap();
+        let started = main
+            .record_with_provenance(
+                AgentEvent::tool(ToolEvent::Started {
+                    proposal_event_id: proposed.id,
+                }),
+                Some(accepted.id),
+                koi_core::domain::EventProvenance::tool(),
+            )
+            .await
+            .unwrap();
+
+        let mut child = TaskRuntime::new(Arc::clone(&store), child_id);
+        child
+            .record(
+                AgentEvent::control(ControlEvent::TaskCreated {
+                    trigger_event_id: Some(started.id),
+                }),
+                Some(started.id),
+            )
+            .await
+            .unwrap();
+        child
+            .record(AgentEvent::control(ControlEvent::TaskQueued), None)
+            .await
+            .unwrap();
+
+        assert!(source.can_access_task(&alice, child_id).await);
+        assert_eq!(source.list_tasks(&alice).await.unwrap().len(), 2);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn web_source_names_and_deletes_children_through_task_manager() {
         let directory = std::env::temp_dir().join(format!("koi-web-manage-{}", EventId::new()));
         let store = Arc::new(JsonlEventStore::open(&directory).unwrap());
@@ -1567,6 +1752,7 @@ mod tests {
                         kind: "service".into(),
                         id: "order-api".into(),
                     },
+                    suggested_permission: None,
                 },
             )
             .await
@@ -1665,5 +1851,26 @@ mod tests {
         assert!(store.load_task(task_id).await.unwrap().is_empty());
 
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn suggested_permission_cannot_exceed_authenticated_identity() {
+        let user = WebPrincipal {
+            subject: "alice_ops".into(),
+            display_name: Some("alice_ops".into()),
+            permission: PermissionLevel::User,
+        };
+        assert_eq!(
+            resolve_suggested_permission(&user, Some(PermissionLevel::User)).unwrap(),
+            PermissionLevel::User
+        );
+        assert!(matches!(
+            resolve_suggested_permission(&user, Some(PermissionLevel::Operator)),
+            Err(WebApiError::Forbidden(_))
+        ));
+        assert!(matches!(
+            resolve_suggested_permission(&user, Some(PermissionLevel::None)),
+            Err(WebApiError::Validation(_))
+        ));
     }
 }

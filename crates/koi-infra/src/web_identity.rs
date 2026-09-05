@@ -41,6 +41,33 @@ struct StoredUser {
     email: String,
     username: String,
     password_hash: String,
+    /// Web 账户只能被授予 User 或 Admin，不能通过用户库获得 System 权限。
+    /// 缺少该字段的旧用户记录按 User 处理，保证向后兼容。
+    #[serde(default)]
+    permission: StoredUserPermission,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+enum StoredUserPermission {
+    #[default]
+    User,
+    Admin,
+}
+
+impl StoredUserPermission {
+    fn as_core_permission(self) -> PermissionLevel {
+        match self {
+            Self::User => PermissionLevel::User,
+            Self::Admin => PermissionLevel::Admin,
+        }
+    }
+
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::User => "User",
+            Self::Admin => "Admin",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -53,6 +80,11 @@ const SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 
 impl WebUserStore {
     /// Opens (or creates on first registration) a local account database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the administrator token is empty or the user database cannot be
+    /// read, parsed, or initialized.
     pub fn open(
         path: impl Into<PathBuf>,
         admin_token: impl Into<String>,
@@ -95,8 +127,8 @@ impl WebUserStore {
         self.users
             .read()
             .ok()?
-            .contains_key(subject)
-            .then_some(PermissionLevel::User)
+            .get(subject)
+            .map(|user| user.permission.as_core_permission())
     }
 
     fn display_name_for(&self, subject: &str) -> Option<String> {
@@ -184,6 +216,7 @@ impl WebIdentityProvider for WebUserStore {
             email,
             username: username.clone(),
             password_hash,
+            permission: StoredUserPermission::User,
         };
         users.insert(username, user.clone());
         self.persist(&users)?;
@@ -261,7 +294,7 @@ fn principal_for(user: &StoredUser) -> WebPrincipal {
     WebPrincipal {
         subject: user.username.clone(),
         display_name: Some(user.username.clone()),
-        permission: PermissionLevel::User,
+        permission: user.permission.as_core_permission(),
     }
 }
 
@@ -270,7 +303,7 @@ fn user_dto(user: &StoredUser) -> WebUserDto {
         user_id: user.username.clone(),
         username: user.username.clone(),
         email: user.email.clone(),
-        permission: "User".into(),
+        permission: user.permission.as_label().into(),
     }
 }
 
@@ -278,7 +311,7 @@ fn admin_user_dto() -> WebUserDto {
     WebUserDto {
         user_id: ADMIN_SUBJECT.into(),
         username: "Web Admin".into(),
-        email: "".into(),
+        email: String::new(),
         permission: "Admin".into(),
     }
 }
@@ -341,6 +374,55 @@ mod tests {
             .unwrap();
         assert_eq!(session.principal.subject, "ada_ops");
         assert_eq!(session.user.username, session.principal.subject);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn stored_admin_permission_is_exposed_to_core_and_legacy_users_stay_user() {
+        let path = std::env::temp_dir().join(format!("koi-web-users-{}.json", Uuid::new_v4()));
+        let body = r#"
+        {
+          "version": 1,
+          "users": [
+            {
+              "email": "admin@example.com",
+              "username": "admin_ops",
+              "password_hash": "not-used-in-this-test",
+              "permission": "Admin"
+            },
+            {
+              "email": "legacy@example.com",
+              "username": "legacy_ops",
+              "password_hash": "not-used-in-this-test"
+            }
+          ]
+        }
+        "#;
+        std::fs::write(&path, body).unwrap();
+
+        let store = WebUserStore::open(&path, "admin-token").unwrap();
+        assert_eq!(
+            store.permission_for("admin_ops"),
+            Some(PermissionLevel::Admin)
+        );
+        assert_eq!(
+            store.permission_for("legacy_ops"),
+            Some(PermissionLevel::User)
+        );
+
+        let admin_user = store
+            .users
+            .read()
+            .unwrap()
+            .get("admin_ops")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            principal_for(&admin_user).permission,
+            PermissionLevel::Admin
+        );
+        assert_eq!(user_dto(&admin_user).permission, "Admin");
+
         std::fs::remove_file(path).unwrap();
     }
 }

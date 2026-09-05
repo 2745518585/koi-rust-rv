@@ -137,11 +137,13 @@ export interface SystemSnapshot {
 export interface CreateTaskRequest {
   message: string;
   scope: Scope;
+  suggestedPermission: PermissionLevel;
 }
 
 export interface ApprovalSubmission {
   approved: boolean;
   reason?: string;
+  suggestedPermission?: PermissionLevel;
 }
 
 export type TaskControlRequest =

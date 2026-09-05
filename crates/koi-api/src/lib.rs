@@ -1,8 +1,8 @@
 //! HTTP API, server-sent event boundary, and Web-source command contracts.
 //!
 //! This crate owns transport DTOs and authentication hand-off only. Implementations of the
-//! command ports must hand trusted Web identities to `koi-core`; they must never accept a
-//! permission level, event source, or event sequence from an HTTP request.
+//! command ports must hand trusted Web identities to `koi-core`; an HTTP request may only carry
+//! an untrusted permission suggestion, which the source adapter and `koi-core` must clamp again.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -122,6 +122,9 @@ pub trait WebIdentityProvider: Send + Sync {
 pub struct CreateTaskCommand {
     pub message: String,
     pub scope: ScopeDto,
+    /// 用户希望本次输入最多使用的权限；缺省时由来源适配器使用当前身份权限。
+    #[serde(default)]
+    pub suggested_permission: Option<PermissionLevel>,
 }
 
 /// A follow-up Web context event for an existing task. The transport can choose only a bounded
@@ -131,6 +134,9 @@ pub struct CreateTaskCommand {
 pub struct AppendContextCommand {
     pub message: String,
     pub kind: WebContextKind,
+    /// 用户希望本次输入最多使用的权限；该值不能超过认证身份权限。
+    #[serde(default)]
+    pub suggested_permission: Option<PermissionLevel>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -147,6 +153,9 @@ pub enum WebContextKind {
 #[serde(rename_all = "camelCase")]
 pub struct CancellationRequestCommand {
     pub reason: String,
+    /// 取消请求的建议权限；缺省时使用当前身份权限。
+    #[serde(default)]
+    pub suggested_permission: Option<PermissionLevel>,
 }
 
 /// Request body for a user decision on an existing tool approval request.
@@ -154,6 +163,9 @@ pub struct CancellationRequestCommand {
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalCommand {
     pub approved: bool,
+    /// 审批输入的建议权限；缺省时使用当前身份权限。
+    #[serde(default)]
+    pub suggested_permission: Option<PermissionLevel>,
 }
 
 /// Direct task control commands. They are turned into core control events by the Web source
