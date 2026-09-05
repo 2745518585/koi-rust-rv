@@ -31,7 +31,8 @@ model_id = "gpt-5-mini"
 api_key = ""
 protocol = "responses" # responses 或 chat_completions；学校接口可切换为 chat_completions
 request_timeout_secs = 60
-max_context_messages = 32
+context_window_tokens = 32768
+max_output_tokens = 4096
 reasoning_effort = "medium"
 
 [[models.entries]]
@@ -43,7 +44,8 @@ model_id = "deepseek-chat"
 api_key = ""
 protocol = "responses"
 request_timeout_secs = 30
-max_context_messages = 16
+context_window_tokens = 16384
+max_output_tokens = 4096
 reasoning_effort = "low"
 
 [agent]

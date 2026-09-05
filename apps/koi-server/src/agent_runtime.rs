@@ -3,7 +3,7 @@
 //! Web、QQ 和告警适配器只负责把外部事实写成事件；本模块负责发现排队任务、恢复事件
 //! 流并调用 `koi-core::agent::AgentLoop`。它不改变权限结论，也不接受模型返回的权限字段。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,8 +12,9 @@ use koi_core::agent::{
     TaskManager, TaskRuntime,
 };
 use koi_core::domain::{
-    AgentEvent, EventEnvelope, IngressEvent, ModelContextItem, ModelError, ModelErrorKind,
-    ModelInputRole, ModelOutputContract, ModelSelection, TaskId, TaskStatus, ToolEvent,
+    AgentEvent, ControlEvent, EventEnvelope, IngressEvent, ModelContextItem, ModelError,
+    ModelErrorKind, ModelEvent, ModelInputRole, ModelOutputContract, ModelSelection, TaskId,
+    TaskStatus, ToolEvent,
 };
 use koi_core::ports::{
     EventStore, ModelProvider, SourceAuthorizationRegistry, SystemPromptProvider, ToolRegistry,
@@ -46,6 +47,7 @@ pub struct AgentSupervisor {
 impl AgentSupervisor {
     /// 创建后台调度器。所有依赖均由应用层装配，核心循环本身不绑定 Web 或具体模型。
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<JsonlEventStore>,
         models: Arc<ModelProviderRegistry>,
@@ -75,14 +77,14 @@ impl AgentSupervisor {
         let mut interval = tokio::time::interval(POLL_INTERVAL);
         loop {
             tokio::select! {
-                _ = shutdown.cancelled() => break,
+                () = shutdown.cancelled() => break,
                 _ = interval.tick() => self.tick().await,
             }
         }
     }
 
     async fn tick(self: &Arc<Self>) {
-        let task_ids = match self.store.list_task_ids() {
+        let task_ids = match JsonlEventStore::list_task_ids(self.store.as_ref()) {
             Ok(task_ids) => task_ids,
             Err(error) => {
                 tracing::error!(%error, "扫描 Agent 任务失败");
@@ -111,9 +113,7 @@ impl AgentSupervisor {
             };
             match runtime.projection().status {
                 TaskStatus::New | TaskStatus::Queued => {
-                    let context_limit =
-                        self.context_limit(task_id, runtime.projection().selected_model.as_ref());
-                    let input_events = context_events(&events, context_limit);
+                    let input_events = context_events(&events);
                     // Web/工具建任务会先写入生命周期事件，再写入首条输入；没有输入时不
                     // 应让模型凭空启动，也避免与仍在提交首条输入的请求竞争事件序号。
                     if !input_events.is_empty() {
@@ -126,11 +126,10 @@ impl AgentSupervisor {
                 }
                 TaskStatus::Running if task_id.is_main() && !self.is_active(task_id) => {
                     // 主会话持续存在：新输入或子任务回传的工具结果都会唤醒一次续跑。
-                    // 已完成的一轮模型调用已经消费了此前所有上下文。只传入其后的
-                    // Web 输入，避免主会话在空闲时每 250ms 重复执行同一条请求。
-                    let context_limit =
-                        self.context_limit(task_id, runtime.projection().selected_model.as_ref());
-                    let input_events = context_events_since_last_model(&events, context_limit);
+                    // 已经出现在某次模型调用 context_event_ids 中的上下文不会重复注入；
+                    // 这里只收集新的外部输入和仍未注入的工具结果，避免主会话在空闲时
+                    // 每 250ms 重复执行同一条请求。
+                    let input_events = context_events_since_last_model(&events);
                     let tool_results = pending_tool_results(&events);
                     if !input_events.is_empty() || !tool_results.is_empty() {
                         self.spawn_main(task_id, input_events, tool_results);
@@ -142,26 +141,10 @@ impl AgentSupervisor {
                             self.spawn_main_resume(
                                 task_id,
                                 approval_event_id,
-                                context_events(
-                                    &events,
-                                    self.context_limit(
-                                        task_id,
-                                        runtime.projection().selected_model.as_ref(),
-                                    ),
-                                ),
+                                context_events(&events),
                             );
                         } else {
-                            self.spawn_resume(
-                                task_id,
-                                approval_event_id,
-                                context_events(
-                                    &events,
-                                    self.context_limit(
-                                        task_id,
-                                        runtime.projection().selected_model.as_ref(),
-                                    ),
-                                ),
-                            );
+                            self.spawn_resume(task_id, approval_event_id, context_events(&events));
                         }
                     }
                 }
@@ -482,33 +465,17 @@ impl AgentSupervisor {
             .models
             .resolve(selected_model)
             .map_err(model_selection_error)?;
-        let changed = self
-            .last_models
-            .lock()
-            .map(|mut last_models| {
-                let changed = last_models
-                    .get(&task_id)
-                    .is_some_and(|previous| previous != selection);
-                last_models.insert(task_id, selection.clone());
-                changed
-            })
-            .unwrap_or(false);
+        let changed = self.last_models.lock().is_ok_and(|mut last_models| {
+            let changed = last_models
+                .get(&task_id)
+                .is_some_and(|previous| previous != selection);
+            last_models.insert(task_id, selection.clone());
+            changed
+        });
         if changed {
             self.models.reset_task(task_id);
         }
         Ok(entry)
-    }
-
-    fn context_limit(&self, task_id: TaskId, selected_model: Option<&ModelSelection>) -> usize {
-        match self.resolve_model(task_id, selected_model) {
-            Ok(entry) => entry.max_context_messages,
-            Err(error) => {
-                tracing::warn!(%task_id, %error, "任务选择的模型不可用，将使用默认模型上下文上限进行检查");
-                self.models
-                    .default_entry()
-                    .map_or(1, |entry| entry.max_context_messages)
-            }
-        }
     }
 
     fn try_start(&self, task_id: TaskId) -> Option<CancellationToken> {
@@ -533,8 +500,7 @@ impl AgentSupervisor {
     fn is_active(&self, task_id: TaskId) -> bool {
         self.active
             .lock()
-            .map(|active| active.contains_key(&task_id))
-            .unwrap_or(true)
+            .map_or(true, |active| active.contains_key(&task_id))
     }
 
     fn active_token(&self, task_id: TaskId) -> Option<CancellationToken> {
@@ -545,6 +511,7 @@ impl AgentSupervisor {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn model_selection_error(error: ModelRegistryError) -> koi_core::agent::AgentLoopError {
     ModelError::new(
         ModelErrorKind::InvalidResponse,
@@ -554,8 +521,8 @@ fn model_selection_error(error: ModelRegistryError) -> koi_core::agent::AgentLoo
     .into()
 }
 
-fn context_events(events: &[EventEnvelope], limit: usize) -> Vec<EventEnvelope> {
-    let mut contexts = events
+fn context_events(events: &[EventEnvelope]) -> Vec<EventEnvelope> {
+    current_cycle_events(events)
         .iter()
         .filter(|event| {
             matches!(
@@ -565,15 +532,11 @@ fn context_events(events: &[EventEnvelope], limit: usize) -> Vec<EventEnvelope> 
             )
         })
         .cloned()
-        .collect::<Vec<_>>();
-    if contexts.len() > limit {
-        let first = contexts.len() - limit;
-        contexts.drain(..first);
-    }
-    contexts
+        .collect()
 }
 
-fn context_events_since_last_model(events: &[EventEnvelope], limit: usize) -> Vec<EventEnvelope> {
+fn context_events_since_last_model(events: &[EventEnvelope]) -> Vec<EventEnvelope> {
+    let events = current_cycle_events(events);
     let last_model_completed = events
         .iter()
         .rev()
@@ -591,39 +554,46 @@ fn context_events_since_last_model(events: &[EventEnvelope], limit: usize) -> Ve
             .filter(|event| event.sequence > last_model_completed)
             .cloned()
             .collect::<Vec<_>>(),
-        limit,
     )
 }
 
 /// 主会话续跑时待注入的工具结果上下文。
 ///
-/// 只有最近一次模型完成之后新写入的 `ToolEvent::Finished` 才是模型尚未看到的；同一次
-/// 运行内已经继续推理过的工具结果都会被后续的模型完成事件覆盖。
+/// 模型是否已经看到工具结果，以 `ModelEvent::CallStarted.context_event_ids` 为准，
+/// 而不是以事件序号或最近一次模型完成事件为准。
+///
+/// 这一区别对异步子任务很重要：子任务结果可能在主会话模型调用已经开始后、该调用
+/// 完成前到达。此时结果事件的序号小于 `ModelEvent::Completed`，但它并没有出现在该
+/// 调用的 `context_event_ids` 中，必须保留到下一次模型调用。
 ///
 /// 工具结果进入会话是一条显式的无权限限制通道：不经过会话最低控制权限审查。安全性
 /// 由授权规则保证——工具事件以 `None` 权限持久化且永远不能作为权限父节点，只能被
 /// 模型阅读，不能参与提权。
 fn pending_tool_results(events: &[EventEnvelope]) -> Vec<ModelContextItem> {
-    let last_model_completed = events
+    let events = current_cycle_events(events);
+    let injected_context_event_ids: HashSet<_> = events
         .iter()
-        .rev()
-        .find(|event| {
-            matches!(
-                event.payload,
-                AgentEvent::Model(ref model)
-                    if matches!(model.as_ref(), koi_core::domain::ModelEvent::Completed { .. })
-            )
+        .filter_map(|event| match &event.payload {
+            AgentEvent::Model(model) => match model.as_ref() {
+                ModelEvent::CallStarted {
+                    context_event_ids, ..
+                } => Some(context_event_ids.iter()),
+                _ => None,
+            },
+            _ => None,
         })
-        .map_or(0, |event| event.sequence);
+        .flatten()
+        .copied()
+        .collect();
     events
         .iter()
-        .filter(|event| event.sequence > last_model_completed)
+        .filter(|event| !injected_context_event_ids.contains(&event.id))
         .filter_map(|event| match &event.payload {
             AgentEvent::Tool(tool) => match tool.as_ref() {
                 ToolEvent::Finished { result, .. } => Some(ModelContextItem {
                     event_id: event.id,
                     role: ModelInputRole::Tool,
-                    content: result.summary.clone(),
+                    content: result.model_content(),
                     permission: koi_core::domain::PermissionLevel::None,
                 }),
                 _ => None,
@@ -634,7 +604,7 @@ fn pending_tool_results(events: &[EventEnvelope]) -> Vec<ModelContextItem> {
 }
 
 fn has_cancellation_request(events: &[EventEnvelope]) -> bool {
-    events.iter().any(|event| {
+    current_cycle_events(events).iter().any(|event| {
         matches!(
             event.payload,
             AgentEvent::Ingress(ref ingress)
@@ -644,6 +614,7 @@ fn has_cancellation_request(events: &[EventEnvelope]) -> bool {
 }
 
 fn completed_approval(events: &[EventEnvelope]) -> Option<koi_core::domain::EventId> {
+    let events = current_cycle_events(events);
     let (request_event_id, request_sequence) = events.iter().rev().find_map(|event| {
         let AgentEvent::Tool(tool) = &event.payload else {
             return None;
@@ -669,4 +640,105 @@ fn completed_approval(events: &[EventEnvelope]) -> Option<koi_core::domain::Even
             _ => None,
         }
     })
+}
+
+/// 最近一次入队事件界定当前工作周期。主会话在重启后重新入队时，旧周期的输入、
+/// 取消和审批都只能保留为审计历史，不能再影响新的对话。
+fn current_cycle_events(events: &[EventEnvelope]) -> &[EventEnvelope] {
+    let start = events
+        .iter()
+        .rposition(|event| {
+            matches!(
+                event.payload,
+                AgentEvent::Control(ref control)
+                    if matches!(control.as_ref(), ControlEvent::TaskQueued)
+            )
+        })
+        .map_or(0, |index| index.saturating_add(1));
+    &events[start..]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use koi_core::domain::{EventId, ToolResult, Usage};
+
+    fn finished_tool(sequence: u64, summary: &str) -> EventEnvelope {
+        EventEnvelope::new(
+            TaskId::MAIN,
+            sequence,
+            None,
+            AgentEvent::tool(ToolEvent::Finished {
+                execution_started_event_id: EventId::new(),
+                result: ToolResult {
+                    summary: summary.to_owned(),
+                    data: serde_json::Value::Null,
+                    truncated: false,
+                },
+            }),
+        )
+    }
+
+    fn model_call_started(sequence: u64, context_event_ids: Vec<EventId>) -> EventEnvelope {
+        EventEnvelope::new(
+            TaskId::MAIN,
+            sequence,
+            None,
+            AgentEvent::model(ModelEvent::CallStarted {
+                context_event_ids,
+                context_hash: "test-context".to_owned(),
+                provider: "test".to_owned(),
+                model_id: "test-model".to_owned(),
+            }),
+        )
+    }
+
+    fn model_completed(sequence: u64, call_started_event_id: EventId) -> EventEnvelope {
+        EventEnvelope::new(
+            TaskId::MAIN,
+            sequence,
+            Some(call_started_event_id),
+            AgentEvent::model(ModelEvent::Completed {
+                call_started_event_id,
+                outputs: Vec::new(),
+                usage: Usage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cached_input_tokens: None,
+                    reasoning_tokens: None,
+                },
+            }),
+        )
+    }
+
+    #[test]
+    fn pending_tool_results_uses_model_context_ids_instead_of_sequence_watermark() {
+        let queued = EventEnvelope::new(
+            TaskId::MAIN,
+            1,
+            None,
+            AgentEvent::control(ControlEvent::TaskQueued),
+        );
+        let already_injected = finished_tool(2, "already injected");
+        let first_call = model_call_started(3, vec![already_injected.id]);
+        let arrived_during_call = finished_tool(4, "arrived during call");
+        let completed = model_completed(5, first_call.id);
+
+        let events = vec![
+            queued,
+            already_injected.clone(),
+            first_call.clone(),
+            arrived_during_call.clone(),
+            completed,
+        ];
+        let pending = pending_tool_results(&events);
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].event_id, arrived_during_call.id);
+        assert_eq!(pending[0].content, "arrived during call");
+
+        let second_call = model_call_started(6, vec![already_injected.id, arrived_during_call.id]);
+        let events = [events, vec![second_call]].concat();
+        assert!(pending_tool_results(&events).is_empty());
+    }
 }

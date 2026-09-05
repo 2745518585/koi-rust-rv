@@ -29,6 +29,7 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_SSE_EVENT_BYTES: usize = 4 * 1024 * 1024;
+const CHAT_COMPLETIONS_START_MESSAGE: &str = "请根据系统中的任务要求开始处理。";
 const AUTHORITY_PARENT_FIELD: &str = "__koi_authority_parent_event_id";
 const AUTHORITY_PARENT_DESCRIPTION: &str =
     "授权此调用的 KOI_CONTEXT event_id；无可用授权事件时必须传 null，不能编造。";
@@ -46,6 +47,8 @@ pub struct OpenAiCompatibleModelConfig {
     pub api_key: Option<String>,
     pub protocol: ModelProtocol,
     pub request_timeout_secs: u64,
+    /// 由部署配置提供的模型上下文窗口上限；兼容网关通常不会动态返回它。
+    pub context_window_tokens: Option<u32>,
 }
 
 impl fmt::Debug for OpenAiCompatibleModelConfig {
@@ -58,6 +61,7 @@ impl fmt::Debug for OpenAiCompatibleModelConfig {
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("protocol", &self.protocol)
             .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("context_window_tokens", &self.context_window_tokens)
             .finish()
     }
 }
@@ -78,6 +82,7 @@ impl OpenAiCompatibleModelConfig {
             api_key,
             protocol: ModelProtocol::Responses,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            context_window_tokens: None,
         }
     }
 
@@ -90,6 +95,12 @@ impl OpenAiCompatibleModelConfig {
     #[must_use]
     pub fn with_request_timeout_secs(mut self, seconds: u64) -> Self {
         self.request_timeout_secs = seconds;
+        self
+    }
+
+    #[must_use]
+    pub fn with_context_window_tokens(mut self, tokens: u32) -> Self {
+        self.context_window_tokens = Some(tokens);
         self
     }
 
@@ -109,6 +120,9 @@ impl OpenAiCompatibleModelConfig {
             .map_err(|error| ModelProviderConfigError::InvalidModelId(error.to_string()))?;
         if self.request_timeout_secs == 0 {
             return Err(ModelProviderConfigError::ZeroRequestTimeout);
+        }
+        if self.context_window_tokens == Some(0) {
+            return Err(ModelProviderConfigError::ZeroContextWindow);
         }
         if self
             .api_key
@@ -157,6 +171,8 @@ pub enum ModelProviderConfigError {
     InvalidModelId(String),
     #[error("模型请求超时时间必须大于零")]
     ZeroRequestTimeout,
+    #[error("模型上下文窗口必须大于零")]
+    ZeroContextWindow,
     #[error("模型 API key 不能为空")]
     EmptyApiKey,
     #[error("模型 base URL 无效：{0}")]
@@ -237,14 +253,14 @@ impl OpenAiCompatibleModelProvider {
 
     fn request_body(&self, request: &ModelRequest) -> Result<Value, ModelError> {
         let pending_tool_calls = self.conversation_snapshot(request.task_id)?;
-        match self.config.protocol {
+        Ok(match self.config.protocol {
             ModelProtocol::Responses => {
-                build_responses_request(&self.config.model_id, request, pending_tool_calls)
+                build_responses_request(&self.config.model_id, request, &pending_tool_calls)
             }
             ModelProtocol::ChatCompletions => {
-                build_chat_request(&self.config.model_id, request, pending_tool_calls)
+                build_chat_request(&self.config.model_id, request, &pending_tool_calls)
             }
-        }
+        })
     }
 
     fn conversation_snapshot(&self, task_id: TaskId) -> Result<Vec<PendingToolCall>, ModelError> {
@@ -263,7 +279,7 @@ impl OpenAiCompatibleModelProvider {
             .conversations
             .lock()
             .map_err(|_| internal_error("模型会话状态锁已中毒"))?;
-        append_tool_calls(&mut conversations, task_id, turn);
+        remember_tool_calls(&mut conversations, task_id, turn);
         Ok(())
     }
 }
@@ -281,6 +297,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 ModelCapability::StructuredOutput,
             ]),
         }
+    }
+
+    fn context_window_tokens(&self) -> Option<u32> {
+        self.config.context_window_tokens
     }
 
     async fn start(
@@ -313,7 +333,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         }
 
         let response = tokio::select! {
-            _ = cancel.cancelled() => return Err(cancelled_error()),
+            () = cancel.cancelled() => return Err(cancelled_error()),
             result = request_builder.send() => result.map_err(map_request_error)?,
         };
         let status = response.status();
@@ -364,7 +384,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 pub struct ModelProviderEntry {
     pub provider: Arc<dyn ModelProvider>,
     pub model_options: ModelGenerationOptions,
-    pub max_context_messages: usize,
+    /// 配置中的模型上下文窗口上限，供应用层展示和调度策略使用。
+    pub context_window_tokens: u32,
 }
 
 impl ModelProviderEntry {
@@ -372,12 +393,12 @@ impl ModelProviderEntry {
     pub fn new(
         provider: Arc<dyn ModelProvider>,
         model_options: ModelGenerationOptions,
-        max_context_messages: usize,
+        context_window_tokens: u32,
     ) -> Self {
         Self {
             provider,
             model_options,
-            max_context_messages: max_context_messages.max(1),
+            context_window_tokens: context_window_tokens.max(1),
         }
     }
 }
@@ -533,8 +554,8 @@ fn endpoint_for(config: &OpenAiCompatibleModelConfig) -> Result<Url, ModelProvid
 fn build_responses_request(
     model: &str,
     request: &ModelRequest,
-    pending_tool_calls: Vec<PendingToolCall>,
-) -> Result<Value, ModelError> {
+    pending_tool_calls: &[PendingToolCall],
+) -> Value {
     let mut body = Map::new();
     body.insert("model".into(), Value::String(model.into()));
     body.insert(
@@ -543,7 +564,7 @@ fn build_responses_request(
     );
     body.insert(
         "input".into(),
-        Value::Array(responses_input(&request.context, &pending_tool_calls)),
+        Value::Array(responses_input(&request.context, pending_tool_calls)),
     );
     body.insert(
         "tools".into(),
@@ -568,14 +589,14 @@ fn build_responses_request(
             }),
         );
     }
-    Ok(Value::Object(body))
+    Value::Object(body)
 }
 
 fn build_chat_request(
     model: &str,
     request: &ModelRequest,
-    pending_tool_calls: Vec<PendingToolCall>,
-) -> Result<Value, ModelError> {
+    pending_tool_calls: &[PendingToolCall],
+) -> Value {
     let mut body = Map::new();
     body.insert("model".into(), Value::String(model.into()));
     body.insert(
@@ -583,7 +604,7 @@ fn build_chat_request(
         Value::Array(chat_messages(
             &request.instructions,
             &request.context,
-            &pending_tool_calls,
+            pending_tool_calls,
         )),
     );
     body.insert(
@@ -600,7 +621,7 @@ fn build_chat_request(
             chat_output_contract(&request.output_contract),
         );
     }
-    Ok(Value::Object(body))
+    Value::Object(body)
 }
 
 fn apply_common_request_options(
@@ -683,11 +704,40 @@ fn chat_messages(
     context: &[ModelContextItem],
     pending_tool_calls: &[PendingToolCall],
 ) -> Vec<Value> {
+    // 部分 OpenAI 兼容服务（学校接口也属于这一类）不接受多个连续的 system
+    // 消息，甚至不接受 developer role。核心中的系统事件仍然要保留其语义，
+    // 因此在 Chat Completions 协议下将它们合并到唯一的首条 system 消息中。
+    // Responses 协议不经过这里，仍可保留独立的 system/developer input item。
+    let system_context = context
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.role,
+                ModelInputRole::System | ModelInputRole::Developer
+            )
+        })
+        .map(model_context_content)
+        .collect::<Vec<_>>();
+    let system_message = if system_context.is_empty() {
+        instructions.to_owned()
+    } else {
+        std::iter::once(instructions)
+            .chain(system_context.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
     let mut messages = Vec::with_capacity(context.len() + pending_tool_calls.len() + 1);
-    messages.push(json!({"role": "system", "content": instructions}));
+    messages.push(json!({"role": "system", "content": system_message}));
     let mut tool_index = 0;
     let mut inserted_pending_calls = false;
+    let mut has_user_message = false;
     for item in context {
+        if matches!(
+            item.role,
+            ModelInputRole::System | ModelInputRole::Developer
+        ) {
+            continue;
+        }
         if item.role == ModelInputRole::Tool {
             if !inserted_pending_calls && !pending_tool_calls.is_empty() {
                 messages.push(chat_assistant_tool_call(pending_tool_calls));
@@ -709,11 +759,21 @@ fn chat_messages(
             }
             tool_index += 1;
         } else {
+            has_user_message |= chat_role(item.role) == "user";
             messages.push(json!({
                 "role": chat_role(item.role),
                 "content": model_context_content(item),
             }));
         }
+    }
+    // 学校的 Chat Completions 兼容接口要求 messages 中至少有一条 user 消息。
+    // 子任务刚启动时上下文可能只有一条系统创建指令；这时添加固定的线协议占位消息，
+    // 不伪造事件、不携带权限，也不向模型提供可作为授权证据的 event_id。
+    if !has_user_message {
+        messages.push(json!({
+            "role": "user",
+            "content": CHAT_COMPLETIONS_START_MESSAGE,
+        }));
     }
     messages
 }
@@ -749,7 +809,7 @@ fn chat_assistant_tool_call(calls: &[PendingToolCall]) -> Value {
     })
 }
 
-fn append_tool_calls(
+fn remember_tool_calls(
     conversations: &mut HashMap<TaskId, ConversationState>,
     task_id: TaskId,
     turn: &ModelTurn,
@@ -766,12 +826,13 @@ fn append_tool_calls(
             _ => None,
         })
         .collect::<Vec<_>>();
-    if !tool_calls.is_empty() {
-        conversations
-            .entry(task_id)
-            .or_default()
-            .pending_tool_calls
-            .extend(tool_calls);
+    if tool_calls.is_empty() {
+        // 工具链已经结束；不能把上一轮的 provider call ID 带到下一次独立对话中。
+        conversations.remove(&task_id);
+    } else {
+        // 一次模型响应对应一组新的待执行工具调用。替换而不是追加，避免跨轮次重复
+        // 配对历史工具结果。
+        conversations.entry(task_id).or_default().pending_tool_calls = tool_calls;
     }
 }
 
@@ -795,9 +856,8 @@ fn chat_role(role: ModelInputRole) -> &'static str {
     match role {
         ModelInputRole::System => "system",
         ModelInputRole::Developer => "developer",
-        ModelInputRole::User | ModelInputRole::Memory => "user",
+        ModelInputRole::User | ModelInputRole::Memory | ModelInputRole::Tool => "user",
         ModelInputRole::Assistant => "assistant",
-        ModelInputRole::Tool => "user",
     }
 }
 
@@ -952,7 +1012,7 @@ impl ModelResponseStream {
         loop {
             if let Some(message) = self.decoder.next_message() {
                 match message {
-                    Ok(message) => self.handle_message(message),
+                    Ok(message) => self.handle_message(&message),
                     Err(error) => self.fail(error),
                 }
                 if let Some(item) = self.queue.pop_front() {
@@ -968,7 +1028,7 @@ impl ModelResponseStream {
                 if !self.decoder_finished {
                     self.decoder_finished = true;
                     match self.decoder.finish() {
-                        Ok(Some(message)) => self.handle_message(message),
+                        Ok(Some(message)) => self.handle_message(&message),
                         Ok(None) => {}
                         Err(error) => self.fail(error),
                     }
@@ -984,7 +1044,7 @@ impl ModelResponseStream {
             }
 
             let chunk = tokio::select! {
-                _ = self.cancel.cancelled() => {
+                () = self.cancel.cancelled() => {
                     self.fail(cancelled_error());
                     return self.queue.pop_front();
                 },
@@ -1010,7 +1070,7 @@ impl ModelResponseStream {
         }
     }
 
-    fn handle_message(&mut self, message: SseMessage) {
+    fn handle_message(&mut self, message: &SseMessage) {
         if message.data.trim() == "[DONE]" {
             match self.accumulator.finish() {
                 Ok(turn) => self.complete(turn),
@@ -1030,10 +1090,10 @@ impl ModelResponseStream {
         };
         match self.protocol {
             ModelProtocol::Responses => {
-                self.handle_responses_event(&value, message.event.as_deref())
+                self.handle_responses_event(&value, message.event.as_deref());
             }
             ModelProtocol::ChatCompletions => {
-                self.handle_chat_event(&value, message.event.as_deref())
+                self.handle_chat_event(&value, message.event.as_deref());
             }
         }
     }
@@ -1221,7 +1281,7 @@ impl ModelResponseStream {
             return;
         }
         if let Ok(mut conversations) = self.conversations.lock() {
-            append_tool_calls(&mut conversations, self.task_id, &turn);
+            remember_tool_calls(&mut conversations, self.task_id, &turn);
         }
         self.done = true;
         self.queue.push_back(Ok(ModelStreamEvent::Completed(turn)));
@@ -1314,10 +1374,10 @@ impl StreamAccumulator {
         if let Self::Responses(accumulator) = self {
             let tool = accumulator.tools.entry(index).or_default();
             if let Some(name) = value.get("name").and_then(Value::as_str) {
-                tool.name = name.to_owned();
+                name.clone_into(&mut tool.name);
             }
             if let Some(arguments) = value.get("arguments").and_then(Value::as_str) {
-                tool.arguments = arguments.to_owned();
+                arguments.clone_into(&mut tool.arguments);
             }
             if let Some(id) = value.get("call_id").and_then(Value::as_str) {
                 tool.id = Some(id.to_owned());
@@ -1341,13 +1401,13 @@ impl StreamAccumulator {
                         .and_then(Value::as_u64)
                         .and_then(|value| usize::try_from(value).ok())
                 })
-                .unwrap_or_else(|| accumulator.tools.len());
+                .unwrap_or(accumulator.tools.len());
             let tool = accumulator.tools.entry(index).or_default();
             if let Some(name) = item.get("name").and_then(Value::as_str) {
-                tool.name = name.to_owned();
+                name.clone_into(&mut tool.name);
             }
             if let Some(arguments) = item.get("arguments").and_then(Value::as_str) {
-                tool.arguments = arguments.to_owned();
+                arguments.clone_into(&mut tool.arguments);
             }
             tool.id = item
                 .get("call_id")
@@ -1760,15 +1820,32 @@ fn parse_tool_arguments(raw: &str) -> Result<(Value, Option<EventId>), ModelErro
     let Value::Object(mut object) = value else {
         return Err(invalid_response("工具参数必须是 JSON 对象"));
     };
-    let authority_parent_event_id = object
-        .remove(AUTHORITY_PARENT_FIELD)
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .map(|raw| {
-            uuid::Uuid::parse_str(&raw)
-                .map(EventId)
-                .map_err(|error| invalid_response(format!("授权父事件 ID 无效：{error}")))
-        })
-        .transpose()?;
+    let authority_parent_event_id =
+        match object.remove(AUTHORITY_PARENT_FIELD) {
+            None | Some(Value::Null) => None,
+            Some(Value::String(raw)) => {
+                let raw = raw.trim();
+                // 一些 Chat Completions 兼容模型会把 schema 中的 null 错误编码为字符串
+                // "null"、"none" 或 "nil"。这些值都表示“本次没有可用授权证据”，不应
+                // 让整个模型调用失败；它们不会产生任何权限，因为核心仍会对 None 做拒绝。
+                if raw.is_empty()
+                    || raw.eq_ignore_ascii_case("null")
+                    || raw.eq_ignore_ascii_case("none")
+                    || raw.eq_ignore_ascii_case("nil")
+                {
+                    None
+                } else {
+                    Some(uuid::Uuid::parse_str(raw).map(EventId).map_err(|error| {
+                        invalid_response(format!("授权父事件 ID 无效：{error}"))
+                    })?)
+                }
+            }
+            Some(value) => {
+                return Err(invalid_response(format!(
+                    "授权父事件 ID 必须是字符串或 null，实际为 {value}"
+                )));
+            }
+        };
     Ok((Value::Object(object), authority_parent_event_id))
 }
 
@@ -1944,7 +2021,7 @@ async fn read_response_body(
     let mut body = response.bytes_stream();
     let mut bytes = Vec::new();
     while let Some(chunk) = tokio::select! {
-        _ = cancel.cancelled() => return Err(cancelled_error()),
+        () = cancel.cancelled() => return Err(cancelled_error()),
         chunk = body.next() => chunk,
     } {
         let chunk = chunk.map_err(map_request_error)?;
@@ -1996,7 +2073,7 @@ async fn read_limited_body(
     let mut body = response.bytes_stream();
     let mut bytes = Vec::new();
     while let Some(chunk) = tokio::select! {
-        _ = cancel.cancelled() => return Err(cancelled_error()),
+        () = cancel.cancelled() => return Err(cancelled_error()),
         chunk = body.next() => chunk,
     } {
         let chunk = chunk.map_err(map_request_error)?;
@@ -2023,6 +2100,7 @@ fn provider_event_error(value: &Value, kind: ModelErrorKind, retryable: bool) ->
     )
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn map_request_error(error: reqwest::Error) -> ModelError {
     if error.is_timeout() {
         ModelError::new(ModelErrorKind::Timeout, "模型请求超时", true)
@@ -2142,10 +2220,10 @@ mod tests {
 
         let (default_id, default_entry) = registry.resolve(None).unwrap();
         assert_eq!(default_id, &deepseek_selection);
-        assert_eq!(default_entry.max_context_messages, 16);
+        assert_eq!(default_entry.context_window_tokens, 16);
         let (selected_id, selected_entry) = registry.resolve(Some(&openai_selection)).unwrap();
         assert_eq!(selected_id, &openai_selection);
-        assert_eq!(selected_entry.max_context_messages, 32);
+        assert_eq!(selected_entry.context_window_tokens, 32);
         assert_eq!(
             registry.model_selections().collect::<Vec<_>>(),
             [&deepseek_selection, &openai_selection]
@@ -2216,6 +2294,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn chat_messages_merge_system_context_into_the_single_system_message() {
+        let mut request = request(ModelProtocol::ChatCompletions, false);
+        request.context.insert(
+            0,
+            ModelContextItem {
+                event_id: EventId::new(),
+                role: ModelInputRole::System,
+                content: "子任务的系统创建指令".into(),
+                permission: PermissionLevel::System,
+            },
+        );
+
+        let messages = chat_messages(&request.instructions, &request.context, &[]);
+        let system_messages = messages
+            .iter()
+            .filter(|message| message["role"] == "system")
+            .collect::<Vec<_>>();
+        assert_eq!(system_messages.len(), 1);
+        let system_content = system_messages[0]["content"].as_str().unwrap();
+        assert!(system_content.contains(&request.instructions));
+        assert!(system_content.contains("子任务的系统创建指令"));
+        assert_eq!(messages[1]["role"], "user");
+    }
+
+    #[test]
+    fn chat_messages_add_a_user_turn_for_a_system_only_child_task() {
+        let request = ModelRequest {
+            context: vec![ModelContextItem {
+                event_id: EventId::new(),
+                role: ModelInputRole::System,
+                content: "子任务的系统创建指令".into(),
+                permission: PermissionLevel::System,
+            }],
+            ..request(ModelProtocol::ChatCompletions, false)
+        };
+
+        let messages = chat_messages(&request.instructions, &request.context, &[]);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("子任务的系统创建指令")
+        );
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], CHAT_COMPLETIONS_START_MESSAGE);
+    }
+
+    #[test]
+    fn parse_tool_arguments_accepts_string_encoded_null_authority() {
+        for value in ["null", "none", "NIL", ""] {
+            let raw = format!("{{\"service\":\"demo\",\"{AUTHORITY_PARENT_FIELD}\":\"{value}\"}}");
+            let (arguments, authority) = parse_tool_arguments(&raw).unwrap();
+            assert_eq!(arguments["service"], "demo");
+            assert_eq!(authority, None);
+        }
+    }
+
+    #[test]
+    fn parse_tool_arguments_rejects_non_null_invalid_authority() {
+        let raw = format!("{{\"{AUTHORITY_PARENT_FIELD}\":\"not-an-event-id\"}}");
+        let error = parse_tool_arguments(&raw).unwrap_err();
+        assert!(error.message.contains("授权父事件 ID 无效"));
+    }
+
     async fn test_server(response: String) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -2258,7 +2403,12 @@ mod tests {
         let (base_url, handle) = test_server(response.into()).await;
         let config =
             OpenAiCompatibleModelConfig::new("test-provider", base_url, "test-model", None);
-        let provider = OpenAiCompatibleModelProvider::new(config).unwrap();
+        // 测试服务绑定在回环地址，不能受开发机 HTTP(S) 代理环境变量影响。
+        let provider = OpenAiCompatibleModelProvider::with_client(
+            Client::builder().no_proxy().build().unwrap(),
+            config,
+        )
+        .unwrap();
         let events = provider
             .start(
                 request(ModelProtocol::Responses, true),
@@ -2305,7 +2455,12 @@ mod tests {
         let config =
             OpenAiCompatibleModelConfig::new("test-provider", base_url, "test-model", None)
                 .with_protocol(ModelProtocol::ChatCompletions);
-        let provider = OpenAiCompatibleModelProvider::new(config).unwrap();
+        // 测试服务绑定在回环地址，不能受开发机 HTTP(S) 代理环境变量影响。
+        let provider = OpenAiCompatibleModelProvider::with_client(
+            Client::builder().no_proxy().build().unwrap(),
+            config,
+        )
+        .unwrap();
         let events = provider
             .start(
                 request(ModelProtocol::ChatCompletions, false),

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use koi_api::{WebApi, WebAuth};
+use koi_core::agent::DEFAULT_CONTEXT_WINDOW_TOKENS;
 use koi_core::domain::{EventSource, ModelGenerationOptions, ModelProtocol, ModelSelection};
 use koi_core::ports::{EventStore, SourceAuthorizationRegistry, ToolRegistry};
 use koi_infra::event_store::JsonlEventStore;
@@ -42,7 +43,14 @@ struct ModelConfig {
     api_key: Option<String>,
     protocol: String,
     request_timeout_secs: u64,
-    max_context_messages: usize,
+    /// 模型上下文窗口上限；兼容旧配置时可由 `max_context_messages` 推导。
+    #[serde(default)]
+    context_window_tokens: Option<u32>,
+    /// 旧版按消息数量限制上下文的配置，仅用于迁移，不再直接控制上下文。
+    #[serde(default)]
+    max_context_messages: Option<usize>,
+    #[serde(default)]
+    max_output_tokens: Option<u32>,
     reasoning_effort: Option<String>,
 }
 
@@ -103,6 +111,7 @@ async fn main() {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run() -> Result<(), ServerError> {
     let config = load_runtime_config()?;
     let web_token = load_web_admin_token(&config.server.web_admin_token)?;
@@ -125,7 +134,7 @@ async fn run() -> Result<(), ServerError> {
     // 之后 Web 与 `task.*` 工具共享同一个任务管理器。
     bootstrap_main_session(&store)
         .await
-        .map_err(|error| ServerError::EventStore(error.to_string()))?;
+        .map_err(ServerError::EventStore)?;
     let task_manager = Arc::new(koi_core::agent::TaskManager::new(Arc::new(Arc::clone(
         &store,
     ))));
@@ -164,8 +173,7 @@ async fn run() -> Result<(), ServerError> {
                 Ok(event) if !matches!(event.provenance.creator, EventSource::External(_)) => {
                     event_sink.publish_event(&event);
                 }
-                Ok(_) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
@@ -245,6 +253,7 @@ fn build_model_registry(config: &RuntimeConfig) -> Result<Arc<ModelProviderRegis
         let selection = ModelSelection::new(model.provider.clone(), model.model_id.clone())
             .map_err(|error| ServerError::Configuration(format!("模型条目无效：{error}")))?;
         let protocol = parse_model_protocol(&model.protocol)?;
+        let context_window_tokens = configured_context_window_tokens(&model)?;
         let api_key = model.api_key.filter(|value| !value.trim().is_empty());
         let provider_config = OpenAiCompatibleModelConfig::new(
             model.provider.clone(),
@@ -253,12 +262,14 @@ fn build_model_registry(config: &RuntimeConfig) -> Result<Arc<ModelProviderRegis
             api_key,
         )
         .with_protocol(protocol)
-        .with_request_timeout_secs(model.request_timeout_secs);
+        .with_request_timeout_secs(model.request_timeout_secs)
+        .with_context_window_tokens(context_window_tokens);
         let provider = Arc::new(
             OpenAiCompatibleModelProvider::new(provider_config)
                 .map_err(|error| ServerError::ModelProvider(format!("{selection}：{error}")))?,
         );
         let model_options = ModelGenerationOptions {
+            max_output_tokens: model.max_output_tokens,
             reasoning_effort: model
                 .reasoning_effort
                 .filter(|effort| !effort.trim().is_empty()),
@@ -267,7 +278,7 @@ fn build_model_registry(config: &RuntimeConfig) -> Result<Arc<ModelProviderRegis
         registry
             .register(
                 selection,
-                ModelProviderEntry::new(provider, model_options, model.max_context_messages),
+                ModelProviderEntry::new(provider, model_options, context_window_tokens),
             )
             .map_err(|error| ServerError::Configuration(error.to_string()))?;
     }
@@ -277,35 +288,69 @@ fn build_model_registry(config: &RuntimeConfig) -> Result<Arc<ModelProviderRegis
     Ok(Arc::new(registry))
 }
 
-/// 若主会话事件流为空，则写入 `TaskCreated` 与 `TaskQueued`，使主会话可以被
-/// Web 输入唤醒并接收 `task.*` 管理工具的审计事件。
+fn configured_context_window_tokens(model: &ModelConfig) -> Result<u32, ServerError> {
+    let configured = model.context_window_tokens.or_else(|| {
+        model
+            .max_context_messages
+            .and_then(|messages| u32::try_from(messages).ok())
+            .map(|messages| messages.saturating_mul(1024))
+    });
+    let tokens = configured.unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS);
+    if tokens == 0 {
+        return Err(ServerError::Configuration(format!(
+            "模型 {}/{} 的 context_window_tokens 必须大于零",
+            model.provider, model.model_id
+        )));
+    }
+    Ok(tokens)
+}
+
+/// 初始化主会话，或在其上一轮被取消/终止后开启新的工作周期。
+///
+/// 主会话是固定的跨任务协调入口，不应永久停留在终态；普通子任务仍保持终态不可复活。
 async fn bootstrap_main_session(store: &Arc<JsonlEventStore>) -> Result<(), String> {
     let events = store
         .load_task(koi_core::domain::TaskId::MAIN)
         .await
         .map_err(|error| error.to_string())?;
-    if !events.is_empty() {
+    if events.is_empty() {
+        let mut runtime =
+            koi_core::agent::TaskRuntime::new(Arc::clone(store), koi_core::domain::TaskId::MAIN);
+        runtime
+            .record(
+                koi_core::domain::AgentEvent::control(
+                    koi_core::domain::ControlEvent::TaskCreated {
+                        trigger_event_id: None,
+                    },
+                ),
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        runtime
+            .record(
+                koi_core::domain::AgentEvent::control(koi_core::domain::ControlEvent::TaskQueued),
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        tracing::info!("已初始化主会话事件流");
         return Ok(());
     }
     let mut runtime =
-        koi_core::agent::TaskRuntime::new(Arc::clone(store), koi_core::domain::TaskId::MAIN);
-    runtime
-        .record(
-            koi_core::domain::AgentEvent::control(koi_core::domain::ControlEvent::TaskCreated {
-                trigger_event_id: None,
-            }),
-            None,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    runtime
-        .record(
-            koi_core::domain::AgentEvent::control(koi_core::domain::ControlEvent::TaskQueued),
-            None,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    tracing::info!("已初始化主会话事件流");
+        koi_core::agent::TaskRuntime::recover(Arc::clone(store), koi_core::domain::TaskId::MAIN)
+            .await
+            .map_err(|error| error.to_string())?;
+    if runtime.projection().status.is_terminal() {
+        runtime
+            .record(
+                koi_core::domain::AgentEvent::control(koi_core::domain::ControlEvent::TaskQueued),
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        tracing::info!("已重新开启终止的主会话工作周期");
+    }
     Ok(())
 }
 
@@ -377,7 +422,7 @@ mod tests {
                 model_id = "gpt-5-mini"
                 protocol = "chat_completions"
                 request_timeout_secs = 60
-                max_context_messages = 24
+                context_window_tokens = 24576
 
                 [[models.entries]]
                 provider = "deepseek"
@@ -385,7 +430,7 @@ mod tests {
                 model_id = "deepseek-chat"
                 protocol = "responses"
                 request_timeout_secs = 60
-                max_context_messages = 8
+                context_window_tokens = 8192
             "#,
         )
         .unwrap();
@@ -402,7 +447,10 @@ mod tests {
                 &ModelSelection::new("openai", "gpt-5-mini").unwrap()
             ]
         );
-        assert_eq!(registry.resolve(None).unwrap().1.max_context_messages, 8);
+        assert_eq!(
+            registry.resolve(None).unwrap().1.context_window_tokens,
+            8192
+        );
         assert_eq!(
             registry
                 .resolve(Some(&ModelSelection::new("openai", "gpt-5-mini").unwrap()))

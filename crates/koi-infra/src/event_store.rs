@@ -141,6 +141,10 @@ impl EventStore for JsonlEventStore {
         Ok(events)
     }
 
+    async fn list_task_ids(&self) -> Result<Vec<TaskId>, EventStoreError> {
+        JsonlEventStore::list_task_ids(self)
+    }
+
     async fn load_event(
         &self,
         task_id: TaskId,
@@ -151,6 +155,18 @@ impl EventStore for JsonlEventStore {
             .await?
             .into_iter()
             .find(|event| event.id == event_id))
+    }
+
+    async fn load_event_any(
+        &self,
+        event_id: EventId,
+    ) -> Result<Option<EventEnvelope>, EventStoreError> {
+        for task_id in self.list_task_ids()? {
+            if let Some(event) = self.load_event(task_id, event_id).await? {
+                return Ok(Some(event));
+            }
+        }
+        Ok(None)
     }
 
     async fn delete_task(&self, task_id: TaskId) -> Result<(), EventStoreError> {
@@ -217,6 +233,12 @@ mod tests {
         assert_eq!(
             store.load_event(task_id, created.id).await.unwrap(),
             Some(created)
+        );
+        assert_eq!(
+            <JsonlEventStore as EventStore>::list_task_ids(&store)
+                .await
+                .unwrap(),
+            vec![task_id]
         );
 
         fs::remove_dir_all(directory).unwrap();
