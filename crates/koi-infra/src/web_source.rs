@@ -1434,6 +1434,28 @@ mod tests {
     use koi_api::{RegisterUserCommand, WebIdentityProvider};
     use koi_core::domain::PermissionAssessment;
 
+    /// 测试数据显式持久化管理员；生产路径不再提供内置管理员身份。
+    fn test_identities(path: std::path::PathBuf) -> Arc<WebUserStore> {
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "users": [{
+                    "email": "admin@example.test",
+                    "username": "admin_ops",
+                    "password_hash": "unused-in-source-tests",
+                    "permission": "Admin"
+                }]
+            }"#,
+        )
+        .unwrap();
+        Arc::new(WebUserStore::open(path).unwrap())
+    }
+
+    fn test_admin() -> WebPrincipal {
+        WebPrincipal::admin("admin_ops", Some("admin_ops".into()))
+    }
+
     /// 测试辅助：构造与生产一致的共享任务管理器。
     fn test_task_manager(store: &Arc<JsonlEventStore>) -> Arc<TaskManager<Arc<JsonlEventStore>>> {
         Arc::new(TaskManager::new(Arc::new(Arc::clone(store))))
@@ -1585,8 +1607,7 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("koi-web-source-{}", EventId::new()));
         let store = Arc::new(JsonlEventStore::open(&directory).unwrap());
         bootstrap_main_session(&store).await;
-        let identities =
-            Arc::new(WebUserStore::open(directory.join("users.json"), "test-admin").unwrap());
+        let identities = test_identities(directory.join("users.json"));
         let source = KoiWebSource::new(
             Arc::clone(&store),
             identities,
@@ -1598,7 +1619,7 @@ mod tests {
 
         let task = source
             .create_task(
-                WebPrincipal::admin("web-admin", Some("Web Admin".into())),
+                test_admin(),
                 CreateTaskCommand {
                     message: "检查 order-api 的连接池状态".into(),
                     scope: ScopeDto {
@@ -1656,8 +1677,7 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("koi-web-elevation-{}", EventId::new()));
         let store = Arc::new(JsonlEventStore::open(&directory).unwrap());
         bootstrap_main_session(&store).await;
-        let identities =
-            Arc::new(WebUserStore::open(directory.join("users.json"), "test-admin").unwrap());
+        let identities = test_identities(directory.join("users.json"));
         let source = Arc::new(
             KoiWebSource::new(
                 Arc::clone(&store),
@@ -1670,7 +1690,7 @@ mod tests {
         );
         let task = source
             .create_task(
-                WebPrincipal::admin("web-admin", Some("Web Admin".into())),
+                test_admin(),
                 CreateTaskCommand {
                     message: "检查 order-api".into(),
                     scope: ScopeDto {
@@ -1744,8 +1764,7 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("koi-web-visibility-{}", EventId::new()));
         let store = Arc::new(JsonlEventStore::open(&directory).unwrap());
         bootstrap_main_session(&store).await;
-        let identities =
-            Arc::new(WebUserStore::open(directory.join("users.json"), "test-admin").unwrap());
+        let identities = test_identities(directory.join("users.json"));
         let alice = identities
             .register(RegisterUserCommand {
                 email: "alice@example.test".into(),
@@ -1794,7 +1813,7 @@ mod tests {
 
         source
             .control_task(
-                WebPrincipal::admin("web-admin", Some("Web Admin".into())),
+                test_admin(),
                 task_id,
                 TaskControlCommand {
                     action: TaskControlAction::SetMinimumPermission,
@@ -1811,14 +1830,7 @@ mod tests {
         assert_eq!(source.list_tasks(&bob).await.unwrap().len(), 1);
         assert!(source.task_events(&bob, task_id).await.is_err());
         assert!(!source.can_access_task(&alice, task_id).await);
-        assert!(
-            source
-                .can_access_task(
-                    &WebPrincipal::admin("web-admin", Some("Web Admin".into())),
-                    task_id,
-                )
-                .await
-        );
+        assert!(source.can_access_task(&test_admin(), task_id,).await);
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -1830,8 +1842,7 @@ mod tests {
             std::env::temp_dir().join(format!("koi-web-derived-owner-{}", EventId::new()));
         let store = Arc::new(JsonlEventStore::open(&directory).unwrap());
         bootstrap_main_session(&store).await;
-        let identities =
-            Arc::new(WebUserStore::open(directory.join("users.json"), "test-admin").unwrap());
+        let identities = test_identities(directory.join("users.json"));
         let alice = identities
             .register(RegisterUserCommand {
                 email: "alice@example.test".into(),
@@ -1949,8 +1960,7 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("koi-web-manage-{}", EventId::new()));
         let store = Arc::new(JsonlEventStore::open(&directory).unwrap());
         bootstrap_main_session(&store).await;
-        let identities =
-            Arc::new(WebUserStore::open(directory.join("users.json"), "test-admin").unwrap());
+        let identities = test_identities(directory.join("users.json"));
         let source = Arc::new(
             KoiWebSource::new(
                 Arc::clone(&store),
@@ -1968,7 +1978,7 @@ mod tests {
                 ModelSelection::new("openai", "gpt-5-mini").unwrap(),
             ),
         );
-        let admin = WebPrincipal::admin("web-admin", Some("Web Admin".into()));
+        let admin = test_admin();
         let task = source
             .create_task(
                 admin.clone(),

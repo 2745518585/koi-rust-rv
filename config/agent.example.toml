@@ -8,9 +8,6 @@ event_store_dir = "./data/events"
 user_store_path = "./data/users.json"
 # Set true whenever the Web console is served over HTTPS.
 web_cookie_secure = false
-# 管理端访问令牌；请在本机配置中替换为随机值。
-web_admin_token = "change-me-to-a-long-random-token"
-
 [qq]
 api_base_url = "https://api.bot.qq.com"
 # GROUP_AND_C2C_EVENT (1 << 25)。启用全量群消息权限后，机器人可旁听群聊。

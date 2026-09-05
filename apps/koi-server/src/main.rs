@@ -85,7 +85,6 @@ struct ServerConfig {
     event_store_dir: PathBuf,
     user_store_path: PathBuf,
     web_cookie_secure: bool,
-    web_admin_token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,7 +113,6 @@ async fn main() {
 #[allow(clippy::too_many_lines)]
 async fn run() -> Result<(), ServerError> {
     let config = load_runtime_config()?;
-    let web_token = load_web_admin_token(&config.server.web_admin_token)?;
     let prompts = prompts::ServerPromptProvider;
     let model_registry = build_model_registry(&config)?;
 
@@ -138,10 +136,8 @@ async fn run() -> Result<(), ServerError> {
     let task_manager = Arc::new(koi_core::agent::TaskManager::new(Arc::new(Arc::clone(
         &store,
     ))));
-    let identities = Arc::new(
-        WebUserStore::open(&config.server.user_store_path, web_token)
-            .map_err(ServerError::WebApi)?,
-    );
+    let identities =
+        Arc::new(WebUserStore::open(&config.server.user_store_path).map_err(ServerError::WebApi)?);
     let source = Arc::new(
         KoiWebSource::new(
             Arc::clone(&store),
@@ -364,16 +360,6 @@ fn load_runtime_config() -> Result<RuntimeConfig, ServerError> {
         .map_err(|error| ServerError::Configuration(format!("运行配置解析失败：{error}")))
 }
 
-fn load_web_admin_token(configured_token: &str) -> Result<String, ServerError> {
-    let token = configured_token.trim();
-    if token.trim().is_empty() || token == "change-me-to-a-long-random-token" {
-        return Err(ServerError::Configuration(
-            "[server].web_admin_token 必须设置为非示例值".into(),
-        ));
-    }
-    Ok(token.to_owned())
-}
-
 #[derive(Debug, Error)]
 enum ServerError {
     #[error("配置错误：{0}")]
@@ -410,8 +396,6 @@ mod tests {
                 event_store_dir = "./data/events"
                 user_store_path = "./data/users.json"
                 web_cookie_secure = false
-                web_admin_token = "test-token"
-
                 [models]
                 default_provider = "deepseek"
                 default_model_id = "deepseek-chat"

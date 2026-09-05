@@ -102,12 +102,6 @@ pub trait WebIdentityProvider: Send + Sync {
     ///
     /// 当令牌无效、过期或会话不存在时返回错误。
     fn authenticate_session(&self, token: &str) -> Result<WebSession, WebApiError>;
-    /// 使用管理访问令牌创建会话。
-    ///
-    /// # Errors
-    ///
-    /// 当令牌无效或访问令牌未配置时返回错误。
-    fn authenticate_bearer(&self, token: &str) -> Result<WebSession, WebApiError>;
     /// 使当前不透明会话令牌立即失效。
     ///
     /// # Errors
@@ -504,7 +498,6 @@ impl WebAuth {
     ///
     /// # Errors
     ///
-    /// Returns an error for an empty token so the HTTP boundary fails closed.
     pub fn new(identities: Arc<dyn WebIdentityProvider>, secure_cookie: bool) -> Self {
         Self {
             identities,
@@ -513,13 +506,6 @@ impl WebAuth {
     }
 
     fn authenticate(&self, headers: &HeaderMap) -> Result<WebPrincipal, ApiError> {
-        if let Some(token) = bearer_token(headers) {
-            return self
-                .identities
-                .authenticate_bearer(token)
-                .map(|session| session.principal)
-                .map_err(ApiError::from);
-        }
         session_cookie(headers)
             .ok_or_else(|| ApiError::unauthorized("缺少 Web 会话"))
             .and_then(|token| {
@@ -530,23 +516,7 @@ impl WebAuth {
             })
     }
 
-    fn authenticate_bearer(&self, headers: &HeaderMap) -> Result<WebSession, ApiError> {
-        bearer_token(headers)
-            .ok_or_else(|| ApiError::unauthorized("缺少 Bearer 访问令牌"))
-            .and_then(|token| {
-                self.identities
-                    .authenticate_bearer(token)
-                    .map_err(ApiError::from)
-            })
-    }
-
     fn current_session(&self, headers: &HeaderMap) -> Result<WebSession, ApiError> {
-        if let Some(token) = bearer_token(headers) {
-            return self
-                .identities
-                .authenticate_bearer(token)
-                .map_err(ApiError::from);
-        }
         session_cookie(headers)
             .ok_or_else(|| ApiError::unauthorized("缺少 Web 会话"))
             .and_then(|token| {
@@ -562,13 +532,6 @@ impl WebAuth {
             "{WEB_SESSION_COOKIE}={token}; HttpOnly; Path=/; SameSite=Strict; Max-Age=28800{secure}"
         )
     }
-}
-
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
 }
 
 fn session_cookie(headers: &HeaderMap) -> Option<&str> {
@@ -597,7 +560,6 @@ pub fn router(api: Arc<dyn WebApi>, auth: WebAuth) -> Router {
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/me", get(current_user))
         .route("/api/v1/auth/logout", post(logout))
-        .route("/api/v1/session", post(create_session))
         .route("/api/v1/dashboard", get(dashboard))
         .route("/api/v1/tasks", get(list_tasks).post(create_task))
         .route(
@@ -705,14 +667,6 @@ async fn logout(State(state): State<HttpState>, headers: HeaderMap) -> Result<Re
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().insert(header::SET_COOKIE, cookie);
     Ok(response)
-}
-
-async fn create_session(
-    State(state): State<HttpState>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    let session = state.auth.authenticate_bearer(&headers)?;
-    session_response(&state, session)
 }
 
 async fn dashboard(

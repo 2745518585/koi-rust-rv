@@ -8,7 +8,7 @@ Koi Rust Remastered Version：一个面向小型服务器运维群的 QQ 协作�
 
 1. Copy `config/agent.example.toml` to `config/agent.toml`.
 2. Copy `config/persona.example.toml` to `config/persona.toml`.
-3. Fill in the local TOML credentials, including `[server].web_admin_token` and each model entry's `api_key` when required.
+3. Fill in the local TOML credentials, including each model entry's `api_key` when required.
 4. Run `cargo check --workspace`.
 
 `config/agent.toml` and `config/persona.toml` are local runtime files and are ignored by Git. Model and Web credentials belong in the local TOML file; the repository only tracks the example template.

@@ -21,13 +21,10 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-const ADMIN_SUBJECT: &str = "web-admin";
-
 pub struct WebUserStore {
     path: PathBuf,
     users: RwLock<BTreeMap<String, StoredUser>>,
     sessions: Mutex<BTreeMap<String, StoredSession>>,
-    admin_token: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -83,17 +80,9 @@ impl WebUserStore {
     ///
     /// # Errors
     ///
-    /// Returns an error when the administrator token is empty or the user database cannot be
-    /// read, parsed, or initialized.
-    pub fn open(
-        path: impl Into<PathBuf>,
-        admin_token: impl Into<String>,
-    ) -> Result<Self, WebApiError> {
+    /// Returns an error when the user database cannot be read, parsed, or initialized.
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self, WebApiError> {
         let path = path.into();
-        let admin_token = admin_token.into();
-        if admin_token.trim().is_empty() {
-            return Err(WebApiError::validation("Web 管理访问密钥不能为空"));
-        }
         let users = if path.exists() {
             let body = fs::read_to_string(&path)
                 .map_err(|error| WebApiError::internal(format!("读取用户库失败：{error}")))?;
@@ -111,7 +100,6 @@ impl WebUserStore {
             path,
             users: RwLock::new(users),
             sessions: Mutex::new(BTreeMap::new()),
-            admin_token,
         })
     }
 
@@ -121,9 +109,6 @@ impl WebUserStore {
     }
 
     pub fn permission_for(&self, subject: &str) -> Option<PermissionLevel> {
-        if subject == ADMIN_SUBJECT {
-            return Some(PermissionLevel::Admin);
-        }
         self.users
             .read()
             .ok()?
@@ -132,9 +117,6 @@ impl WebUserStore {
     }
 
     fn display_name_for(&self, subject: &str) -> Option<String> {
-        if subject == ADMIN_SUBJECT {
-            return Some("Web Admin".into());
-        }
         self.users
             .read()
             .ok()?
@@ -172,25 +154,6 @@ impl WebUserStore {
             token,
             principal: principal_for(user),
             user: user_dto(user),
-        })
-    }
-
-    fn create_admin_session(&self) -> Result<WebSession, WebApiError> {
-        let token = Uuid::new_v4().to_string();
-        self.sessions
-            .lock()
-            .map_err(|_| WebApiError::Unavailable("用户会话锁不可用".into()))?
-            .insert(
-                token.clone(),
-                StoredSession {
-                    username: ADMIN_SUBJECT.into(),
-                    expires_at: SystemTime::now() + SESSION_TTL,
-                },
-            );
-        Ok(WebSession {
-            token,
-            principal: WebPrincipal::admin(ADMIN_SUBJECT, Some("Web Admin".into())),
-            user: admin_user_dto(),
         })
     }
 }
@@ -253,13 +216,6 @@ impl WebIdentityProvider for WebUserStore {
                 .map(|session| session.username.clone())
                 .ok_or_else(|| WebApiError::Forbidden("Web 会话已失效".into()))?
         };
-        if username == ADMIN_SUBJECT {
-            return Ok(WebSession {
-                token: token.into(),
-                principal: WebPrincipal::admin(ADMIN_SUBJECT, Some("Web Admin".into())),
-                user: admin_user_dto(),
-            });
-        }
         let user = self
             .users
             .read()
@@ -272,13 +228,6 @@ impl WebIdentityProvider for WebUserStore {
             principal: principal_for(&user),
             user: user_dto(&user),
         })
-    }
-
-    fn authenticate_bearer(&self, token: &str) -> Result<WebSession, WebApiError> {
-        if !constant_time_eq(self.admin_token.as_bytes(), token.as_bytes()) {
-            return Err(WebApiError::Forbidden("无效的 Bearer 访问令牌".into()));
-        }
-        self.create_admin_session()
     }
 
     fn logout(&self, token: &str) -> Result<(), WebApiError> {
@@ -304,15 +253,6 @@ fn user_dto(user: &StoredUser) -> WebUserDto {
         username: user.username.clone(),
         email: user.email.clone(),
         permission: user.permission.as_label().into(),
-    }
-}
-
-fn admin_user_dto() -> WebUserDto {
-    WebUserDto {
-        user_id: ADMIN_SUBJECT.into(),
-        username: "Web Admin".into(),
-        email: String::new(),
-        permission: "Admin".into(),
     }
 }
 
@@ -347,16 +287,6 @@ fn validate_password(password: &str) -> Result<(), WebApiError> {
     Ok(())
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right)
-        .fold(0_u8, |difference, (a, b)| difference | (a ^ b))
-        == 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,7 +294,7 @@ mod tests {
     #[test]
     fn registered_username_is_the_core_principal_subject() {
         let path = std::env::temp_dir().join(format!("koi-web-users-{}.json", Uuid::new_v4()));
-        let store = WebUserStore::open(&path, "admin-token").unwrap();
+        let store = WebUserStore::open(&path).unwrap();
         let session = store
             .register(RegisterUserCommand {
                 email: "Ada@Example.com".into(),
@@ -400,7 +330,7 @@ mod tests {
         "#;
         std::fs::write(&path, body).unwrap();
 
-        let store = WebUserStore::open(&path, "admin-token").unwrap();
+        let store = WebUserStore::open(&path).unwrap();
         assert_eq!(
             store.permission_for("admin_ops"),
             Some(PermissionLevel::Admin)
