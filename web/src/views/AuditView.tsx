@@ -4,7 +4,7 @@ import type { EventKind, TaskEvent } from "../api/types";
 import { useI18n } from "../i18n";
 import { EmptyState, EventLine, labelFor, PanelHeader, eventKindMeta } from "../lib/ui";
 
-const kindOrder: Array<EventKind | "all"> = ["all", "ingress", "model", "tool", "approval", "control", "system"];
+const kindOrder: Array<EventKind | "all"> = ["all", "ingress", "control", "model", "tool"];
 
 export function AuditView({
   events,

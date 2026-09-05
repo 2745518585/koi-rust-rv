@@ -276,9 +276,7 @@ textarea { resize: none; }
 .kind-ingress { color: var(--info); background: var(--info-soft); }
 .kind-model { color: var(--violet); background: var(--violet-soft); }
 .kind-tool { color: var(--accent-strong); background: var(--accent-soft); }
-.kind-approval { color: var(--warn); background: var(--warn-soft); }
 .kind-control { color: #5d6a72; background: #eef1f2; }
-.kind-system { color: var(--danger); background: var(--danger-soft); }
 
 .spin { animation: spin 0.9s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -413,6 +411,16 @@ textarea { resize: none; }
 .msg-tool-copy strong { display: block; color: #45555f; font-family: var(--mono); font-size: 10.5px; font-weight: 500; }
 .msg-tool-copy p { margin: 3px 0 0; color: var(--muted); font-size: 12px; line-height: 1.55; }
 .msg-tool time { margin-top: 2px; color: var(--faint); font-family: var(--mono); font-size: 9px; white-space: nowrap; }
+.msg-tool-group-head { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.msg-tool-group-head strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.msg-tool-group-status { flex-shrink: 0; color: var(--faint); font-size: 10px; }
+.msg-tool-details { margin-top: 7px; color: var(--muted); font-size: 10.5px; }
+.msg-tool-details summary { cursor: pointer; color: var(--faint); }
+.msg-tool-details summary:hover { color: var(--accent-strong); }
+.msg-tool-timeline { display: grid; gap: 5px; margin-top: 7px; padding-left: 8px; border-left: 2px solid #dce8e6; }
+.msg-tool-step { display: grid; gap: 2px; }
+.msg-tool-step strong { color: #5d6a72; font-family: var(--mono); font-size: 9.5px; font-weight: 500; }
+.msg-tool-step span { line-height: 1.45; }
 
 /* —— 事件行（事件模式与审计共用） —— */
 .event-line {
@@ -437,6 +445,17 @@ textarea { resize: none; }
 .event-line-top time { margin-left: auto; flex-shrink: 0; color: var(--faint); font-family: var(--mono); font-size: 9.5px; }
 .event-line-main p { margin: 3px 0 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
 .event-line-meta { color: var(--faint); font-family: var(--mono); font-size: 9.5px; white-space: nowrap; padding-top: 3px; }
+.event-line-group { border-bottom: 1px solid var(--line-soft); }
+.event-line-group:last-child { border-bottom: 0; }
+.event-group-summary { cursor: pointer; list-style: none; }
+.event-group-summary::-webkit-details-marker { display: none; }
+.event-group-summary:hover { background: #f7f9fa; }
+.event-line-group[open] .event-group-summary { border-bottom: 1px solid var(--line-soft); background: #f8fafb; }
+.event-group-timeline { padding: 8px 16px 11px 55px; background: #fbfcfc; }
+.event-group-step { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 9px; padding: 7px 0; }
+.event-group-step > span { padding-top: 1px; color: var(--faint); font-family: var(--mono); font-size: 9.5px; }
+.event-group-step strong { display: block; font-size: 11px; font-weight: 600; }
+.event-group-step p { margin: 2px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
 
 /* —— 内联审批 —— */
 .conv-approvals { padding: 0 16px 10px; background: var(--bg); border-top: 1px solid var(--line-soft); }
@@ -773,6 +792,7 @@ textarea { resize: none; }
   .conv-approvals { padding: 0 10px 8px; }
   .event-line { padding: 11px 12px; }
   .event-line-meta { display: none; }
+  .event-group-timeline { padding-left: 50px; padding-right: 12px; }
   .tool-row { grid-template-columns: 1fr; gap: 7px; }
   .tool-row-meta { grid-column: auto; flex-wrap: wrap; }
   .filter-row { display: grid; align-items: stretch; }

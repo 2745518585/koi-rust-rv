@@ -175,9 +175,9 @@ export default function App() {
         }
         if (
           event.type === "event.appended" &&
-          (event.event.kind === "control" || event.event.kind === "approval")
+          event.event.kind === "control"
         ) {
-          // 生命周期和审批状态由事件投影计算，收到这两类事件后重新读取权威快照。
+          // 生命周期状态由控制事件投影计算，收到后重新读取权威快照。
           void api.getSnapshot().then(setSnapshot).catch(() => undefined);
         }
       },

@@ -15,7 +15,6 @@ import {
   ShieldCheck,
   Terminal,
   XCircle,
-  Zap,
 } from "lucide-react";
 import { useI18n } from "../i18n";
 import type { Locale } from "../i18n";
@@ -64,11 +63,9 @@ export const permissionMeta: Record<PermissionLevel, { label: Label; className: 
 
 export const eventKindMeta: Record<EventKind, { label: Label; className: string; icon: LucideIcon }> = {
   ingress: { label: { zh: "输入", en: "Input" }, className: "kind-ingress", icon: MessageSquare },
+  control: { label: { zh: "控制", en: "Control" }, className: "kind-control", icon: Settings2 },
   model: { label: { zh: "模型", en: "Model" }, className: "kind-model", icon: Bot },
   tool: { label: { zh: "工具", en: "Tool" }, className: "kind-tool", icon: Terminal },
-  approval: { label: { zh: "授权", en: "Approval" }, className: "kind-approval", icon: ShieldCheck },
-  control: { label: { zh: "控制", en: "Control" }, className: "kind-control", icon: Settings2 },
-  system: { label: { zh: "系统", en: "System" }, className: "kind-system", icon: Zap },
 };
 
 export const sideEffectMeta: Record<ToolSideEffect, { label: Label; className: string }> = {
@@ -120,7 +117,7 @@ export function EffectBadge({ effect }: { effect: ToolSideEffect }) {
 
 /** 事件种类的着色小图标。 */
 export function EventIcon({ kind, size = 15 }: { kind: EventKind; size?: number }) {
-  const meta = eventKindMeta[kind] ?? eventKindMeta.system;
+  const meta = eventKindMeta[kind] ?? eventKindMeta.control;
   const Icon = meta.icon;
   return (
     <span className={`kind-icon ${meta.className}`}>

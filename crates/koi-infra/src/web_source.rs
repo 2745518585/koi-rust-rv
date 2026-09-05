@@ -125,9 +125,17 @@ impl KoiWebSource {
         }
     }
 
-    fn publish(&self, event: &EventEnvelope) {
+    async fn publish(&self, event: &EventEnvelope) {
+        // 结果事件只携带 Started 事件 ID，必须读取当前任务事件流才能解析到最初的
+        // Proposed 事件。SSE 与 GET 事件接口使用同一套解析逻辑，避免实时卡片和刷新
+        // 后的卡片出现不同的关联结果。
+        let events = self
+            .store
+            .load_task(event.task_id)
+            .await
+            .unwrap_or_else(|_| vec![event.clone()]);
         let _ = self.events.send(WebStreamEvent::EventAppended {
-            event: event_dto(event),
+            event: event_dto(event, &events),
         });
     }
 
@@ -135,8 +143,8 @@ impl KoiWebSource {
     ///
     /// Web 自己写入的输入事件仍由命令方法直接发布；后台 Agent 事件由事件存储订阅器
     /// 调用此方法发布，避免把 UI 推送逻辑耦合进核心循环。
-    pub fn publish_event(&self, event: &EventEnvelope) {
-        self.publish(event);
+    pub async fn publish_event(&self, event: &EventEnvelope) {
+        self.publish(event).await;
     }
 
     /// Creates the core-facing authorization capability for this source. The provider is
@@ -462,7 +470,12 @@ impl WebQueryPort for KoiWebSource {
             .collect::<Vec<_>>();
         let mut recent_events = records
             .iter()
-            .flat_map(|record| record.events.iter().map(event_dto))
+            .flat_map(|record| {
+                record
+                    .events
+                    .iter()
+                    .map(|event| event_dto(event, &record.events))
+            })
             .collect::<Vec<_>>();
         recent_events.sort_by(|left, right| right.occurred_at.cmp(&left.occurred_at));
         recent_events.truncate(30);
@@ -524,12 +537,11 @@ impl WebQueryPort for KoiWebSource {
     ) -> Result<Vec<EventDto>, WebApiError> {
         self.validate_principal(principal)?;
         let _guard = self.write_lock.lock().await;
-        Ok(self
-            .load_accessible_task(principal, task_id)
-            .await?
+        let record = self.load_accessible_task(principal, task_id).await?;
+        Ok(record
             .events
             .iter()
-            .map(event_dto)
+            .map(|event| event_dto(event, &record.events))
             .collect())
     }
 
@@ -623,8 +635,13 @@ impl WebCommandPort for KoiWebSource {
                 suggested_permission,
             )
             .await?;
-        let dto = event_dto(&recorded);
-        self.publish(&recorded);
+        let events = self
+            .store
+            .load_task(task_id)
+            .await
+            .map_err(|error| WebApiError::internal(error.to_string()))?;
+        let dto = event_dto(&recorded, &events);
+        self.publish(&recorded).await;
         Ok(dto)
     }
 
@@ -656,8 +673,13 @@ impl WebCommandPort for KoiWebSource {
             )
             .await
             .map_err(map_ingress_error)?;
-        let dto = event_dto(&recorded);
-        self.publish(&recorded);
+        let events = self
+            .store
+            .load_task(task_id)
+            .await
+            .map_err(|error| WebApiError::internal(error.to_string()))?;
+        let dto = event_dto(&recorded, &events);
+        self.publish(&recorded).await;
         Ok(dto)
     }
 
@@ -719,7 +741,7 @@ impl WebCommandPort for KoiWebSource {
             )
             .await
             .map_err(map_ingress_error)?;
-        self.publish(&submitted);
+        self.publish(&submitted).await;
 
         let mut updated_events = record.events.clone();
         updated_events.push(submitted);
@@ -806,7 +828,7 @@ impl WebCommandPort for KoiWebSource {
         )
         .await
         .map_err(|error| WebApiError::conflict(error.to_string()))?;
-        self.publish(&recorded);
+        self.publish(&recorded).await;
         let events = self
             .store
             .load_task(task_id)
@@ -1017,7 +1039,7 @@ fn map_task_manager_error(error: TaskManagerError) -> WebApiError {
 }
 
 fn task_dto(task_id: TaskId, events: &[EventEnvelope], projection: &TaskProjection) -> TaskDto {
-    let last_event = events.last().map(event_dto);
+    let last_event = events.last().map(|event| event_dto(event, events));
     let started_at = events.first().map_or_else(
         || Utc::now().to_rfc3339(),
         |event| event.recorded_at.to_rfc3339(),
@@ -1112,7 +1134,7 @@ fn task_scope(task_id: TaskId, events: &[EventEnvelope]) -> ScopeDto {
         })
 }
 
-fn event_dto(event: &EventEnvelope) -> EventDto {
+fn event_dto(event: &EventEnvelope, events: &[EventEnvelope]) -> EventDto {
     let (kind, title, summary) = event_description(&event.payload);
     EventDto {
         id: event.id.to_string(),
@@ -1127,7 +1149,87 @@ fn event_dto(event: &EventEnvelope) -> EventDto {
             .provenance
             .direct_permission
             .map_or_else(|| "None".into(), permission_name),
+        tool_proposal_event_id: tool_proposal_event_id(event, events),
     }
+}
+
+/// 解析一个工具生命周期事件所属的原始工具提议事件。
+///
+/// `Validated`、授权检查、审批请求和 `Started` 直接携带 `proposal_event_id`；执行
+/// 结果事件携带 `execution_started_event_id`，因此需要再跳转到 `Started`；来源提交的
+/// `ApprovalSubmitted` 会先跳转到 `ApprovalRequested`。解析失败时返回 `None`，让前端
+/// 把异常或历史不完整事件作为独立事件显示，而不是错误合并。
+fn tool_proposal_event_id(event: &EventEnvelope, events: &[EventEnvelope]) -> Option<String> {
+    let proposal_event_id = match &event.payload {
+        AgentEvent::Tool(tool) => match tool.as_ref() {
+            ToolEvent::Proposed { .. } => return Some(event.id.to_string()),
+            ToolEvent::Validated { proposal_event_id }
+            | ToolEvent::AuthorizationChecked {
+                proposal_event_id, ..
+            }
+            | ToolEvent::ApprovalRequested { proposal_event_id }
+            | ToolEvent::Started { proposal_event_id } => *proposal_event_id,
+            ToolEvent::Output {
+                execution_started_event_id,
+                ..
+            }
+            | ToolEvent::Finished {
+                execution_started_event_id,
+                ..
+            }
+            | ToolEvent::Failed {
+                execution_started_event_id,
+                ..
+            }
+            | ToolEvent::Cancelled {
+                execution_started_event_id,
+                ..
+            } => {
+                let started = events
+                    .iter()
+                    .find(|candidate| candidate.id == *execution_started_event_id)?;
+                let AgentEvent::Tool(tool) = &started.payload else {
+                    return None;
+                };
+                let ToolEvent::Started { proposal_event_id } = tool.as_ref() else {
+                    return None;
+                };
+                *proposal_event_id
+            }
+            ToolEvent::NotificationSent { .. } => return None,
+        },
+        AgentEvent::Ingress(ingress) => match ingress.as_ref() {
+            IngressEvent::ApprovalSubmitted {
+                approval_request_event_id,
+                ..
+            } => {
+                let request = events
+                    .iter()
+                    .find(|candidate| candidate.id == *approval_request_event_id)?;
+                let AgentEvent::Tool(tool) = &request.payload else {
+                    return None;
+                };
+                let ToolEvent::ApprovalRequested { proposal_event_id } = tool.as_ref() else {
+                    return None;
+                };
+                *proposal_event_id
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+
+    events
+        .iter()
+        .any(|candidate| {
+            candidate.id == proposal_event_id
+                && matches!(
+                    candidate.payload,
+                    AgentEvent::Tool(ref tool)
+                        if matches!(tool.as_ref(), ToolEvent::Proposed { .. })
+                )
+        })
+        .then_some(proposal_event_id.to_string())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1143,7 +1245,7 @@ fn event_description(event: &AgentEvent) -> (&'static str, String, String) {
                 ("ingress", "收到外部上下文".into(), summary)
             }
             IngressEvent::ApprovalSubmitted { approved, .. } => (
-                "approval",
+                "ingress",
                 "Web 已提交授权决定".into(),
                 if *approved {
                     "已批准工具操作".into()
@@ -1277,7 +1379,7 @@ fn event_description(event: &AgentEvent) -> (&'static str, String, String) {
                 format!("决策：{decision:?}"),
             ),
             ToolEvent::ApprovalRequested { .. } => (
-                "approval",
+                "tool",
                 "需要人工授权".into(),
                 "工具调用等待来源方确认".into(),
             ),
@@ -1330,6 +1432,7 @@ fn truncate(input: &str, limit: usize) -> String {
 mod tests {
     use super::*;
     use koi_api::{RegisterUserCommand, WebIdentityProvider};
+    use koi_core::domain::PermissionAssessment;
 
     /// 测试辅助：构造与生产一致的共享任务管理器。
     fn test_task_manager(store: &Arc<JsonlEventStore>) -> Arc<TaskManager<Arc<JsonlEventStore>>> {
@@ -1352,6 +1455,129 @@ mod tests {
             .record(AgentEvent::control(ControlEvent::TaskQueued), None)
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn event_dto_links_tool_lifecycle_to_proposal() {
+        let proposed = EventEnvelope::new(
+            TaskId::MAIN,
+            1,
+            None,
+            AgentEvent::tool(ToolEvent::Proposed {
+                tool_call: koi_core::domain::ToolCall {
+                    name: "server.status".into(),
+                    arguments: serde_json::json!({}),
+                    provider_call_id: None,
+                    authority_parent_event_id: None,
+                },
+            }),
+        );
+        let validated = EventEnvelope::new(
+            TaskId::MAIN,
+            2,
+            Some(proposed.id),
+            AgentEvent::tool(ToolEvent::Validated {
+                proposal_event_id: proposed.id,
+            }),
+        );
+        let started = EventEnvelope::new(
+            TaskId::MAIN,
+            3,
+            Some(validated.id),
+            AgentEvent::tool(ToolEvent::Started {
+                proposal_event_id: proposed.id,
+            }),
+        );
+        let finished = EventEnvelope::new(
+            TaskId::MAIN,
+            4,
+            Some(started.id),
+            AgentEvent::tool(ToolEvent::Finished {
+                execution_started_event_id: started.id,
+                result: koi_core::domain::ToolResult {
+                    summary: "server.status 完成".into(),
+                    data: serde_json::Value::Null,
+                    truncated: false,
+                },
+            }),
+        );
+        let events = vec![proposed, validated, started, finished];
+        let proposal_id = events[0].id.to_string();
+
+        assert_eq!(
+            event_dto(&events[0], &events).tool_proposal_event_id,
+            Some(proposal_id.clone())
+        );
+        assert_eq!(
+            event_dto(&events[1], &events).tool_proposal_event_id,
+            Some(proposal_id.clone())
+        );
+        assert_eq!(
+            event_dto(&events[2], &events).tool_proposal_event_id,
+            Some(proposal_id.clone())
+        );
+        assert_eq!(
+            event_dto(&events[3], &events).tool_proposal_event_id,
+            Some(proposal_id)
+        );
+    }
+
+    #[test]
+    fn event_dto_uses_only_core_categories_and_groups_approval_reply() {
+        let proposed = EventEnvelope::new(
+            TaskId::MAIN,
+            1,
+            None,
+            AgentEvent::tool(ToolEvent::Proposed {
+                tool_call: koi_core::domain::ToolCall {
+                    name: "service.restart".into(),
+                    arguments: serde_json::json!({ "service": "order-api" }),
+                    provider_call_id: None,
+                    authority_parent_event_id: None,
+                },
+            }),
+        );
+        let approval_requested = EventEnvelope::new(
+            TaskId::MAIN,
+            2,
+            Some(proposed.id),
+            AgentEvent::tool(ToolEvent::ApprovalRequested {
+                proposal_event_id: proposed.id,
+            }),
+        );
+        let approval_submitted = EventEnvelope::new(
+            TaskId::MAIN,
+            3,
+            Some(approval_requested.id),
+            AgentEvent::ingress(IngressEvent::ApprovalSubmitted {
+                approval_request_event_id: approval_requested.id,
+                principal: Principal::new("web", "alice"),
+                scope: Scope::new("service", "order-api"),
+                assessment: PermissionAssessment::new(
+                    PermissionLevel::Operator,
+                    PermissionLevel::Admin,
+                    PermissionLevel::Operator,
+                ),
+                approved: true,
+            }),
+        );
+        let control = EventEnvelope::new(
+            TaskId::MAIN,
+            4,
+            None,
+            AgentEvent::control(ControlEvent::TaskQueued),
+        );
+        let events = vec![proposed, approval_requested, approval_submitted, control];
+        let proposal_id = events[0].id.to_string();
+
+        assert_eq!(event_dto(&events[0], &events).kind, "tool");
+        assert_eq!(event_dto(&events[1], &events).kind, "tool");
+        assert_eq!(event_dto(&events[2], &events).kind, "ingress");
+        assert_eq!(event_dto(&events[3], &events).kind, "control");
+        assert_eq!(
+            event_dto(&events[2], &events).tool_proposal_event_id,
+            Some(proposal_id)
+        );
     }
 
     #[tokio::test]

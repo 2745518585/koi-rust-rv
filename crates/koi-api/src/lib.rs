@@ -340,6 +340,11 @@ pub struct EventDto {
     pub title: String,
     pub summary: String,
     pub permission: String,
+    /// 工具生命周期事件所属的原始 `ToolEvent::Proposed` 事件 ID。
+    ///
+    /// 非工具事件以及无法安全解析关联关系的事件为 `null`。该字段只用于展示层
+    /// 聚合，不参与权限判断或事件处理。
+    pub tool_proposal_event_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

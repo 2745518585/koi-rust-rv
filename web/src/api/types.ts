@@ -19,11 +19,9 @@ export type EventSource = "system" | "model" | "tool" | string;
 
 export type EventKind =
   | "ingress"
-  | "model"
-  | "tool"
-  | "approval"
   | "control"
-  | "system";
+  | "model"
+  | "tool";
 
 export type ApprovalStatus = "Pending" | "Approved" | "Denied" | "Expired";
 
@@ -71,6 +69,8 @@ export interface TaskEvent {
   title: string;
   summary: string;
   permission: PermissionLevel;
+  /** 所属工具调用的原始 Proposed 事件 ID；非工具事件为 null/未提供。 */
+  toolProposalEventId?: string | null;
   payload?: unknown;
 }
 

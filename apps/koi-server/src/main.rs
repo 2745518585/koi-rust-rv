@@ -171,7 +171,7 @@ async fn run() -> Result<(), ServerError> {
         loop {
             match stored_events.recv().await {
                 Ok(event) if !matches!(event.provenance.creator, EventSource::External(_)) => {
-                    event_sink.publish_event(&event);
+                    event_sink.publish_event(&event).await;
                 }
                 Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,

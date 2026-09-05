@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent, UIEvent } from "react";
 import {
   CircleStop,
@@ -19,8 +19,9 @@ import {
 import type { KoiApiClient } from "../api/client";
 import type { ApprovalRequest, ModelSelection, PermissionLevel, TaskEvent, TaskSummary } from "../api/types";
 import { useI18n } from "../i18n";
+import { groupConversationEvents, type ConversationFeedItem } from "../lib/events";
 import { formatRelative, scopeLabel } from "../lib/format";
-import { EmptyState, EventLine, PermissionSelector, StatusBadge } from "../lib/ui";
+import { EmptyState, EventIcon, EventLine, PermissionSelector, StatusBadge } from "../lib/ui";
 import { ApprovalCard } from "./ApprovalCard";
 
 type FeedMode = "conversation" | "events";
@@ -112,7 +113,13 @@ export function Conversation({
           return event.kind === "model" && (event.title === "Agent 回复" || event.title === "模型调用失败");
         })
       : events;
-  const visibleCount = conversationEvents.length;
+  const conversationItems = useMemo(
+    () => (mode === "conversation" ? groupConversationEvents(conversationEvents) : []),
+    [conversationEvents, mode],
+  );
+  const eventItems = useMemo(() => groupConversationEvents(events), [events]);
+  // 使用原始事件数量触发滚动更新；同一个工具组追加内部步骤时，聚合项数量不会变化。
+  const visibleCount = mode === "events" ? events.length : conversationEvents.length;
 
   // 会话切换、加载完成或新事件到达时，保持视图贴在底部；用户上滚后不再打扰。
   useLayoutEffect(() => {
@@ -369,12 +376,18 @@ export function Conversation({
           <div className="conv-loading">{t("loadingFeed")}</div>
         ) : mode === "events" ? (
           events.length ? (
-            events.map((item) => <EventLine key={item.id} event={item} />)
+            eventItems.map((item) =>
+              item.type === "tool-group" ? (
+                <ToolEventGroupLine key={`tool:${item.proposalEventId}`} events={item.events} />
+              ) : (
+                <EventLine key={item.event.id} event={item.event} />
+              ),
+            )
           ) : (
             <EmptyState icon={FileClock} title={t("allEvents")} description={t("noMessages")} />
           )
         ) : conversationEvents.length ? (
-          conversationEvents.map((item) => <ConversationMessage key={item.id} event={item} />)
+          conversationItems.map((item) => <ConversationFeedMessage key={feedItemKey(item)} item={item} />)
         ) : (
           <EmptyState icon={MessageSquare} title={t("noMessages")} description={t("typePlaceholder")} />
         )}
@@ -423,6 +436,93 @@ export function Conversation({
         </div>
       </form>
     </section>
+  );
+}
+
+function feedItemKey(item: ConversationFeedItem): string {
+  return item.type === "tool-group" ? `tool:${item.proposalEventId}` : item.event.id;
+}
+
+function ConversationFeedMessage({ item }: { item: ConversationFeedItem }) {
+  return item.type === "tool-group" ? (
+    <ToolEventGroupMessage events={item.events} />
+  ) : (
+    <ConversationMessage event={item.event} />
+  );
+}
+
+function ToolEventGroupMessage({ events }: { events: TaskEvent[] }) {
+  const { locale } = useI18n();
+  const proposal = events.find((event) => event.id === event.toolProposalEventId) ?? events[0];
+  const latest = events[events.length - 1] ?? proposal;
+  if (!proposal || !latest) return null;
+
+  const detailEvents = events.filter((event) => event.id !== proposal.id);
+  return (
+    <article className="msg-tool msg-tool-group">
+      <span className="msg-tool-icon">
+        <Terminal size={13} />
+      </span>
+      <div className="msg-tool-copy">
+        <div className="msg-tool-group-head">
+          <strong>{proposal.summary}</strong>
+          <span className="msg-tool-group-status">{latest.title}</span>
+        </div>
+        <p>{latest.id === proposal.id ? proposal.title : latest.summary}</p>
+        {detailEvents.length ? (
+          <details className="msg-tool-details">
+            <summary>已合并 {events.length} 个工具事件</summary>
+            <div className="msg-tool-timeline">
+              {events.map((event) => (
+                <div className="msg-tool-step" key={event.id}>
+                  <strong>
+                    {event.sequence.toString().padStart(3, "0")} · {event.title}
+                  </strong>
+                  <span>{event.summary}</span>
+                </div>
+              ))}
+            </div>
+          </details>
+        ) : null}
+      </div>
+      <time>{formatRelative(latest.occurredAt, locale)}</time>
+    </article>
+  );
+}
+
+/** 事件模式保留每个原始步骤，但将同一工具调用折叠成一条可展开的记录。 */
+function ToolEventGroupLine({ events }: { events: TaskEvent[] }) {
+  const { locale } = useI18n();
+  const proposal = events.find((event) => event.id === event.toolProposalEventId) ?? events[0];
+  const latest = events[events.length - 1] ?? proposal;
+  if (!proposal || !latest) return null;
+
+  const stepLabel = locale === "en" ? `${events.length} tool events` : `${events.length} 个工具事件`;
+  return (
+    <details className="event-line-group">
+      <summary className="event-line event-group-summary">
+        <EventIcon kind="tool" />
+        <div className="event-line-main">
+          <div className="event-line-top">
+            <strong>{proposal.sequence.toString().padStart(3, "0")} · {proposal.summary}</strong>
+            <time>{formatRelative(latest.occurredAt, locale)}</time>
+          </div>
+          <p>{latest.title} · {latest.summary}</p>
+        </div>
+        <span className="event-line-meta">{stepLabel}</span>
+      </summary>
+      <div className="event-group-timeline">
+        {events.map((event) => (
+          <div className="event-group-step" key={event.id}>
+            <span>{event.sequence.toString().padStart(3, "0")}</span>
+            <div>
+              <strong>{event.title}</strong>
+              <p>{event.summary}</p>
+            </div>
+          </div>
+        ))}
+      </div>
+    </details>
   );
 }
 
