@@ -174,7 +174,7 @@ impl ScheduleTool {
 fn validate_content(content: &str, max_bytes: usize) -> Result<(), ToolError> {
     if content.len() > max_bytes {
         return Err(invalid(format!(
-            "crontab content exceeds the {max_bytes} byte limit. The limit is controlled by [security].max_file_bytes in agent.toml"
+            "crontab content exceeds the {max_bytes} byte runtime limit"
         )));
     }
     if content

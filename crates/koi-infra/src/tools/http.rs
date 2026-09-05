@@ -51,7 +51,7 @@ pub(crate) fn tools(policy: &ToolPolicy) -> Vec<Arc<dyn ToolExecutor>> {
     [
         (
             "http.get",
-            "Send a read-only GET request to a policy-allowed HTTP host.",
+            "Send a read-only GET request to an HTTP host.",
             HttpAction::Get,
         ),
         (
@@ -61,7 +61,7 @@ pub(crate) fn tools(policy: &ToolPolicy) -> Vec<Arc<dyn ToolExecutor>> {
         ),
         (
             "http.request",
-            "Send a restricted mutating request to a policy-allowed HTTP host.",
+            "Send a mutating HTTP request.",
             HttpAction::Request,
         ),
         (
@@ -234,7 +234,7 @@ impl HttpTool {
         }
         if header_bytes > self.policy.max_http_header_bytes {
             return Err(invalid(format!(
-                "Total HTTP header size exceeds the {} byte limit. The limit is controlled by [security].max_http_header_bytes in agent.toml",
+                "Total HTTP header size exceeds the {} byte runtime limit",
                 self.policy.max_http_header_bytes
             )));
         }
@@ -244,7 +244,7 @@ impl HttpTool {
             })?;
             if serialized.len() > self.policy.max_input_bytes {
                 return Err(invalid(format!(
-                    "HTTP request body exceeds the {} byte limit. The limit is controlled by [security].max_input_bytes in agent.toml",
+                    "HTTP request body exceeds the {} byte runtime limit",
                     self.policy.max_input_bytes
                 )));
             }
@@ -346,9 +346,7 @@ async fn resolve_http_addresses(
     {
         return Err(ToolError::new(
             ToolErrorKind::TargetUnavailable,
-            format!(
-                "HTTP host resolved to a restricted address: {host}. To allow private, loopback, or link-local access, an administrator must set [security].allow_private_http_addresses = true in agent.toml."
-            ),
+            format!("HTTP host resolved to a restricted address: {host}"),
             false,
         ));
     }

@@ -81,7 +81,7 @@ impl CommandRunner {
             return Err(ToolError::new(
                 ToolErrorKind::InvalidArguments,
                 format!(
-                    "Total command argument size exceeds the {} byte limit. The limit is controlled by [security].max_input_bytes in agent.toml",
+                    "Total command argument size exceeds the {} byte runtime limit",
                     self.policy.max_input_bytes
                 ),
                 false,
@@ -95,7 +95,7 @@ impl CommandRunner {
             return Err(ToolError::new(
                 ToolErrorKind::InvalidArguments,
                 format!(
-                    "Command standard input exceeds the {} byte limit. The limit is controlled by [security].max_input_bytes in agent.toml",
+                    "Command standard input exceeds the {} byte runtime limit",
                     self.policy.max_input_bytes
                 ),
                 false,
@@ -146,7 +146,7 @@ impl CommandRunner {
                 ToolErrorKind::ExecutionFailed
             };
             let hint = if used_sudo && error.kind() == std::io::ErrorKind::NotFound {
-                "; this operation requires sudo because [security].use_sudo=true. Install sudo, or have an administrator set [security].use_sudo=false only after confirming the runtime account already has the required privileges"
+                "; this operation requires sudo. Install sudo and grant the runtime account non-interactive sudoers authorization"
             } else {
                 ""
             };

@@ -273,16 +273,10 @@ fn format_endpoint(host: &str, port: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::{format_endpoint, validate_host};
-    use crate::tools::ToolPolicy;
 
     #[test]
-    fn active_network_probes_are_fail_closed_and_support_ipv6() {
+    fn active_network_probes_validate_input_and_support_ipv6() {
         assert!(validate_host("@8.8.8.8").is_err());
         assert!(format_endpoint("2001:db8::1", 443).starts_with('['));
-
-        let policy = ToolPolicy::default();
-        assert!(policy.require_network_host("example.com").is_err());
-        let policy = policy.with_allowed_network_host("Example.com");
-        assert!(policy.require_network_host("example.com").is_ok());
     }
 }

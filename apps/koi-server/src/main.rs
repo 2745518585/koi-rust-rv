@@ -15,7 +15,6 @@ use koi_infra::llm::{
     ModelProviderEntry, ModelProviderRegistry, OpenAiCompatibleModelConfig,
     OpenAiCompatibleModelProvider,
 };
-use koi_infra::tools::ToolPolicy;
 use koi_infra::web_identity::WebUserStore;
 use koi_infra::web_source::KoiWebSource;
 use serde::Deserialize;
@@ -30,8 +29,6 @@ mod prompts;
 #[derive(Debug, Deserialize)]
 struct RuntimeConfig {
     server: ServerConfig,
-    #[serde(default)]
-    security: ToolPolicy,
     models: ModelsConfig,
     #[serde(default)]
     agent: AgentConfig,
@@ -144,7 +141,7 @@ async fn run() -> Result<(), ServerError> {
     let model_registry = build_model_registry(&config)?;
 
     let mut registry = ToolRegistry::default();
-    let registered = koi_infra::tools::register_builtin_tools(&mut registry, config.security)
+    let registered = koi_infra::tools::register_builtin_tools(&mut registry)
         .map_err(|error| ServerError::ToolRegistry(error.to_string()))?;
     let task_tools = koi_core::agent::task_tools::register_task_management_tools(&mut registry)
         .map_err(|error| ServerError::ToolRegistry(error.to_string()))?;

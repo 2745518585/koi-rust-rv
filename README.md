@@ -28,8 +28,8 @@ Koi Rust Remastered Version：一个面向小型服务器运维群的 QQ 协作�
 
 User-level tools are read-only. Operator-level tools cover scoped changes and
 operations that may use `sudo -n`; arbitrary commands require Admin. The
-default `ToolPolicy` fails closed: mutating tools, Admin command tools, paths,
-services, HTTP hosts and database targets must be explicitly configured.
+Tool invocation is authorized by the core's event permission chain; tool definitions retain
+their minimum permission levels and side-effect classifications.
 
 The current implementation uses structured arguments and fixed command
 templates for specialized tools. It does not concatenate user input into a

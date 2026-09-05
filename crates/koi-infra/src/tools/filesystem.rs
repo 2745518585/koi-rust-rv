@@ -467,7 +467,7 @@ impl FileTool {
         self.policy.require_mutation()?;
         if args.content.len() > self.policy.max_file_bytes {
             return Err(invalid(format!(
-                "File content exceeds the {} byte limit. The limit is controlled by [security].max_file_bytes in agent.toml",
+                "File content exceeds the {} byte runtime limit",
                 self.policy.max_file_bytes
             )));
         }
@@ -560,16 +560,6 @@ impl FileTool {
         self.policy.require_mutation()?;
         let path = existing_entry(&self.policy, &args.path)?;
         let recursive = args.recursive;
-        if self
-            .policy
-            .allowed_roots
-            .iter()
-            .any(|root| fs::canonicalize(root).is_ok_and(|canonical| canonical == path))
-        {
-            return Err(invalid(
-                "Configured allowed root directories cannot be deleted",
-            ));
-        }
         blocking(move || {
             let metadata =
                 fs::symlink_metadata(&path).map_err(|error| invalid(error.to_string()))?;

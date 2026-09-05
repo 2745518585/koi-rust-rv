@@ -2,28 +2,14 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use koi_core::domain::{ToolError, ToolErrorKind};
-use serde::Deserialize;
 
-/// Runtime safety policy shared by built-in tools.
+/// 内置工具的固定运行时边界。
+///
+/// 权限是否足够由核心在调用工具前裁决；这里不再包含可配置的目标白名单、写操作开关
+/// 或管理员命令开关。保留的大小、超时和参数格式检查只用于保证进程与内存可控。
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Clone, Debug, Deserialize)]
-#[serde(default)]
+#[derive(Clone, Debug)]
 pub struct ToolPolicy {
-    /// Filesystem roots that structured file, Git, archive and compose tools
-    /// may access. An empty list fails closed.
-    pub allowed_roots: Vec<PathBuf>,
-    /// Service units that service tools may address.
-    pub allowed_services: BTreeSet<String>,
-    /// Host names allowed for HTTP tools. An empty list fails closed.
-    pub allowed_http_hosts: BTreeSet<String>,
-    /// Host names allowed for active network probes. An empty list fails closed.
-    pub allowed_network_hosts: BTreeSet<String>,
-    /// Database names or local database paths allowed for read-only tools.
-    pub allowed_database_targets: BTreeSet<String>,
-    /// Whether Operator-level mutating tools are enabled.
-    pub allow_mutating_tools: bool,
-    /// Whether Admin-only arbitrary process tools are enabled.
-    pub allow_admin_commands: bool,
     /// Whether structured mutating commands should invoke `sudo -n` on Unix.
     pub use_sudo: bool,
     /// Environment variable names that may be inherited by child commands.
@@ -51,16 +37,9 @@ pub struct ToolPolicy {
 impl Default for ToolPolicy {
     fn default() -> Self {
         Self {
-            allowed_roots: Vec::new(),
-            allowed_services: BTreeSet::new(),
-            allowed_http_hosts: BTreeSet::new(),
-            allowed_network_hosts: BTreeSet::new(),
-            allowed_database_targets: BTreeSet::new(),
-            allow_mutating_tools: false,
-            allow_admin_commands: false,
             use_sudo: true,
             environment_allowlist: default_environment_allowlist(),
-            allow_private_http_addresses: false,
+            allow_private_http_addresses: true,
             max_output_bytes: 64 * 1024,
             max_input_bytes: 1024 * 1024,
             max_http_header_bytes: 16 * 1024,
@@ -72,49 +51,8 @@ impl Default for ToolPolicy {
     }
 }
 
+#[allow(clippy::unused_self)]
 impl ToolPolicy {
-    /// A convenient explicitly-scoped policy for local development and tests.
-    #[must_use]
-    pub fn development(root: impl Into<PathBuf>) -> Self {
-        let mut policy = Self::default();
-        policy.allowed_roots.push(root.into());
-        policy.allow_mutating_tools = true;
-        policy.allow_admin_commands = true;
-        policy
-    }
-
-    #[must_use]
-    pub fn with_allowed_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.allowed_roots.push(root.into());
-        self
-    }
-
-    #[must_use]
-    pub fn with_allowed_service(mut self, service: impl Into<String>) -> Self {
-        self.allowed_services.insert(service.into());
-        self
-    }
-
-    #[must_use]
-    pub fn with_allowed_http_host(mut self, host: impl Into<String>) -> Self {
-        self.allowed_http_hosts
-            .insert(host.into().to_ascii_lowercase());
-        self
-    }
-
-    #[must_use]
-    pub fn with_allowed_network_host(mut self, host: impl Into<String>) -> Self {
-        self.allowed_network_hosts
-            .insert(host.into().to_ascii_lowercase());
-        self
-    }
-
-    #[must_use]
-    pub fn with_allowed_database_target(mut self, target: impl Into<String>) -> Self {
-        self.allowed_database_targets.insert(target.into());
-        self
-    }
-
     #[must_use]
     pub fn with_allowed_environment(mut self, name: impl Into<String>) -> Self {
         self.environment_allowlist.insert(name.into());
@@ -127,28 +65,14 @@ impl ToolPolicy {
         self
     }
 
+    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn require_mutation(&self) -> Result<(), ToolError> {
-        if self.allow_mutating_tools {
-            Ok(())
-        } else {
-            Err(ToolError::new(
-                ToolErrorKind::ExecutionFailed,
-                "Mutating tools are disabled by policy. To allow this operation, an administrator must set [security].allow_mutating_tools = true in agent.toml.",
-                false,
-            ))
-        }
+        Ok(())
     }
 
+    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn require_admin_commands(&self) -> Result<(), ToolError> {
-        if self.allow_admin_commands {
-            Ok(())
-        } else {
-            Err(ToolError::new(
-                ToolErrorKind::ExecutionFailed,
-                "Admin command tools are disabled by policy. To allow this operation, an administrator must set [security].allow_admin_commands = true in agent.toml.",
-                false,
-            ))
-        }
+        Ok(())
     }
 
     pub(crate) fn require_service(&self, service: &str) -> Result<(), ToolError> {
@@ -158,13 +82,10 @@ impl ToolPolicy {
             || service
                 .chars()
                 .any(|character| character.is_whitespace() || character.is_control())
-            || !self.allowed_services.contains(service)
         {
             return Err(ToolError::new(
                 ToolErrorKind::InvalidArguments,
-                format!(
-                    "Service is not allowed by policy: {service}. To allow access, an administrator must add it to [security].allowed_services in agent.toml."
-                ),
+                format!("Invalid service name: {service}"),
                 false,
             ));
         }
@@ -172,33 +93,21 @@ impl ToolPolicy {
     }
 
     pub(crate) fn require_http_host(&self, host: Option<&str>) -> Result<(), ToolError> {
-        let Some(host) = host.map(str::to_ascii_lowercase) else {
+        let Some(_host) = host else {
             return Err(ToolError::new(
                 ToolErrorKind::InvalidArguments,
                 "URL is missing a host name",
                 false,
             ));
         };
-        if !self.allowed_http_hosts.contains(&host) {
-            return Err(ToolError::new(
-                ToolErrorKind::TargetUnavailable,
-                format!(
-                    "HTTP host is not allowed by policy: {host}. To allow access, an administrator must add it to [security].allowed_http_hosts in agent.toml."
-                ),
-                false,
-            ));
-        }
         Ok(())
     }
 
     pub(crate) fn require_network_host(&self, host: &str) -> Result<(), ToolError> {
-        let normalized = host.to_ascii_lowercase();
-        if !self.allowed_network_hosts.contains(&normalized) {
+        if host.trim().is_empty() || host.chars().any(char::is_control) {
             return Err(ToolError::new(
-                ToolErrorKind::TargetUnavailable,
-                format!(
-                    "Network probe target is not allowed by policy: {host}. To allow probing, an administrator must add it to [security].allowed_network_hosts in agent.toml."
-                ),
+                ToolErrorKind::InvalidArguments,
+                "Network probe target must not be empty or contain control characters",
                 false,
             ));
         }
@@ -206,17 +115,10 @@ impl ToolPolicy {
     }
 
     pub(crate) fn require_database_target(&self, target: &str) -> Result<(), ToolError> {
-        if target.trim().is_empty()
-            || target
-                .chars()
-                .any(|character| character.is_whitespace() || character.is_control())
-            || !self.allowed_database_targets.contains(target)
-        {
+        if target.trim().is_empty() || target.chars().any(char::is_control) {
             return Err(ToolError::new(
                 ToolErrorKind::TargetUnavailable,
-                format!(
-                    "Database target is not allowed by policy: {target}. To allow access, an administrator must add it to [security].allowed_database_targets in agent.toml."
-                ),
+                "Database target must not be empty or contain control characters",
                 false,
             ));
         }
@@ -233,7 +135,7 @@ impl ToolPolicy {
             return Err(ToolError::new(
                 ToolErrorKind::InvalidArguments,
                 format!(
-                    "Timeout must be between 1 and {} milliseconds. The upper limit is controlled by [security].max_timeout_ms in agent.toml.",
+                    "Timeout must be between 1 and {} milliseconds.",
                     self.max_timeout_ms
                 ),
                 false,
@@ -281,43 +183,7 @@ pub(crate) fn absolute_path(path: &Path) -> Result<PathBuf, ToolError> {
     }
 }
 
-fn allowed_roots(policy: &ToolPolicy) -> Vec<PathBuf> {
-    policy
-        .allowed_roots
-        .iter()
-        .filter_map(|root| {
-            let absolute = absolute_path(root).ok()?;
-            Some(std::fs::canonicalize(&absolute).unwrap_or(absolute))
-        })
-        .collect()
-}
-
-fn ensure_within(policy: &ToolPolicy, path: &Path) -> Result<(), ToolError> {
-    let roots = allowed_roots(policy);
-    if roots.is_empty() {
-        return Err(ToolError::new(
-            ToolErrorKind::TargetUnavailable,
-            "No allowed paths are configured. An administrator must configure directories in [security].allowed_roots in agent.toml.",
-            false,
-        ));
-    }
-    if !roots
-        .iter()
-        .any(|root| path == root || path.starts_with(root))
-    {
-        return Err(ToolError::new(
-            ToolErrorKind::TargetUnavailable,
-            format!(
-                "Path is outside the allowed roots: {}. To allow access, an administrator must add its parent directory to [security].allowed_roots in agent.toml.",
-                path.display()
-            ),
-            false,
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn existing_path(policy: &ToolPolicy, raw: &str) -> Result<PathBuf, ToolError> {
+pub(crate) fn existing_path(_policy: &ToolPolicy, raw: &str) -> Result<PathBuf, ToolError> {
     if raw.trim().is_empty() {
         return Err(ToolError::new(
             ToolErrorKind::InvalidArguments,
@@ -333,11 +199,10 @@ pub(crate) fn existing_path(policy: &ToolPolicy, raw: &str) -> Result<PathBuf, T
             false,
         )
     })?;
-    ensure_within(policy, &canonical)?;
     Ok(canonical)
 }
 
-pub(crate) fn new_path(policy: &ToolPolicy, raw: &str) -> Result<PathBuf, ToolError> {
+pub(crate) fn new_path(_policy: &ToolPolicy, raw: &str) -> Result<PathBuf, ToolError> {
     if raw.trim().is_empty() {
         return Err(ToolError::new(
             ToolErrorKind::InvalidArguments,
@@ -370,7 +235,6 @@ pub(crate) fn new_path(policy: &ToolPolicy, raw: &str) -> Result<PathBuf, ToolEr
             false,
         )
     })?);
-    ensure_within(policy, &candidate)?;
     Ok(candidate)
 }
 
@@ -421,27 +285,12 @@ mod tests {
     use super::{ToolPolicy, existing_path};
 
     #[test]
-    fn policy_rejections_explain_the_relevant_configuration() {
+    fn runtime_limits_do_not_restrict_authorized_targets() {
         let policy = ToolPolicy::default();
-        assert!(
-            policy
-                .require_mutation()
-                .unwrap_err()
-                .message
-                .contains("[security].allow_mutating_tools")
-        );
-        assert!(
-            policy
-                .require_http_host(Some("example.com"))
-                .unwrap_err()
-                .message
-                .contains("[security].allowed_http_hosts")
-        );
-        assert!(
-            existing_path(&policy, ".")
-                .unwrap_err()
-                .message
-                .contains("[security].allowed_roots")
-        );
+        assert!(policy.require_mutation().is_ok());
+        assert!(policy.require_admin_commands().is_ok());
+        assert!(policy.require_http_host(Some("example.com")).is_ok());
+        assert!(policy.require_network_host("example.com").is_ok());
+        assert!(existing_path(&policy, ".").is_ok());
     }
 }

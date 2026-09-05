@@ -1,9 +1,8 @@
 use koi_core::domain::{
-    AuthorizedToolInvocation, EventId, PermissionLevel, TaskId, ToolCall, ToolErrorKind,
-    ToolSideEffect,
+    AuthorizedToolInvocation, EventId, PermissionLevel, TaskId, ToolCall, ToolSideEffect,
 };
-use koi_core::ports::{ToolInvocationError, ToolRegistry};
-use koi_infra::tools::{ToolPolicy, register_builtin_tools};
+use koi_core::ports::ToolRegistry;
+use koi_infra::tools::register_builtin_tools;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -25,7 +24,7 @@ fn invocation(name: &str, arguments: serde_json::Value) -> AuthorizedToolInvocat
 #[test]
 fn registers_the_builtin_tool_catalog_with_expected_risk_levels() {
     let mut registry = ToolRegistry::default();
-    let count = register_builtin_tools(&mut registry, ToolPolicy::default()).unwrap();
+    let count = register_builtin_tools(&mut registry).unwrap();
 
     assert_eq!(count, 94);
     assert_eq!(registry.list_definitions().len(), count);
@@ -47,12 +46,12 @@ fn registers_the_builtin_tool_catalog_with_expected_risk_levels() {
 }
 
 #[tokio::test]
-async fn filesystem_tools_are_scoped_and_support_write_read_delete() {
+async fn filesystem_tools_support_write_read_delete() {
     let root = std::env::temp_dir().join(format!("koi-tools-{}", EventId::new()));
     std::fs::create_dir_all(&root).unwrap();
     let file = root.join("status.txt");
     let mut registry = ToolRegistry::default();
-    register_builtin_tools(&mut registry, ToolPolicy::development(&root)).unwrap();
+    register_builtin_tools(&mut registry).unwrap();
 
     registry
         .invoke(
@@ -82,24 +81,10 @@ async fn filesystem_tools_are_scoped_and_support_write_read_delete() {
 }
 
 #[tokio::test]
-async fn disabled_mutations_and_admin_commands_fail_closed() {
+async fn mutating_and_admin_tools_run_after_core_authorization() {
     let mut registry = ToolRegistry::default();
-    register_builtin_tools(&mut registry, ToolPolicy::default()).unwrap();
-
-    let write_error = registry
-        .invoke(
-            invocation("fs.write", json!({"path":"missing.txt","content":"x"})),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        write_error,
-        ToolInvocationError::ExecutionFailed(error)
-            if error.kind == ToolErrorKind::ExecutionFailed
-    ));
-
-    let command_error = registry
+    register_builtin_tools(&mut registry).unwrap();
+    let command = registry
         .invoke(
             invocation(
                 "system.command",
@@ -108,18 +93,14 @@ async fn disabled_mutations_and_admin_commands_fail_closed() {
             CancellationToken::new(),
         )
         .await
-        .unwrap_err();
-    assert!(matches!(
-        command_error,
-        ToolInvocationError::ExecutionFailed(error)
-            if error.kind == ToolErrorKind::ExecutionFailed
-    ));
+        .unwrap();
+    assert_eq!(command.data["exit_code"], 0);
 }
 
 #[tokio::test]
 async fn admin_command_uses_structured_arguments() {
     let mut registry = ToolRegistry::default();
-    register_builtin_tools(&mut registry, ToolPolicy::development(std::env::temp_dir())).unwrap();
+    register_builtin_tools(&mut registry).unwrap();
 
     let result = registry
         .invoke(

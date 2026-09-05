@@ -2,7 +2,7 @@
 //!
 //! The tools in this module deliberately use structured arguments and fixed
 //! command templates. The only general-purpose process entry point is
-//! `system.command`, which is Admin-only and disabled by the default policy.
+//! `system.command`, which is Admin-only and hidden from the model by default.
 
 mod archive;
 mod command;
@@ -35,10 +35,8 @@ pub(crate) use runner::{CommandOutput, CommandRunner, CommandSpec};
 ///
 /// Returns an error if a built-in definition is invalid or a name is
 /// registered twice.
-pub fn register_builtin_tools(
-    registry: &mut ToolRegistry,
-    policy: ToolPolicy,
-) -> Result<usize, ToolRegistrationError> {
+pub fn register_builtin_tools(registry: &mut ToolRegistry) -> Result<usize, ToolRegistrationError> {
+    let policy = ToolPolicy::default();
     let runner = CommandRunner::new(policy.clone());
     let mut tools: Vec<Arc<dyn ToolExecutor>> = Vec::new();
     tools.extend(filesystem::tools(&policy));
@@ -141,7 +139,7 @@ pub(crate) fn ensure_success(label: &str, output: &CommandOutput) -> Result<(), 
         redact_text(output.stderr.trim())
     };
     let sudo_hint = if output.used_sudo {
-        "; this operation used sudo -n. Confirm that the runtime account has non-interactive sudoers authorization, or have an administrator review [security].use_sudo in agent.toml"
+        "; this operation used sudo -n. Confirm that the runtime account has non-interactive sudoers authorization"
     } else {
         ""
     };

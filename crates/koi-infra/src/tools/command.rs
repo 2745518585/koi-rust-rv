@@ -99,7 +99,7 @@ impl ToolExecutor for CommandTool {
         if let Some(stdin) = &args.stdin {
             if stdin.len() > self.policy.max_file_bytes {
                 return Err(invalid(format!(
-                    "Standard input exceeds the {} byte limit. The limit is controlled by [security].max_file_bytes in agent.toml",
+                    "Standard input exceeds the {} byte runtime limit",
                     self.policy.max_file_bytes
                 )));
             }
