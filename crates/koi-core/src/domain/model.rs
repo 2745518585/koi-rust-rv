@@ -229,6 +229,11 @@ impl fmt::Display for ModelSelection {
 }
 
 /// Validates the provider part of a model identity.
+///
+/// # Errors
+///
+/// Returns an error when the provider is empty, too long, contains whitespace, or contains
+/// control characters.
 pub fn validate_model_provider(provider: &str) -> Result<(), ModelSelectionValidationError> {
     validate_model_component(
         provider,
@@ -257,6 +262,10 @@ pub fn validate_model_id(model_id: &str) -> Result<(), ModelSelectionValidationE
 }
 
 /// Validates both parts of a provider/model identity.
+///
+/// # Errors
+///
+/// Returns the validation error for either the provider or model ID.
 pub fn validate_model_selection(
     provider: &str,
     model_id: &str,

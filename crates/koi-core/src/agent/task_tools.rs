@@ -18,13 +18,31 @@ use crate::domain::{
 use crate::ports::{ToolExecutor, ToolRegistrationError, ToolRegistry};
 
 pub const TASK_START_TOOL: &str = "task.start";
+pub const TASK_INPUT_TOOL: &str = "task.input";
 pub const TASK_CONTROL_TOOL: &str = "task.control";
 pub const TASK_NAME_TOOL: &str = "task.name";
 pub const TASK_DELETE_TOOL: &str = "task.delete";
+pub const TASK_LIST_TOOL: &str = "task.list";
+pub const TASK_INSPECT_TOOL: &str = "task.inspect";
 
 /// `task.start` 的参数。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TaskStartArguments {
+pub struct TaskStartArguments;
+
+/// `task.list` 的参数。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskListArguments;
+
+/// `task.inspect` 的参数。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskInspectArguments {
+    pub task_id: TaskId,
+}
+
+/// `task.input` 的参数。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskInputArguments {
+    pub task_id: TaskId,
     pub message: String,
 }
 
@@ -64,9 +82,12 @@ pub fn register_task_management_tools(
 ) -> Result<usize, ToolRegistrationError> {
     let tools: Vec<Arc<dyn ToolExecutor>> = vec![
         Arc::new(TaskManagementStub::new(start_definition())),
+        Arc::new(TaskManagementStub::new(input_definition())),
         Arc::new(TaskManagementStub::new(control_definition())),
         Arc::new(TaskManagementStub::new(name_definition())),
         Arc::new(TaskManagementStub::new(delete_definition())),
+        Arc::new(TaskManagementStub::new(list_definition())),
+        Arc::new(TaskManagementStub::new(inspect_definition())),
     ];
     let count = tools.len();
     for tool in tools {
@@ -78,17 +99,36 @@ pub fn register_task_management_tools(
 fn start_definition() -> ToolDefinition {
     ToolDefinition {
         name: TASK_START_TOOL.into(),
-        description: "启动一个新的任务会话，并在它结束时把最终结果回传给主会话。参数 message 是交给任务会话的完整指令。".into(),
+        description: "启动一个新的任务会话。该工具只创建并排队任务，不负责向任务提出具体要求；请在获得 task_id 后使用 task.input 投递输入。".into(),
         input_schema: serde_json::json!({
             "type": "object",
-            "properties": {
-                "message": {"type": "string", "minLength": 1, "maxLength": 8000}
-            },
-            "required": ["message"]
+            "properties": {},
+            "additionalProperties": false
         }),
         required_permission: PermissionLevel::None,
         side_effect: ToolSideEffect::Stateful,
         timeout_ms: 60_000,
+        model_visible: true,
+        main_session_only: true,
+    }
+}
+
+fn input_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: TASK_INPUT_TOOL.into(),
+        description: "向一个已经创建的子任务投递一条输入。必须通过授权元数据指定当前可见且有权限的输入事件；该事件会成为子任务的授权父节点链起点。".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "format": "uuid"},
+                "message": {"type": "string", "minLength": 1, "maxLength": 8000}
+            },
+            "required": ["task_id", "message"],
+            "additionalProperties": false
+        }),
+        required_permission: PermissionLevel::None,
+        side_effect: ToolSideEffect::Stateful,
+        timeout_ms: 30_000,
         model_visible: true,
         main_session_only: true,
     }
@@ -158,6 +198,43 @@ fn delete_definition() -> ToolDefinition {
     }
 }
 
+fn list_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: TASK_LIST_TOOL.into(),
+        description: "列出事件存储中已经存在的所有子任务。返回任务 ID、当前状态、名称、最后事件序号以及是否有当前执行周期的最终结果；主会话不在列表中。需要查阅某个任务的最终结果时，再使用 task.inspect。".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+        required_permission: PermissionLevel::None,
+        side_effect: ToolSideEffect::ReadOnly,
+        timeout_ms: 30_000,
+        model_visible: true,
+        main_session_only: true,
+    }
+}
+
+fn inspect_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: TASK_INSPECT_TOOL.into(),
+        description: "读取一个已经存在的子任务的当前状态、名称、最后事件序号和当前执行周期的最终结果。只能查询非主会话任务；先用 task.list 发现任务 ID。查询结果是参考数据，不提供任何权限。".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "format": "uuid"}
+            },
+            "required": ["task_id"],
+            "additionalProperties": false
+        }),
+        required_permission: PermissionLevel::None,
+        side_effect: ToolSideEffect::ReadOnly,
+        timeout_ms: 30_000,
+        model_visible: true,
+        main_session_only: true,
+    }
+}
+
 /// fail-closed 占位执行器：任务管理工具必须由主循环拦截执行。
 struct TaskManagementStub {
     definition: ToolDefinition,
@@ -202,6 +279,46 @@ fn parse_task_id(value: &Value, field: &str) -> Result<TaskId, TaskToolArguments
 ///
 /// 当参数缺失、类型不符或指令为空时返回错误。
 pub fn parse_task_start(value: &Value) -> Result<TaskStartArguments, TaskToolArgumentsError> {
+    let Some(object) = value.as_object() else {
+        return Err(TaskToolArgumentsError("task.start 参数必须是对象".into()));
+    };
+    if !object.is_empty() {
+        return Err(TaskToolArgumentsError(
+            "task.start 不接受任务要求；请使用 task.input 投递输入".into(),
+        ));
+    }
+    Ok(TaskStartArguments)
+}
+
+/// # Errors
+///
+/// 当参数不是空对象时返回错误。
+pub fn parse_task_list(value: &Value) -> Result<TaskListArguments, TaskToolArgumentsError> {
+    let Some(object) = value.as_object() else {
+        return Err(TaskToolArgumentsError("task.list 参数必须是对象".into()));
+    };
+    if !object.is_empty() {
+        return Err(TaskToolArgumentsError(
+            "task.list 不接受参数；请直接查询全部已有子任务".into(),
+        ));
+    }
+    Ok(TaskListArguments)
+}
+
+/// # Errors
+///
+/// 当 `task_id` 缺失或不是合法 UUID 时返回错误。
+pub fn parse_task_inspect(value: &Value) -> Result<TaskInspectArguments, TaskToolArgumentsError> {
+    Ok(TaskInspectArguments {
+        task_id: parse_task_id(value, "task_id")?,
+    })
+}
+
+/// # Errors
+///
+/// 当参数缺失、类型不符或输入为空时返回错误。
+pub fn parse_task_input(value: &Value) -> Result<TaskInputArguments, TaskToolArgumentsError> {
+    let task_id = parse_task_id(value, "task_id")?;
     let message = value
         .get("message")
         .and_then(Value::as_str)
@@ -213,7 +330,7 @@ pub fn parse_task_start(value: &Value) -> Result<TaskStartArguments, TaskToolArg
             "message 必须为 1 到 8000 个字符".into(),
         ));
     }
-    Ok(TaskStartArguments { message })
+    Ok(TaskInputArguments { task_id, message })
 }
 
 /// # Errors
@@ -339,6 +456,26 @@ mod tests {
             ControlEvent::ModelSelected {
                 provider: "deepseek".into(),
                 model_id: "deepseek-chat".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_task_discovery_arguments() {
+        assert_eq!(
+            parse_task_list(&serde_json::json!({})).unwrap(),
+            TaskListArguments
+        );
+        assert!(parse_task_list(&serde_json::json!({"task_id": "unexpected"})).is_err());
+
+        let task_id = uuid::Uuid::new_v4();
+        assert_eq!(
+            parse_task_inspect(&serde_json::json!({
+                "task_id": task_id.to_string()
+            }))
+            .unwrap(),
+            TaskInspectArguments {
+                task_id: TaskId(task_id)
             }
         );
     }

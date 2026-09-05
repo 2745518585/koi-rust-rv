@@ -439,6 +439,24 @@ pub struct ToolResult {
     pub truncated: bool,
 }
 
+impl ToolResult {
+    /// 将工具结果渲染为模型可读的上下文内容。
+    ///
+    /// `summary` 适合人类快速浏览，`data` 才是工具返回的结构化事实。两者都必须
+    /// 进入模型上下文，否则模型在重启后或异步续跑时只能看到摘要，无法读取任务 ID、
+    /// 状态字段以及工具返回的其他结构化结果。
+    #[must_use]
+    pub fn model_content(&self) -> String {
+        if self.data.is_null() {
+            return self.summary.clone();
+        }
+        match serde_json::to_string(&self.data) {
+            Ok(data) => format!("{}\n[KOI_TOOL_DATA]\n{data}", self.summary),
+            Err(_) => self.summary.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum ToolEvent {
     Proposed {
@@ -485,6 +503,12 @@ pub enum ToolEvent {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TaskOperation {
     CreateChild,
+    /// 由主会话向子任务投递一条带授权父事件的输入。
+    InputChild {
+        task_id: TaskId,
+        message: String,
+        authority_parent_event_id: EventId,
+    },
     /// 为子任务设置稳定显示名称。
     NameChild {
         task_id: TaskId,
@@ -518,7 +542,8 @@ impl TaskOperation {
     pub const fn target_task_id(&self) -> Option<TaskId> {
         match self {
             Self::CreateChild => None,
-            Self::NameChild { task_id, .. }
+            Self::InputChild { task_id, .. }
+            | Self::NameChild { task_id, .. }
             | Self::DeleteChild { task_id, .. }
             | Self::ControlChild { task_id, .. }
             | Self::ResumeChild { task_id }
@@ -583,6 +608,11 @@ pub enum ControlEvent {
     },
     ContextCompacted {
         dropped_context_event_ids: Vec<EventId>,
+        /// 对被移出直接上下文的历史事件生成的模型可读摘要。
+        ///
+        /// 使用 `serde(default)` 兼容早期只有事件 ID、没有摘要内容的事件日志。
+        #[serde(default)]
+        summary: String,
     },
 }
 

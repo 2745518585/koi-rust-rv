@@ -25,6 +25,17 @@ pub trait AuthorizationEvidenceResolver: Send + Sync {
         task_id: TaskId,
         event_id: EventId,
     ) -> Result<AuthorizationEvidence, AuthorizationError>;
+
+    /// 按全局事件 ID读取权限证据。
+    ///
+    /// 主会话委托给子任务的输入会跨任务引用主会话事件。默认实现保持旧版解析器的
+    /// fail-closed 行为；支持跨任务权限链的实现应覆盖此方法。
+    async fn resolve_any(
+        &self,
+        _event_id: EventId,
+    ) -> Result<AuthorizationEvidence, AuthorizationError> {
+        Err(AuthorizationError::new("权限解析器不支持跨任务事件读取"))
+    }
 }
 
 /// 特定输入来源的补充授权能力，例如 QQ 确认消息或 Web 提权窗口。

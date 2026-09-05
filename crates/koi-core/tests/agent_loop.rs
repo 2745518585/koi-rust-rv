@@ -5,18 +5,23 @@ use std::sync::{
 
 use async_trait::async_trait;
 use futures_util::stream;
-use koi_core::agent::{AgentLoop, AgentRunOutcome, AgentRunRequest, TaskRuntime};
+use koi_core::agent::{
+    AgentLoop, AgentRunOutcome, AgentRunRequest, PersistedAuthorizationEvidenceResolver,
+    TaskManager, TaskRuntime,
+};
 use koi_core::domain::{
     AgentEvent, AuthorizationEvidence, AuthorizationEvidenceStatus, AuthorizedToolInvocation,
-    EventEnvelope, EventId, EventSource, ModelCapabilities, ModelContextItem, ModelError,
-    ModelGenerationOptions, ModelInputRole, ModelOutput, ModelOutputContract, ModelProtocol,
-    ModelProviderDescriptor, ModelRequest, ModelStreamEvent, PermissionLevel, Principal,
-    SourceName, TaskId, ToolCall, ToolDefinition, ToolError, ToolResult, ToolSideEffect, Usage,
+    EventEnvelope, EventId, EventSource, ModelCapabilities, ModelContextItem, ModelDeltaKind,
+    ModelError, ModelGenerationOptions, ModelInputRole, ModelOutput, ModelOutputContract,
+    ModelProtocol, ModelProviderDescriptor, ModelRequest, ModelStreamEvent, PermissionLevel,
+    Principal, SourceName, TaskId, ToolCall, ToolDefinition, ToolError, ToolResult, ToolSideEffect,
+    Usage,
 };
 use koi_core::ports::{
     AuthorizationError, AuthorizationEvidenceResolver, EventStore, EventStoreError,
-    ModelEventStream, ModelProvider, PromptError, PromptTaskKind, SourceAuthorizationProvider,
-    SourceAuthorizationRegistry, SystemPrompt, SystemPromptProvider, ToolExecutor, ToolRegistry,
+    InMemoryEventStore, ModelEventStream, ModelProvider, PromptError, PromptTaskKind,
+    SourceAuthorizationProvider, SourceAuthorizationRegistry, SystemPrompt, SystemPromptProvider,
+    ToolExecutor, ToolRegistry,
 };
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -43,6 +48,19 @@ impl EventStore for MemoryEventStore {
             .filter(|event| event.task_id == task_id)
             .cloned()
             .collect())
+    }
+
+    async fn load_event_any(
+        &self,
+        event_id: EventId,
+    ) -> Result<Option<EventEnvelope>, EventStoreError> {
+        Ok(self
+            .events
+            .lock()
+            .await
+            .iter()
+            .find(|event| event.id == event_id)
+            .cloned())
     }
 }
 
@@ -79,8 +97,13 @@ impl ModelProvider for TwoTurnModel {
                 text: "诊断完成".into(),
             }]
         };
-        Ok(Box::pin(stream::iter(vec![Ok(
-            ModelStreamEvent::Completed(koi_core::domain::ModelTurn {
+        Ok(Box::pin(stream::iter(vec![
+            Ok(ModelStreamEvent::Delta {
+                sequence: 0,
+                kind: ModelDeltaKind::Text,
+                content: "临时流式片段".into(),
+            }),
+            Ok(ModelStreamEvent::Completed(koi_core::domain::ModelTurn {
                 outputs,
                 usage: Usage {
                     input_tokens: 1,
@@ -89,8 +112,8 @@ impl ModelProvider for TwoTurnModel {
                     reasoning_tokens: None,
                 },
                 provider_response_id: None,
-            }),
-        )])))
+            })),
+        ])))
     }
 }
 
@@ -299,6 +322,11 @@ async fn main_loop_records_model_tool_and_final_response() {
     assert_eq!(finished.provenance.authority_parent_event_id, None);
     assert!(!recorded_events.iter().any(|event| matches!(
         event.payload,
+        AgentEvent::Model(ref model)
+            if matches!(model.as_ref(), koi_core::domain::ModelEvent::Delta { .. })
+    )));
+    assert!(!recorded_events.iter().any(|event| matches!(
+        event.payload,
         AgentEvent::Control(ref control)
             if matches!(control.as_ref(), koi_core::domain::ControlEvent::TaskCompleted { .. })
     )));
@@ -377,15 +405,22 @@ impl ModelProvider for TaskStartModel {
         _request: ModelRequest,
         _cancel: CancellationToken,
     ) -> Result<ModelEventStream, ModelError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let output = if call == 0 {
+            ModelOutput::ToolCall(ToolCall {
+                name: "task.start".into(),
+                arguments: json!({}),
+                provider_call_id: Some("call-task-1".into()),
+                authority_parent_event_id: Some(self.evidence_event_id),
+            })
+        } else {
+            ModelOutput::Text {
+                text: "子任务已创建，等待输入".into(),
+            }
+        };
         Ok(Box::pin(stream::iter(vec![Ok(
             ModelStreamEvent::Completed(koi_core::domain::ModelTurn {
-                outputs: vec![ModelOutput::ToolCall(ToolCall {
-                    name: "task.start".into(),
-                    arguments: json!({"message": "巡检磁盘空间并汇报"}),
-                    provider_call_id: Some("call-task-1".into()),
-                    authority_parent_event_id: Some(self.evidence_event_id),
-                })],
+                outputs: vec![output],
                 usage: Usage {
                     input_tokens: 1,
                     output_tokens: 1,
@@ -400,9 +435,9 @@ impl ModelProvider for TaskStartModel {
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn main_session_task_start_creates_child_and_returns_pending_external() {
+async fn main_session_task_start_creates_queued_child_without_input() {
     use koi_core::agent::TaskManager;
-    use koi_core::domain::{ControlEvent, IngressEvent, ToolEvent};
+    use koi_core::domain::{ControlEvent, ToolEvent};
 
     let evidence_event_id = EventId::new();
     let model = TaskStartModel {
@@ -412,7 +447,7 @@ async fn main_session_task_start_creates_child_and_returns_pending_external() {
     let mut tools = ToolRegistry::default();
     let registered = koi_core::agent::task_tools::register_task_management_tools(&mut tools)
         .expect("任务管理工具注册失败");
-    assert_eq!(registered, 4);
+    assert_eq!(registered, 7);
 
     let store = MemoryEventStore::default();
     let events = Arc::clone(&store.events);
@@ -448,13 +483,28 @@ async fn main_session_task_start_creates_child_and_returns_pending_external() {
         .await
         .unwrap();
 
-    let AgentRunOutcome::StartedChildTask { task_id } = outcome else {
-        panic!("task.start 应使本轮以 StartedChildTask 结束");
-    };
-    assert_ne!(task_id, TaskId::MAIN);
-    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        outcome,
+        AgentRunOutcome::Completed { response: Some(_) }
+    ));
+    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
 
     let recorded = events.lock().await;
+    let task_id = recorded
+        .iter()
+        .find_map(|event| match &event.payload {
+            AgentEvent::Control(control) => match control.as_ref() {
+                ControlEvent::TaskOperationAccepted { target_task_id, .. }
+                    if !target_task_id.is_main() =>
+                {
+                    Some(*target_task_id)
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("主会话流必须记录新子任务 ID");
+    assert_ne!(task_id, TaskId::MAIN);
     // 主会话流必须留有跨任务创建审计，并且 Started 的 causation 指向 Accepted 事件。
     let accepted = recorded
         .iter()
@@ -487,12 +537,12 @@ async fn main_session_task_start_creates_child_and_returns_pending_external() {
         AgentEvent::Tool(tool) if matches!(tool.as_ref(), ToolEvent::Failed { .. })
     )));
 
-    // 子任务流：TaskCreated(trigger=accepted) -> TaskQueued -> 首条输入（System 记录）。
+    // 子任务流：TaskCreated(trigger=accepted) -> TaskQueued；具体输入由 task.input 投递。
     let child_events: Vec<&EventEnvelope> = recorded
         .iter()
         .filter(|event| event.task_id == task_id)
         .collect();
-    assert_eq!(child_events.len(), 3);
+    assert_eq!(child_events.len(), 2);
     let ControlEvent::TaskCreated {
         trigger_event_id: Some(trigger),
     } = (match &child_events[0].payload {
@@ -506,15 +556,362 @@ async fn main_session_task_start_creates_child_and_returns_pending_external() {
     assert!(
         matches!(&child_events[1].payload, AgentEvent::Control(control) if matches!(control.as_ref(), ControlEvent::TaskQueued))
     );
-    assert!(
-        matches!(&child_events[2].payload, AgentEvent::Ingress(ingress) if matches!(ingress.as_ref(), IngressEvent::ContextReceived { .. }))
-    );
-    // 子任务尚未运行：不应有任何模型事件。
+    // 子任务尚未收到输入，也不应有任何模型事件。
     assert!(
         child_events
             .iter()
             .all(|event| !matches!(event.payload, AgentEvent::Model(_)))
     );
+}
+
+struct TaskDiscoveryModel {
+    calls: AtomicUsize,
+    contexts: Arc<Mutex<Vec<Vec<ModelContextItem>>>>,
+}
+
+#[async_trait]
+impl ModelProvider for TaskDiscoveryModel {
+    fn descriptor(&self) -> ModelProviderDescriptor {
+        ModelProviderDescriptor {
+            provider: "test".into(),
+            model_id: "task-discovery-model".into(),
+            protocol: ModelProtocol::Responses,
+            capabilities: ModelCapabilities::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancel: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        self.contexts.lock().await.push(request.context);
+        let output = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            ModelOutput::ToolCall(ToolCall {
+                name: "task.list".into(),
+                arguments: json!({}),
+                provider_call_id: Some("task-list-1".into()),
+                authority_parent_event_id: None,
+            })
+        } else {
+            ModelOutput::Text {
+                text: "已查看任务列表".into(),
+            }
+        };
+        Ok(Box::pin(stream::iter(vec![Ok(
+            ModelStreamEvent::Completed(koi_core::domain::ModelTurn {
+                outputs: vec![output],
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cached_input_tokens: None,
+                    reasoning_tokens: None,
+                },
+                provider_response_id: None,
+            }),
+        )])))
+    }
+}
+
+#[tokio::test]
+async fn main_model_can_discover_persisted_children_with_task_list() {
+    let store = Arc::new(InMemoryEventStore::default());
+    let child_id = TaskId::new();
+    let mut child = TaskRuntime::new(Arc::clone(&store), child_id);
+    child
+        .record(
+            AgentEvent::control(koi_core::domain::ControlEvent::TaskCreated {
+                trigger_event_id: None,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    child
+        .record(
+            AgentEvent::control(koi_core::domain::ControlEvent::TaskQueued),
+            None,
+        )
+        .await
+        .unwrap();
+    child
+        .record(
+            AgentEvent::control(koi_core::domain::ControlEvent::TaskResumed),
+            None,
+        )
+        .await
+        .unwrap();
+    child
+        .record(
+            AgentEvent::control(koi_core::domain::ControlEvent::TaskCompleted {
+                response: Some("子任务结果".into()),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let model = TaskDiscoveryModel {
+        calls: AtomicUsize::new(0),
+        contexts: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut tools = ToolRegistry::default();
+    koi_core::agent::task_tools::register_task_management_tools(&mut tools).unwrap();
+    let manager = TaskManager::new(Arc::new(Arc::clone(&store)));
+    let resolver = EvidenceResolver {
+        ingress_event_id: EventId::new(),
+    };
+    let providers = SourceAuthorizationRegistry::default();
+    let prompts = TestPromptProvider;
+    let agent = AgentLoop::new(&model, &tools, &resolver, &providers, None, &prompts)
+        .with_task_manager(&manager);
+    let mut main = TaskRuntime::new(Arc::clone(&store), TaskId::MAIN);
+    let first_context_event_id = EventId::new();
+
+    let outcome = agent
+        .run_main(
+            &mut main,
+            AgentRunRequest {
+                trigger_event_id: Some(first_context_event_id),
+                context: vec![ModelContextItem {
+                    event_id: first_context_event_id,
+                    role: ModelInputRole::User,
+                    content: "有哪些已有任务？".into(),
+                    permission: PermissionLevel::None,
+                }],
+                input_events: Vec::new(),
+                memory_query: None,
+                output_contract: ModelOutputContract::Text,
+                model_options: ModelGenerationOptions::default(),
+                max_model_turns: 3,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        AgentRunOutcome::Completed {
+            response: Some("已查看任务列表".into())
+        }
+    );
+    let contexts = model.contexts.lock().await;
+    assert_eq!(contexts.len(), 2);
+    assert_eq!(contexts[1].len(), 2);
+    assert!(contexts[1][1].content.contains("[KOI_TOOL_DATA]"));
+    assert!(contexts[1][1].content.contains(&child_id.to_string()));
+}
+
+struct DelegatedInputModel {
+    input_event_id: EventId,
+    calls: AtomicUsize,
+    contexts: Arc<Mutex<Vec<Vec<ModelContextItem>>>>,
+}
+
+#[async_trait]
+impl ModelProvider for DelegatedInputModel {
+    fn descriptor(&self) -> ModelProviderDescriptor {
+        ModelProviderDescriptor {
+            provider: "test".into(),
+            model_id: "delegated-input-model".into(),
+            protocol: ModelProtocol::Responses,
+            capabilities: ModelCapabilities::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancel: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        self.contexts.lock().await.push(request.context);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let output = if call == 0 {
+            ModelOutput::ToolCall(ToolCall {
+                name: "server.status".into(),
+                arguments: json!({"server": "prod-1"}),
+                provider_call_id: Some("delegated-call-1".into()),
+                authority_parent_event_id: Some(self.input_event_id),
+            })
+        } else {
+            ModelOutput::Text {
+                text: "委托输入已完成调查".into(),
+            }
+        };
+        Ok(Box::pin(stream::iter(vec![Ok(
+            ModelStreamEvent::Completed(koi_core::domain::ModelTurn {
+                outputs: vec![output],
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cached_input_tokens: None,
+                    reasoning_tokens: None,
+                },
+                provider_response_id: None,
+            }),
+        )])))
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn delegated_child_input_authorizes_tool_via_main_event_chain() {
+    use koi_core::domain::{ContextKind, IngressEvent, ModelEvent, ToolEvent};
+
+    let shared = Arc::new(MemoryEventStore::default());
+    let manager = TaskManager::new(Arc::new(Arc::clone(&shared)));
+    let mut main = TaskRuntime::new(Arc::clone(&shared), TaskId::MAIN);
+    main.record(
+        AgentEvent::control(koi_core::domain::ControlEvent::TaskCreated {
+            trigger_event_id: None,
+        }),
+        None,
+    )
+    .await
+    .unwrap();
+    main.record(
+        AgentEvent::control(koi_core::domain::ControlEvent::TaskQueued),
+        None,
+    )
+    .await
+    .unwrap();
+    let parent = main
+        .record_with_provenance(
+            external_message_event(PermissionLevel::User, "delegated-parent", "请调查部署失败"),
+            None,
+            external_provenance(PermissionLevel::User),
+        )
+        .await
+        .unwrap();
+
+    let mut created = manager.request_create_child(&mut main, None).await.unwrap();
+    let child_id = created.task_id;
+    created
+        .runtime
+        .record(
+            AgentEvent::control(koi_core::domain::ControlEvent::TaskCreated {
+                trigger_event_id: Some(created.accepted_event_id),
+            }),
+            Some(created.accepted_event_id),
+        )
+        .await
+        .unwrap();
+    created
+        .runtime
+        .record(
+            AgentEvent::control(koi_core::domain::ControlEvent::TaskQueued),
+            None,
+        )
+        .await
+        .unwrap();
+    let input_event_id = manager
+        .request_input_child(
+            &mut main,
+            child_id,
+            "请根据用户输入调查部署失败，并只使用只读工具收集证据".into(),
+            parent.id,
+            PermissionLevel::User,
+            None,
+        )
+        .await
+        .unwrap();
+    let child_input = shared
+        .load_event(child_id, input_event_id)
+        .await
+        .unwrap()
+        .expect("委托输入事件应存在");
+
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let model = DelegatedInputModel {
+        input_event_id,
+        calls: AtomicUsize::new(0),
+        contexts: Arc::clone(&contexts),
+    };
+    let tool = Arc::new(StatusTool::new());
+    let mut tools = ToolRegistry::default();
+    tools
+        .register(Arc::clone(&tool) as Arc<dyn ToolExecutor>)
+        .unwrap();
+    let resolver = PersistedAuthorizationEvidenceResolver::new(shared.as_ref());
+    let providers = SourceAuthorizationRegistry::default();
+    let prompts = TestPromptProvider;
+    let agent = AgentLoop::new(&model, &tools, &resolver, &providers, None, &prompts);
+    let mut child = TaskRuntime::recover(Arc::clone(&shared), child_id)
+        .await
+        .unwrap();
+    let outcome = agent
+        .run(
+            &mut child,
+            AgentRunRequest {
+                trigger_event_id: Some(input_event_id),
+                context: vec![],
+                input_events: vec![child_input],
+                memory_query: None,
+                output_contract: ModelOutputContract::Text,
+                model_options: ModelGenerationOptions::default(),
+                max_model_turns: 3,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        AgentRunOutcome::Completed {
+            response: Some("委托输入已完成调查".into())
+        }
+    );
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+    let model_contexts = contexts.lock().await;
+    assert_eq!(model_contexts.len(), 2);
+    assert_eq!(model_contexts[0].len(), 1);
+    assert_eq!(model_contexts[0][0].event_id, input_event_id);
+    assert_eq!(model_contexts[0][0].role, ModelInputRole::User);
+    assert_eq!(model_contexts[0][0].permission, PermissionLevel::User);
+
+    let events = shared.load_task(child_id).await.unwrap();
+    assert!(events.iter().any(|event| {
+        matches!(
+            &event.payload,
+            AgentEvent::Model(model)
+                if matches!(model.as_ref(), ModelEvent::Completed { .. })
+        )
+    }));
+    let proposed = events
+        .iter()
+        .find_map(|event| match &event.payload {
+            AgentEvent::Tool(tool) => match tool.as_ref() {
+                ToolEvent::Proposed { tool_call } => Some(tool_call),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("应记录工具提议");
+    assert_eq!(proposed.authority_parent_event_id, Some(input_event_id));
+    assert!(events.iter().any(|event| {
+        matches!(
+            &event.payload,
+            AgentEvent::Tool(tool)
+                if matches!(
+                    tool.as_ref(),
+                    ToolEvent::AuthorizationChecked {
+                        decision: koi_core::domain::PolicyDecision::Allow,
+                        effective_permission: PermissionLevel::User,
+                        ..
+                    }
+                )
+        )
+    }));
+    assert!(events.iter().any(|event| {
+        matches!(
+            &event.payload,
+            AgentEvent::Ingress(ingress)
+                if matches!(ingress.as_ref(), IngressEvent::ContextReceived { context, .. }
+                    if context.kind == ContextKind::UserMessage)
+        )
+    }));
 }
 
 struct TextModel {
@@ -542,6 +939,51 @@ impl ModelProvider for TextModel {
             ModelStreamEvent::Completed(koi_core::domain::ModelTurn {
                 outputs: vec![ModelOutput::Text {
                     text: "收到".into(),
+                }],
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cached_input_tokens: None,
+                    reasoning_tokens: None,
+                },
+                provider_response_id: None,
+            }),
+        )])))
+    }
+}
+
+struct ContextCaptureModel {
+    contexts: Arc<Mutex<Vec<Vec<ModelContextItem>>>>,
+    calls: AtomicUsize,
+    context_window_tokens: Option<u32>,
+}
+
+#[async_trait]
+impl ModelProvider for ContextCaptureModel {
+    fn descriptor(&self) -> ModelProviderDescriptor {
+        ModelProviderDescriptor {
+            provider: "test".into(),
+            model_id: "context-capture".into(),
+            protocol: ModelProtocol::Responses,
+            capabilities: ModelCapabilities::default(),
+        }
+    }
+
+    fn context_window_tokens(&self) -> Option<u32> {
+        self.context_window_tokens
+    }
+
+    async fn start(
+        &self,
+        request: ModelRequest,
+        _cancel: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        self.contexts.lock().await.push(request.context);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(Box::pin(stream::iter(vec![Ok(
+            ModelStreamEvent::Completed(koi_core::domain::ModelTurn {
+                outputs: vec![ModelOutput::Text {
+                    text: format!("第 {call} 轮回复"),
                 }],
                 usage: Usage {
                     input_tokens: 1,
@@ -693,4 +1135,149 @@ async fn instruction_input_below_session_minimum_is_skipped_not_injected() {
     };
     assert!(!context_event_ids.contains(&below_minimum.id));
     assert!(context_event_ids.contains(&above_minimum.id));
+}
+
+#[tokio::test]
+async fn oversized_history_is_compacted_and_persisted_before_model_call() {
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let model = ContextCaptureModel {
+        contexts: Arc::clone(&contexts),
+        calls: AtomicUsize::new(0),
+        context_window_tokens: Some(5_000),
+    };
+    let store = MemoryEventStore::default();
+    let mut runtime = TaskRuntime::new(store, TaskId::MAIN);
+    let mut input_events = Vec::new();
+    for index in 0..3 {
+        input_events.push(
+            runtime
+                .record_with_provenance(
+                    external_message_event(
+                        PermissionLevel::User,
+                        &format!("large-history-{index}"),
+                        &"历史消息 ".repeat(1_200),
+                    ),
+                    None,
+                    external_provenance(PermissionLevel::User),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+
+    let providers = SourceAuthorizationRegistry::default();
+    let prompts = TestPromptProvider;
+    let resolver = EvidenceResolver {
+        ingress_event_id: input_events[0].id,
+    };
+    let tools = ToolRegistry::default();
+    let agent = AgentLoop::new(&model, &tools, &resolver, &providers, None, &prompts);
+    agent
+        .run_main(
+            &mut runtime,
+            AgentRunRequest {
+                trigger_event_id: Some(input_events[2].id),
+                context: vec![],
+                input_events,
+                memory_query: None,
+                output_contract: ModelOutputContract::Text,
+                model_options: ModelGenerationOptions::default(),
+                max_model_turns: 1,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let events = runtime.load_events().await.unwrap();
+    assert!(events.iter().any(|event| {
+        matches!(
+            &event.payload,
+            AgentEvent::Control(control)
+                if matches!(control.as_ref(), koi_core::domain::ControlEvent::ContextCompacted {
+                    summary, ..
+                } if !summary.is_empty())
+        )
+    }));
+    let captured = contexts.lock().await;
+    assert!(
+        captured[0]
+            .iter()
+            .any(|item| item.content.contains("KOI_CONTEXT_SUMMARY"))
+    );
+}
+
+#[tokio::test]
+async fn a_follow_up_model_call_receives_the_complete_persisted_history() {
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    let model = ContextCaptureModel {
+        contexts: Arc::clone(&contexts),
+        calls: AtomicUsize::new(0),
+        context_window_tokens: None,
+    };
+    let store = MemoryEventStore::default();
+    let mut runtime = TaskRuntime::new(store, TaskId::MAIN);
+    let providers = SourceAuthorizationRegistry::default();
+    let prompts = TestPromptProvider;
+    let resolver = EvidenceResolver {
+        ingress_event_id: EventId::new(),
+    };
+    let tools = ToolRegistry::default();
+    let agent = AgentLoop::new(&model, &tools, &resolver, &providers, None, &prompts);
+
+    let first = runtime
+        .record_with_provenance(
+            external_message_event(PermissionLevel::User, "history-1", "第一次输入"),
+            None,
+            external_provenance(PermissionLevel::User),
+        )
+        .await
+        .unwrap();
+    agent
+        .run_main(
+            &mut runtime,
+            AgentRunRequest {
+                trigger_event_id: Some(first.id),
+                context: vec![],
+                input_events: vec![first.clone()],
+                memory_query: None,
+                output_contract: ModelOutputContract::Text,
+                model_options: ModelGenerationOptions::default(),
+                max_model_turns: 1,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let second = runtime
+        .record_with_provenance(
+            external_message_event(PermissionLevel::User, "history-2", "第二次输入"),
+            None,
+            external_provenance(PermissionLevel::User),
+        )
+        .await
+        .unwrap();
+    agent
+        .run_main(
+            &mut runtime,
+            AgentRunRequest {
+                trigger_event_id: Some(second.id),
+                context: vec![],
+                input_events: vec![second.clone()],
+                memory_query: None,
+                output_contract: ModelOutputContract::Text,
+                model_options: ModelGenerationOptions::default(),
+                max_model_turns: 1,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let captured = contexts.lock().await;
+    assert_eq!(captured.len(), 2);
+    assert!(captured[1].iter().any(|item| item.event_id == first.id));
+    assert!(captured[1].iter().any(|item| item.event_id == second.id));
+    assert!(captured[1].iter().any(|item| item.content == "第 1 轮回复"));
 }

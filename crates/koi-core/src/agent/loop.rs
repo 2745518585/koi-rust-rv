@@ -5,19 +5,19 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{
-    InputInjectionError, InputInjector, RuntimeError, RuntimeRecoveryError, TASK_CONTROL_TOOL,
-    TASK_DELETE_TOOL, TASK_NAME_TOOL, TASK_START_TOOL, TaskManager, TaskManagerError, TaskRuntime,
-    TaskStartArguments, TaskToolArgumentsError, parse_task_control, parse_task_delete,
-    parse_task_name, parse_task_start,
+    ContextAssembler, ContextBudget, InputInjectionError, InputInjector, RuntimeError,
+    RuntimeRecoveryError, TASK_CONTROL_TOOL, TASK_DELETE_TOOL, TASK_INPUT_TOOL, TASK_INSPECT_TOOL,
+    TASK_LIST_TOOL, TASK_NAME_TOOL, TASK_START_TOOL, TaskInputArguments, TaskInspectArguments,
+    TaskListArguments, TaskManager, TaskManagerError, TaskRuntime, TaskStartArguments,
+    TaskToolArgumentsError, parse_task_control, parse_task_delete, parse_task_input,
+    parse_task_inspect, parse_task_list, parse_task_name, parse_task_start,
 };
 use crate::domain::{
     AgentEvent, AuthorizationRequest, AuthorizationRequestResult, AuthorizedToolInvocation,
-    ContextEnvelope, ContextKind, ContextOrigin, ContextPayload, ControlEvent, EventId,
-    IngressEvent, MemoryContextBuilder, MemoryQuery, ModelContextItem, ModelError, ModelEvent,
-    ModelGenerationOptions, ModelInputRole, ModelOutput, ModelOutputContract, ModelRequest,
-    ModelStreamEvent, PermissionAssessment, PermissionCheckResult, PermissionChecker,
-    PermissionLevel, PolicyDecision, Scope, TaskId, TaskStatus, ToolCall, ToolDefinition,
-    ToolEvent, ToolResult,
+    ControlEvent, EventId, MemoryContextBuilder, MemoryQuery, ModelContextItem, ModelError,
+    ModelEvent, ModelGenerationOptions, ModelInputRole, ModelOutput, ModelOutputContract,
+    ModelRequest, ModelStreamEvent, PermissionCheckResult, PermissionChecker, PermissionLevel,
+    PolicyDecision, TaskId, TaskStatus, ToolCall, ToolDefinition, ToolEvent, ToolResult,
 };
 use crate::ports::{
     AuthorizationEvidenceResolver, EventStore, MemoryError, MemoryStore, ModelProvider,
@@ -81,6 +81,7 @@ pub enum AgentRunOutcome {
 /// `task.*` 工具解析后的调度动作。
 enum TaskToolAction {
     Start(TaskStartArguments),
+    Input(TaskInputArguments),
     Control {
         task_id: TaskId,
         control: ControlEvent,
@@ -93,6 +94,8 @@ enum TaskToolAction {
         task_id: TaskId,
         reason: String,
     },
+    List(TaskListArguments),
+    Inspect(TaskInspectArguments),
 }
 
 /// 按工具名解析任务管理工具参数；未知工具名视为参数错误。
@@ -102,6 +105,7 @@ fn parse_task_tool_action(
 ) -> Result<TaskToolAction, TaskToolArgumentsError> {
     match name {
         TASK_START_TOOL => parse_task_start(arguments).map(TaskToolAction::Start),
+        TASK_INPUT_TOOL => parse_task_input(arguments).map(TaskToolAction::Input),
         TASK_CONTROL_TOOL => parse_task_control(arguments).map(|args| TaskToolAction::Control {
             task_id: args.task_id,
             control: args.control,
@@ -114,6 +118,8 @@ fn parse_task_tool_action(
             task_id: args.task_id,
             reason: args.reason,
         }),
+        TASK_LIST_TOOL => parse_task_list(arguments).map(TaskToolAction::List),
+        TASK_INSPECT_TOOL => parse_task_inspect(arguments).map(TaskToolAction::Inspect),
         other => Err(TaskToolArgumentsError(format!("未知任务管理工具：{other}"))),
     }
 }
@@ -297,11 +303,6 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                     "审批恢复不应再次进入等待授权状态".into(),
                 ));
             }
-            ToolHandlingOutcome::PendingExternal { .. } => {
-                return Err(AgentLoopError::InvalidApproval(
-                    "审批恢复不应启动异步任务工具".into(),
-                ));
-            }
         }
         self.run_turns(runtime, request, cancel, is_main_session, context)
             .await
@@ -345,6 +346,9 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                 return Ok(AgentRunOutcome::Cancelled);
             }
 
+            context = self
+                .fit_context_to_budget(runtime, &request, context)
+                .await?;
             let completed = match self
                 .call_model(runtime, &request, &context, cancel.clone())
                 .await
@@ -354,12 +358,13 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                 Err(error) => return Err(error),
             };
 
+            let outputs = completed.outputs;
             let mut tool_calls = Vec::new();
-            for output in completed.outputs {
+            for output in &outputs {
                 match output {
-                    ModelOutput::Text { text } => final_text.push(text),
-                    ModelOutput::Refusal { reason } => final_text.push(reason),
-                    ModelOutput::ToolCall(tool_call) => tool_calls.push(tool_call),
+                    ModelOutput::Text { text } => final_text.push(text.clone()),
+                    ModelOutput::Refusal { reason } => final_text.push(reason.clone()),
+                    ModelOutput::ToolCall(tool_call) => tool_calls.push(tool_call.clone()),
                     ModelOutput::InterventionDecision { .. } => {}
                 }
             }
@@ -379,7 +384,13 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                 return Ok(AgentRunOutcome::Completed { response });
             }
 
-            let mut started_child_task: Option<TaskId> = None;
+            // 下一轮模型调用需要看到本轮助手文本。工具调用本身由 Provider 的当前调用
+            // 状态编码，`ContextAssembler::model_output_item` 会有意忽略纯工具调用输出，
+            // 避免在 Chat Completions 请求中重复构造 assistant tool call。
+            if let Some(item) = ContextAssembler::model_output_item(completed.event_id, &outputs) {
+                push_unique_context(&mut context, item);
+            }
+
             let available_evidence = context.iter().map(|item| item.event_id).collect();
             for tool_call in tool_calls {
                 match self
@@ -398,16 +409,7 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                             approval_request_event_id,
                         });
                     }
-                    ToolHandlingOutcome::PendingExternal { task_id } => {
-                        // 子任务结果将在其结束后以工具事件形式回到本会话；同一轮的其余
-                        // 工具调用仍会先执行完毕，其结果在下一次续跑时一并注入。
-                        started_child_task = Some(task_id);
-                    }
                 }
-            }
-
-            if let Some(task_id) = started_child_task {
-                return Ok(AgentRunOutcome::StartedChildTask { task_id });
             }
         }
 
@@ -448,7 +450,7 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
         Ok(())
     }
 
-    /// 构建首轮模型上下文，并在注入前完成输入事件的权限检查。
+    /// 构建模型上下文，并在注入前完成输入事件的权限检查。
     ///
     /// 检查分两层：
     /// 1. 持久化完整性——输入事件必须已存在于事件存储且与持久化内容一致，否则其
@@ -465,25 +467,102 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
         S: EventStore,
     {
         let task_id = runtime.projection().task_id;
-        let mut context = request.context.clone();
+        let stored = runtime.load_events().await?;
         if !request.input_events.is_empty() {
-            let stored = runtime.load_events().await?;
             InputInjector::verify_persisted_events(&request.input_events, &stored)?;
-            let injector = InputInjector::default();
-            let minimum_control_permission = runtime.projection().minimum_control_permission;
-            for event in &request.input_events {
-                match injector.inject(task_id, event, minimum_control_permission) {
-                    Ok(item) => context.push(item),
-                    Err(InputInjectionError::InsufficientControlPermission { .. }) => {}
-                    Err(error) => return Err(error.into()),
-                }
-            }
+        }
+
+        // 事件存储是完整历史的事实来源。调用方传入的 context 可能是刚刚回传的工具
+        // 结果或其他尚未作为普通输入事件投影的上下文，因此只用它们的 ID 去重，随后
+        // 仍然把任务事件流中所有可见事件按顺序恢复出来。
+        let provided_context_event_ids = request
+            .context
+            .iter()
+            .map(|item| item.event_id)
+            .collect::<HashSet<_>>();
+        let mut context = ContextAssembler::from_events(
+            task_id,
+            &stored,
+            &provided_context_event_ids,
+            runtime.projection().minimum_control_permission,
+        )?;
+        for item in &request.context {
+            push_unique_context(&mut context, item.clone());
         }
         if let (Some(memory), Some(query)) = (self.memory, request.memory_query.as_ref()) {
             let results = memory.search(query.clone()).await?;
             context.extend(MemoryContextBuilder::build(query, results));
         }
         Ok(context)
+    }
+
+    /// 在每次模型调用前按模型上下文窗口压缩最早的完整历史。
+    ///
+    /// 压缩只改变本次模型请求的投影，不删除任何原始事件。每次压缩都会追加一个无权限
+    /// 的 `ContextCompacted` 控制事件；下次恢复任务时，`ContextAssembler` 会使用该事件
+    /// 的摘要而不会再次展开已经覆盖的历史。
+    async fn fit_context_to_budget(
+        &self,
+        runtime: &mut TaskRuntime<S>,
+        request: &AgentRunRequest,
+        mut context: Vec<ModelContextItem>,
+    ) -> Result<Vec<ModelContextItem>, AgentLoopError> {
+        let prompt = self
+            .prompts
+            .prompt_for(crate::ports::PromptTaskKind::for_task(
+                runtime.projection().task_id,
+            ))?;
+        prompt.validate()?;
+        let tools = self.model_tools(runtime.projection().task_id.is_main());
+        let fixed_tokens = ContextAssembler::estimate_fixed_tokens(&prompt.content, &tools);
+        let budget = ContextBudget::new(
+            self.model.context_window_tokens(),
+            request.model_options.max_output_tokens,
+        );
+        let input_budget = budget.available_input_tokens(fixed_tokens);
+        if input_budget == 0 {
+            return Err(AgentLoopError::ContextBudgetTooSmall {
+                context_window_tokens: budget.context_window_tokens,
+                fixed_tokens,
+            });
+        }
+
+        // 一次调用最多连续写入少量压缩检查点。正常情况下第一次压缩即可完成；限制循环
+        // 是为了避免异常长的不可压缩工具结果导致无界追加控制事件。
+        for _ in 0..8 {
+            let Some(plan) = ContextAssembler::compact(&context, input_budget)? else {
+                return Ok(context);
+            };
+            let crate::agent::ContextCompactionPlan {
+                summary_position,
+                remaining,
+                dropped_context_event_ids: plan_dropped_context_event_ids,
+                summary,
+            } = plan;
+            let mut dropped_context_event_ids =
+                ContextAssembler::latest_compaction_coverage(&runtime.load_events().await?)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+            dropped_context_event_ids.extend(plan_dropped_context_event_ids);
+            dropped_context_event_ids.sort_by_key(ToString::to_string);
+            dropped_context_event_ids.dedup();
+            let compacted = runtime
+                .record(
+                    AgentEvent::control(ControlEvent::ContextCompacted {
+                        dropped_context_event_ids,
+                        summary: summary.clone(),
+                    }),
+                    None,
+                )
+                .await?;
+            context = remaining;
+            context.insert(
+                summary_position.min(context.len()),
+                ContextAssembler::summary_item(compacted.id, &summary),
+            );
+        }
+
+        Err(AgentLoopError::ContextCompactionDidNotConverge)
     }
 
     async fn call_model(
@@ -540,9 +619,7 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                 return Err(AgentLoopError::Model(error));
             }
         };
-        let turn = self
-            .record_model_stream(runtime, stream, call_started.id, cancel)
-            .await?;
+        let turn = self.record_model_stream(runtime, stream, cancel).await?;
         let completed = runtime
             .record_with_provenance(
                 AgentEvent::model(ModelEvent::Completed {
@@ -564,7 +641,6 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
         &self,
         runtime: &mut TaskRuntime<S>,
         mut stream: crate::ports::ModelEventStream,
-        call_started_event_id: EventId,
         cancel: CancellationToken,
     ) -> Result<crate::domain::ModelTurn, AgentLoopError> {
         while let Some(item) = stream.next().await {
@@ -573,24 +649,10 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                 return Err(AgentLoopError::Cancelled);
             }
             match item? {
-                ModelStreamEvent::Delta {
-                    sequence,
-                    kind,
-                    content,
-                } => {
-                    runtime
-                        .record_with_provenance(
-                            AgentEvent::model(ModelEvent::Delta {
-                                call_started_event_id,
-                                sequence,
-                                kind,
-                                content,
-                            }),
-                            Some(call_started_event_id),
-                            crate::domain::EventProvenance::model(None),
-                        )
-                        .await?;
-                }
+                // Delta 仅是供应商传输层的临时片段。当前版本不将其写入事件存储，
+                // 避免历史会话被 token 级事件淹没；`Completed` 会持久化本次调用的
+                // 完整输出，作为重放和展示的权威记录。
+                ModelStreamEvent::Delta { .. } => {}
                 ModelStreamEvent::Completed(turn) => return Ok(turn),
             }
         }
@@ -766,11 +828,18 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
             if !visited.insert(current_event_id) {
                 return None;
             }
-            let mut event = self
+            let mut event = match self
                 .evidence_resolver
                 .resolve(task_id, current_event_id)
                 .await
-                .ok()?;
+            {
+                Ok(event) => event,
+                Err(_) => self
+                    .evidence_resolver
+                    .resolve_any(current_event_id)
+                    .await
+                    .ok()?,
+            };
             // 从工具提议事件自身开始逐层审查。控制事件与 System 来源的核心内部事件
             // 只承载核心自身运转所需的权限，不能被模型、工具或其他事件作为权限父节点
             // 借用；工具事件回传可以无条件进入会话，但其权限为 None，同样不能提权。
@@ -929,7 +998,7 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                     .await?;
                 Ok(ToolHandlingOutcome::Continue(tool_result_context(
                     finished.id,
-                    result,
+                    &result,
                 )))
             }
             Err(error) => {
@@ -957,8 +1026,8 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
     ///
     /// 所有操作经 `TaskManager` 在主会话事件流中留下 `TaskOperationRequested` 与
     /// `Accepted/Rejected` 审计事件。`task.start` 在成功后写入绑定 Accepted 事件的
-    /// `ToolEvent::Started`，其结果由核心在子任务结束后以 `ToolEvent::Finished` 回传；
-    /// 其余操作同步完成并立即返回工具结果。
+    /// `ToolEvent::Started`，立即返回子任务 ID，最终结果仍由核心在子任务结束后以
+    /// `ToolEvent::Finished` 回传；其余操作同步完成并立即返回工具结果。
     #[allow(clippy::too_many_lines)]
     async fn execute_task_tool(
         &self,
@@ -1001,7 +1070,7 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
         };
 
         match action {
-            TaskToolAction::Start(args) => {
+            TaskToolAction::Start(_args) => {
                 let mut created = match manager
                     .request_create_child(runtime, Some(validated_event_id))
                     .await
@@ -1025,11 +1094,66 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                         crate::domain::EventProvenance::tool(),
                     )
                     .await?;
-                self.bootstrap_child_task(&mut created, started.id, args.message)
-                    .await?;
-                Ok(ToolHandlingOutcome::PendingExternal {
-                    task_id: created.task_id,
-                })
+                self.bootstrap_child_task(&mut created).await?;
+                self.acknowledge_child_started(runtime, started.id, created.task_id)
+                    .await
+            }
+            TaskToolAction::Input(args) => {
+                let Some(authority_parent_event_id) = tool_call.authority_parent_event_id else {
+                    return self
+                        .deny_tool(
+                            runtime,
+                            proposal_event_id,
+                            "task.input 必须引用一个可见的授权父事件",
+                        )
+                        .await;
+                };
+                let Some(authority) = self
+                    .resolve_authority_chain(
+                        runtime.projection().task_id,
+                        authority_parent_event_id,
+                    )
+                    .await
+                else {
+                    return self
+                        .deny_tool(
+                            runtime,
+                            proposal_event_id,
+                            "task.input 的授权父事件无效、已过期或不可作为授权来源",
+                        )
+                        .await;
+                };
+                if !authority.permission.can_authorize() {
+                    return self
+                        .deny_tool(
+                            runtime,
+                            proposal_event_id,
+                            "task.input 的授权父事件不具备有效权限",
+                        )
+                        .await;
+                }
+                let outcome = manager
+                    .request_input_child(
+                        runtime,
+                        args.task_id,
+                        args.message,
+                        authority_parent_event_id,
+                        authority.permission,
+                        Some(validated_event_id),
+                    )
+                    .await
+                    .map(|event_id| {
+                        (
+                            format!("已向子任务 {} 投递输入事件 {}", args.task_id, event_id),
+                            serde_json::json!({
+                                "task_id": args.task_id.to_string(),
+                                "input_event_id": event_id.to_string(),
+                                "authority_parent_event_id": authority_parent_event_id.to_string(),
+                            }),
+                        )
+                    });
+                self.settle_sync_task_tool(runtime, proposal_event_id, checked.id, outcome)
+                    .await
             }
             TaskToolAction::Control { task_id, control } => {
                 let outcome = manager
@@ -1065,6 +1189,34 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                         (
                             format!("已删除子任务 {task_id}"),
                             serde_json::json!({ "task_id": task_id.to_string() }),
+                        )
+                    });
+                self.settle_sync_task_tool(runtime, proposal_event_id, checked.id, outcome)
+                    .await
+            }
+            TaskToolAction::List(_args) => {
+                let outcome = manager.list_child_tasks().await.map(|tasks| {
+                    let data = serde_json::json!({
+                        "tasks": tasks.iter().map(task_summary_json).collect::<Vec<_>>()
+                    });
+                    let summary = if tasks.is_empty() {
+                        "当前没有已存在的子任务".to_owned()
+                    } else {
+                        format!("已列出 {} 个已存在的子任务", tasks.len())
+                    };
+                    (summary, data)
+                });
+                self.settle_sync_task_tool(runtime, proposal_event_id, checked.id, outcome)
+                    .await
+            }
+            TaskToolAction::Inspect(args) => {
+                let outcome = manager
+                    .inspect_child_task(args.task_id)
+                    .await
+                    .map(|details| {
+                        (
+                            format!("已读取子任务 {} 的详情", args.task_id),
+                            task_details_json(&details),
                         )
                     });
                 self.settle_sync_task_tool(runtime, proposal_event_id, checked.id, outcome)
@@ -1131,7 +1283,7 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
             .await?;
         Ok(ToolHandlingOutcome::Continue(tool_result_context(
             finished.id,
-            result,
+            &result,
         )))
     }
 
@@ -1168,17 +1320,13 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
         }))
     }
 
-    /// 为新子任务写入生命周期事件与首条系统指令输入。
+    /// 为新子任务写入生命周期事件。
     ///
-    /// 系统事件是一种输入事件：它与用户消息走同一条注入管线、受同一权限审查，但它
-    /// 携带的 `System` 权限是最高等级，对任何会话最低控制权限都满足，因此核心写入的
-    /// 系统事件一定能注入上下文。同时它以 System 来源持久化，永远不能被模型当作
-    /// 权限父节点借用（见 `AuthorizationEvidence::can_be_authority_parent`）。
+    /// 具体任务要求不再通过启动命令写入；主会话必须在获得子任务 ID 后通过
+    /// `task.input` 投递一条带授权父事件的输入。
     async fn bootstrap_child_task(
         &self,
         created: &mut crate::agent::CreatedChild<S>,
-        started_event_id: EventId,
-        message: String,
     ) -> Result<(), AgentLoopError> {
         let child = &mut created.runtime;
         child
@@ -1192,43 +1340,36 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
         child
             .record(AgentEvent::control(ControlEvent::TaskQueued), None)
             .await?;
-        let now = chrono::Utc::now();
-        let assessment = PermissionAssessment::new(
-            PermissionLevel::System,
-            PermissionLevel::System,
-            PermissionLevel::System,
+        Ok(())
+    }
+
+    /// 向主会话返回新子任务的 ID，但保留 `task.start` 的 Started 事件用于最终结果回传。
+    async fn acknowledge_child_started(
+        &self,
+        runtime: &mut TaskRuntime<S>,
+        started_event_id: EventId,
+        task_id: TaskId,
+    ) -> Result<ToolHandlingOutcome, AgentLoopError> {
+        let content = format!(
+            "子任务已创建并处于 Queued 状态，task_id={task_id}。请使用 task.input 投递具体任务要求。"
         );
-        child
+        let output = runtime
             .record_with_provenance(
-                AgentEvent::ingress(IngressEvent::ContextReceived {
-                    context: Box::new(ContextEnvelope {
-                        schema_version: 1,
-                        kind: ContextKind::SystemEvent,
-                        origin: ContextOrigin {
-                            source: "internal-task".into(),
-                            source_instance: "main-session".into(),
-                            native_event_id: started_event_id.to_string(),
-                        },
-                        actor: None,
-                        scope: Scope::new("task", created.task_id.to_string()),
-                        occurred_at: now,
-                        received_at: now,
-                        position: None,
-                        permission: PermissionLevel::System,
-                        payload: ContextPayload::Text {
-                            text: message,
-                            mentions: Vec::new(),
-                        },
-                        causation_id: Some(started_event_id),
-                        content_hash: format!("task-start:{started_event_id}"),
-                    }),
-                    assessment,
+                AgentEvent::tool(ToolEvent::Output {
+                    execution_started_event_id: started_event_id,
+                    sequence: 0,
+                    content: content.clone(),
                 }),
                 Some(started_event_id),
-                crate::domain::EventProvenance::system(),
+                crate::domain::EventProvenance::tool(),
             )
             .await?;
-        Ok(())
+        Ok(ToolHandlingOutcome::Continue(ModelContextItem {
+            event_id: output.id,
+            role: ModelInputRole::Tool,
+            content,
+            permission: PermissionLevel::None,
+        }))
     }
 
     async fn deny_tool(
@@ -1296,10 +1437,6 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
 enum ToolHandlingOutcome {
     Continue(ModelContextItem),
     AwaitingAuthorization(EventId),
-    /// 任务管理工具已启动一个子任务；结果在子任务结束后异步回传。
-    PendingExternal {
-        task_id: TaskId,
-    },
 }
 
 struct CompletedModel {
@@ -1468,13 +1605,54 @@ fn unique_sources(evidence: &[crate::domain::AuthorizationEvidence]) -> Vec<Stri
         .collect()
 }
 
-fn tool_result_context(event_id: EventId, result: ToolResult) -> ModelContextItem {
+fn tool_result_context(event_id: EventId, result: &ToolResult) -> ModelContextItem {
     ModelContextItem {
         event_id,
         role: ModelInputRole::Tool,
-        content: result.summary,
+        content: result.model_content(),
         permission: PermissionLevel::None,
     }
+}
+
+fn push_unique_context(context: &mut Vec<ModelContextItem>, item: ModelContextItem) {
+    if !context
+        .iter()
+        .any(|existing| existing.event_id == item.event_id)
+    {
+        context.push(item);
+    }
+}
+
+fn task_summary_json(summary: &crate::agent::TaskSummary) -> serde_json::Value {
+    serde_json::json!({
+        "task_id": summary.task_id.to_string(),
+        "status": format!("{:?}", summary.status),
+        "title": summary.title.clone(),
+        "last_sequence": summary.last_sequence,
+        "has_result": summary.has_result,
+    })
+}
+
+fn task_details_json(details: &crate::agent::TaskDetails) -> serde_json::Value {
+    let mut value = task_summary_json(&details.summary);
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "latest_result_event_id".into(),
+            details
+                .latest_result_event_id
+                .map_or(serde_json::Value::Null, |event_id| {
+                    serde_json::Value::String(event_id.to_string())
+                }),
+        );
+        object.insert(
+            "latest_result".into(),
+            details
+                .latest_result
+                .clone()
+                .map_or(serde_json::Value::Null, serde_json::Value::String),
+        );
+    }
+    value
 }
 
 fn fingerprint(value: &impl serde::Serialize) -> Result<String, AgentLoopError> {
@@ -1508,6 +1686,15 @@ pub enum AgentLoopError {
     Serialization(#[from] serde_json::Error),
     #[error(transparent)]
     InputInjection(#[from] InputInjectionError),
+    #[error(transparent)]
+    ContextCompaction(#[from] crate::agent::ContextCompactionError),
+    #[error("模型上下文窗口 {context_window_tokens} Token 小于固定请求开销 {fixed_tokens} Token")]
+    ContextBudgetTooSmall {
+        context_window_tokens: u32,
+        fixed_tokens: u32,
+    },
+    #[error("上下文压缩在多次尝试后仍未达到模型预算")]
+    ContextCompactionDidNotConverge,
     #[error("任务必须处于 New 状态，当前为 {0:?}")]
     TaskNotNew(TaskStatus),
     #[error("任务必须处于 WaitingApproval 状态，当前为 {0:?}")]

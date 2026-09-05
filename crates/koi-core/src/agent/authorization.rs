@@ -47,9 +47,23 @@ where
             .ok_or_else(|| AuthorizationError::new(format!("权限事件不存在：{event_id}")))?;
         evidence_from_event(event)
     }
+
+    async fn resolve_any(
+        &self,
+        event_id: crate::domain::EventId,
+    ) -> Result<AuthorizationEvidence, AuthorizationError> {
+        let event = self
+            .store
+            .load_event_any(event_id)
+            .await
+            .map_err(|error| AuthorizationError::new(error.to_string()))?
+            .ok_or_else(|| AuthorizationError::new(format!("权限事件不存在：{event_id}")))?;
+        evidence_from_event(event)
+    }
 }
 
 fn evidence_from_event(event: EventEnvelope) -> Result<AuthorizationEvidence, AuthorizationError> {
+    let authority_parent_event_id = event.provenance.authority_parent_event_id;
     let status = if event
         .provenance
         .expires_at
@@ -62,9 +76,11 @@ fn evidence_from_event(event: EventEnvelope) -> Result<AuthorizationEvidence, Au
 
     let (event_kind, principal, source_maximum_permission, permission, approval_request_event_id) =
         match event.payload {
-            AgentEvent::Ingress(ingress) => {
-                ingress_evidence(ingress.as_ref(), &event.provenance.creator)?
-            }
+            AgentEvent::Ingress(ingress) => ingress_evidence(
+                ingress.as_ref(),
+                &event.provenance.creator,
+                authority_parent_event_id,
+            )?,
             AgentEvent::Control(_) => direct_evidence(
                 AuthorizationEvidenceEventKind::Control,
                 &event.provenance.creator,
@@ -94,7 +110,7 @@ fn evidence_from_event(event: EventEnvelope) -> Result<AuthorizationEvidence, Au
         source_maximum_permission,
         permission,
         status,
-        authority_parent_event_id: event.provenance.authority_parent_event_id,
+        authority_parent_event_id,
         expires_at: event.provenance.expires_at,
         approval_request_event_id,
     })
@@ -103,6 +119,7 @@ fn evidence_from_event(event: EventEnvelope) -> Result<AuthorizationEvidence, Au
 fn ingress_evidence(
     ingress: &IngressEvent,
     creator: &EventSource,
+    authority_parent_event_id: Option<crate::domain::EventId>,
 ) -> Result<EvidenceParts, AuthorizationError> {
     match ingress {
         IngressEvent::ContextReceived {
@@ -143,8 +160,25 @@ fn ingress_evidence(
                 PermissionLevel::System,
                 None,
             )),
+            EventSource::Model | EventSource::Tool
+                if matches!(
+                    context.kind,
+                    crate::domain::ContextKind::UserMessage | crate::domain::ContextKind::Alert
+                ) && authority_parent_event_id.is_some() =>
+            {
+                // 主会话委托给子任务的输入由模型发起，但不拥有直接权限；权限只能从
+                // 它的 authority_parent_event_id 继续递归追溯。这里忽略输入事件中保存
+                // 的权限快照，避免将模型生成的字段当作直接授权。
+                Ok((
+                    AuthorizationEvidenceEventKind::Ingress,
+                    None,
+                    PermissionLevel::None,
+                    PermissionLevel::None,
+                    None,
+                ))
+            }
             EventSource::Model | EventSource::Tool => {
-                Err(AuthorizationError::new("输入事件必须由外部来源或核心创建"))
+                Err(AuthorizationError::new("模型或工具输入必须带有权限父事件"))
             }
         },
         IngressEvent::ApprovalSubmitted {

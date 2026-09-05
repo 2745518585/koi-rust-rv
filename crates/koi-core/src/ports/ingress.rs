@@ -110,6 +110,14 @@ impl<'a> IngressRegistrar<'a> {
             .ok_or_else(|| IngressRegistrationError::UnregisteredSource(draft.source().into()))?;
         let assessment = self.assess(&draft, source).await?;
         let (event, causation_id) = into_ingress_event(draft, assessment);
+        if is_cycle_input(&event) {
+            // 输入代表同一会话的新一轮对话。终态会话先追加一个核心控制事件作为周期
+            // 边界，再追加外部输入；旧周期的结果仍然保留，且输入权限不会从旧结果继承。
+            runtime
+                .start_new_cycle_if_terminal(causation_id)
+                .await
+                .map_err(IngressRegistrationError::Runtime)?;
+        }
         runtime
             .record_with_provenance(
                 AgentEvent::ingress(event),
@@ -146,6 +154,19 @@ impl<'a> IngressRegistrar<'a> {
             identity_maximum_permission,
         ))
     }
+}
+
+fn is_cycle_input(event: &IngressEvent) -> bool {
+    matches!(
+        event,
+        IngressEvent::ContextReceived { context, .. }
+            if matches!(
+                context.kind,
+                ContextKind::UserMessage
+                    | ContextKind::Alert
+                    | ContextKind::SystemEvent
+            )
+    )
 }
 
 fn into_ingress_event(

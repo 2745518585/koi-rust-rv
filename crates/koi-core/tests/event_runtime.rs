@@ -167,3 +167,122 @@ fn projection_rejects_out_of_order_events() {
 
     assert!(projection.apply(&event).is_err());
 }
+
+#[tokio::test]
+async fn rejected_event_is_not_left_in_the_append_only_store() {
+    let store = MemoryEventStore::default();
+    let events = Arc::clone(&store.events);
+    let task_id = TaskId::new();
+    let mut runtime = TaskRuntime::new(store, task_id);
+    runtime
+        .record(
+            AgentEvent::control(ControlEvent::TaskCreated {
+                trigger_event_id: None,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    runtime
+        .record(AgentEvent::control(ControlEvent::TaskQueued), None)
+        .await
+        .unwrap();
+
+    let error = runtime
+        .record(
+            AgentEvent::control(ControlEvent::TaskCompleted {
+                response: Some("不应从 Queued 直接完成".into()),
+            }),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        koi_core::agent::RuntimeError::Projection(_)
+    ));
+    assert_eq!(events.lock().await.len(), 2);
+    assert_eq!(runtime.projection().last_sequence, 2);
+}
+
+#[test]
+fn queued_task_can_be_cancelled_before_a_worker_starts() {
+    use koi_core::domain::{IngressEvent, PermissionAssessment, Principal, Scope, TaskProjection};
+
+    let task_id = TaskId::new();
+    let mut projection = TaskProjection::new(task_id);
+    let events = [
+        EventEnvelope::new(
+            task_id,
+            1,
+            None,
+            AgentEvent::control(ControlEvent::TaskCreated {
+                trigger_event_id: None,
+            }),
+        ),
+        EventEnvelope::new(
+            task_id,
+            2,
+            None,
+            AgentEvent::control(ControlEvent::TaskQueued),
+        ),
+        EventEnvelope::new(
+            task_id,
+            3,
+            None,
+            AgentEvent::ingress(IngressEvent::CancellationRequested {
+                principal: Principal::new("web", "operator"),
+                scope: Scope::new("service", "order-api"),
+                assessment: PermissionAssessment::new(
+                    PermissionLevel::User,
+                    PermissionLevel::User,
+                    PermissionLevel::User,
+                ),
+                reason: "不再需要诊断".into(),
+            }),
+        ),
+    ];
+
+    for event in &events {
+        projection.apply(event).unwrap();
+    }
+
+    assert_eq!(projection.status, TaskStatus::Cancelling);
+}
+
+#[test]
+fn any_persistent_session_can_start_a_new_cycle_after_termination() {
+    use koi_core::domain::TaskProjection;
+
+    for task_id in [TaskId::MAIN, TaskId::new()] {
+        let mut projection = TaskProjection::new(task_id);
+        let events = [
+            AgentEvent::control(ControlEvent::TaskCreated {
+                trigger_event_id: None,
+            }),
+            AgentEvent::control(ControlEvent::TaskQueued),
+            AgentEvent::control(ControlEvent::TaskCancelled {
+                reason: "测试终止".into(),
+            }),
+        ];
+        for (index, payload) in events.into_iter().enumerate() {
+            projection
+                .apply(&EventEnvelope::new(
+                    task_id,
+                    (index + 1) as u64,
+                    None,
+                    payload,
+                ))
+                .unwrap();
+        }
+        let restart = EventEnvelope::new(
+            task_id,
+            4,
+            None,
+            AgentEvent::control(ControlEvent::TaskQueued),
+        );
+        projection.apply(&restart).unwrap();
+        assert_eq!(projection.status, TaskStatus::Queued);
+    }
+}

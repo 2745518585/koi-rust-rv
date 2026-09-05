@@ -172,3 +172,90 @@ async fn registrar_forces_external_tool_results_to_none_permission() {
     assert_eq!(assessment.effective_permission, PermissionLevel::None);
     assert_eq!(context.permission, PermissionLevel::None);
 }
+
+#[tokio::test]
+async fn registrar_starts_a_new_cycle_before_input_to_a_terminal_session() {
+    let mut sources = IngressSourceRegistry::default();
+    sources
+        .register(IngressSourceDefinition {
+            source: SourceName::new("qq").unwrap(),
+            maximum_permission: PermissionLevel::User,
+        })
+        .unwrap();
+    let resolver = AdminIdentityResolver;
+    let registrar = IngressRegistrar::new(&sources, &resolver);
+    let store = MemoryEventStore::default();
+    let events = Arc::clone(&store.events);
+    let task_id = TaskId::new();
+    let mut runtime = TaskRuntime::new(store, task_id);
+    runtime
+        .record(
+            AgentEvent::control(koi_core::domain::ControlEvent::TaskCreated {
+                trigger_event_id: None,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    runtime
+        .record(
+            AgentEvent::control(koi_core::domain::ControlEvent::TaskQueued),
+            None,
+        )
+        .await
+        .unwrap();
+    runtime
+        .record(
+            AgentEvent::control(koi_core::domain::ControlEvent::TaskCancelled {
+                reason: "上一轮已经结束".into(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let now = Utc::now();
+    let input = registrar
+        .register(
+            &mut runtime,
+            IngressDraft::Context {
+                context: Box::new(ContextEnvelope {
+                    schema_version: 1,
+                    kind: ContextKind::UserMessage,
+                    origin: ContextOrigin {
+                        source: "qq".into(),
+                        source_instance: "group-42".into(),
+                        native_event_id: "message-101".into(),
+                    },
+                    actor: Some(Principal::new("qq", "10001")),
+                    scope: Scope::new("qq_group", "42"),
+                    occurred_at: now,
+                    received_at: now,
+                    position: None,
+                    permission: PermissionLevel::None,
+                    payload: ContextPayload::Text {
+                        text: "继续检查服务".into(),
+                        mentions: vec!["bot".into()],
+                    },
+                    causation_id: None,
+                    content_hash: "next-cycle-input".into(),
+                }),
+                suggested_permission: PermissionLevel::User,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        runtime.projection().status,
+        koi_core::domain::TaskStatus::Queued
+    );
+    assert_eq!(input.sequence, 5);
+    let stored = events.lock().await;
+    assert_eq!(stored.len(), 5);
+    assert!(matches!(
+        stored[3].payload,
+        AgentEvent::Control(ref control)
+            if matches!(control.as_ref(), koi_core::domain::ControlEvent::TaskQueued)
+    ));
+}

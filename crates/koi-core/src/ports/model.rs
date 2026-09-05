@@ -19,6 +19,14 @@ pub trait ModelProvider: Send + Sync {
     /// 返回当前配置下 Provider 的供应商、模型 ID、协议和能力描述。
     fn descriptor(&self) -> ModelProviderDescriptor;
 
+    /// 返回模型的上下文窗口上限（Token）。
+    ///
+    /// OpenAI-compatible 网关不一定会在 `/models` 响应中提供该字段，因此未知时返回
+    /// `None`，核心会使用保守默认值并在真正调用前自行压缩上下文。
+    fn context_window_tokens(&self) -> Option<u32> {
+        None
+    }
+
     /// 启动一次模型调用并返回规范化流。
     ///
     /// 即使底层接口不支持流式输出，也应返回只包含一个 `Completed` 项的流。

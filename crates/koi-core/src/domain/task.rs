@@ -105,7 +105,30 @@ impl TaskProjection {
             });
         }
 
-        if self.status.is_terminal() {
+        // `TaskCompleted`/`TaskFailed` 等事件结束的是当前执行周期，而不一定是会话本身。
+        // 新的 `TaskQueued` 或新的上下文输入可以显式开启下一轮；任务删除则通过删除
+        // 事件流表示，删除后的任务不会再被恢复。
+        let accepting_main_terminal_audit = self.task_id.is_main()
+            && self.status.is_terminal()
+            && matches!(
+                &event.payload,
+                AgentEvent::Control(control)
+                    if matches!(control.as_ref(), ControlEvent::TaskQueued)
+                        || control.is_task_management_operation()
+            );
+        let accepting_terminal_requeue = self.status.is_terminal()
+            && matches!(
+                &event.payload,
+                AgentEvent::Control(control)
+                    if matches!(control.as_ref(), ControlEvent::TaskQueued)
+            );
+        let accepting_terminal_context =
+            self.status.is_terminal() && is_cycle_input(&event.payload);
+        if self.status.is_terminal()
+            && !accepting_main_terminal_audit
+            && !accepting_terminal_requeue
+            && !accepting_terminal_context
+        {
             return Err(TaskProjectionError::TerminalTask(self.status));
         }
 
@@ -147,14 +170,19 @@ impl TaskProjection {
                 ControlEvent::TaskCancelled { .. } => self.transition(TaskStatus::Cancelled)?,
                 ControlEvent::TaskExpired { .. } => self.transition(TaskStatus::Expired)?,
             },
-            AgentEvent::Ingress(ingress) => {
-                if matches!(
-                    ingress.as_ref(),
-                    super::IngressEvent::CancellationRequested { .. }
-                ) {
+            AgentEvent::Ingress(ingress) => match ingress.as_ref() {
+                super::IngressEvent::ContextReceived { context, .. } => {
+                    // 兼容旧版本曾经直接把新输入追加到终态任务的事件流；读取这类流时
+                    // 将该输入视为隐式的新周期。新代码会在输入前显式写入 TaskQueued。
+                    if self.status.is_terminal() && is_cycle_context_kind(context.kind) {
+                        self.transition(TaskStatus::Queued)?;
+                    }
+                }
+                super::IngressEvent::CancellationRequested { .. } => {
                     self.transition(TaskStatus::Cancelling)?;
                 }
-            }
+                super::IngressEvent::ApprovalSubmitted { .. } => {}
+            },
             AgentEvent::Model(model) => match model.as_ref() {
                 super::ModelEvent::CallStarted { .. } => self.transition(TaskStatus::Running)?,
                 super::ModelEvent::Completed { usage, .. } => self.usage.add(usage),
@@ -181,47 +209,44 @@ impl TaskProjection {
             return Ok(());
         }
 
-        let allowed = matches!(
-            (self.status, next),
-            (TaskStatus::New, TaskStatus::Created)
-                | (
-                    TaskStatus::Created,
-                    TaskStatus::Queued | TaskStatus::Running | TaskStatus::Cancelled
-                )
-                | (
-                    TaskStatus::Queued,
-                    TaskStatus::Running | TaskStatus::Cancelled | TaskStatus::Expired
-                )
-                | (
-                    TaskStatus::Running,
-                    TaskStatus::WaitingApproval
-                        | TaskStatus::Paused
-                        | TaskStatus::Cancelling
-                        | TaskStatus::Completed
-                        | TaskStatus::Failed
-                        | TaskStatus::Cancelled
-                        | TaskStatus::Expired
-                )
-                | (
-                    TaskStatus::WaitingApproval,
-                    TaskStatus::Running
-                        | TaskStatus::Paused
-                        | TaskStatus::Cancelling
-                        | TaskStatus::Cancelled
-                        | TaskStatus::Expired
-                )
-                | (
-                    TaskStatus::Paused,
-                    TaskStatus::Running
-                        | TaskStatus::Cancelling
-                        | TaskStatus::Cancelled
-                        | TaskStatus::Expired
-                )
-                | (
-                    TaskStatus::Cancelling,
-                    TaskStatus::Cancelled | TaskStatus::Failed | TaskStatus::Expired
-                )
-        );
+        let allowed = (self.status.is_terminal() && next == TaskStatus::Queued)
+            || matches!(
+                (self.status, next),
+                (TaskStatus::New, TaskStatus::Created)
+                    | (
+                        TaskStatus::Created,
+                        TaskStatus::Queued | TaskStatus::Running | TaskStatus::Cancelled
+                    )
+                    | (
+                        TaskStatus::Queued | TaskStatus::Paused,
+                        TaskStatus::Running
+                            | TaskStatus::Cancelling
+                            | TaskStatus::Cancelled
+                            | TaskStatus::Expired
+                    )
+                    | (
+                        TaskStatus::Running,
+                        TaskStatus::WaitingApproval
+                            | TaskStatus::Paused
+                            | TaskStatus::Cancelling
+                            | TaskStatus::Completed
+                            | TaskStatus::Failed
+                            | TaskStatus::Cancelled
+                            | TaskStatus::Expired
+                    )
+                    | (
+                        TaskStatus::WaitingApproval,
+                        TaskStatus::Running
+                            | TaskStatus::Paused
+                            | TaskStatus::Cancelling
+                            | TaskStatus::Cancelled
+                            | TaskStatus::Expired
+                    )
+                    | (
+                        TaskStatus::Cancelling,
+                        TaskStatus::Cancelled | TaskStatus::Failed | TaskStatus::Expired
+                    )
+            );
 
         if !allowed {
             return Err(TaskProjectionError::InvalidTransition {
@@ -233,6 +258,27 @@ impl TaskProjection {
         self.status = next;
         Ok(())
     }
+}
+
+fn is_cycle_input(payload: &AgentEvent) -> bool {
+    matches!(
+        payload,
+        AgentEvent::Ingress(ingress)
+            if matches!(
+                ingress.as_ref(),
+                super::IngressEvent::ContextReceived { context, .. }
+                    if is_cycle_context_kind(context.kind)
+            )
+    )
+}
+
+fn is_cycle_context_kind(kind: super::ContextKind) -> bool {
+    matches!(
+        kind,
+        super::ContextKind::UserMessage
+            | super::ContextKind::Alert
+            | super::ContextKind::SystemEvent
+    )
 }
 
 #[derive(Debug, Error)]

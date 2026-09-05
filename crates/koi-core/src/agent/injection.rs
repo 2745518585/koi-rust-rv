@@ -226,6 +226,13 @@ fn validate_ingress_creator(
         EventSource::System
             if kind == ContextKind::ToolResult
                 && permission == crate::domain::PermissionLevel::None => {}
+        // 主会话通过 task.input 委托给子任务的输入由模型触发，但权限快照只能由核心
+        // 根据 authority_parent_event_id 计算；模型来源的输入必须带父事件且具备可授权
+        // 权限，不能凭空伪造普通用户输入。
+        EventSource::Model
+            if matches!(kind, ContextKind::UserMessage | ContextKind::Alert)
+                && event.provenance.authority_parent_event_id.is_some()
+                && permission.can_authorize() => {}
         EventSource::System | EventSource::Model | EventSource::Tool => {
             return Err(InputInjectionError::InvalidIngressCreator(event.id));
         }

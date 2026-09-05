@@ -2,7 +2,7 @@ use chrono::Utc;
 use thiserror::Error;
 
 use crate::domain::{
-    AgentEvent, EventEnvelope, EventId, EventProvenance, TaskId, TaskProjection,
+    AgentEvent, ControlEvent, EventEnvelope, EventId, EventProvenance, TaskId, TaskProjection,
     TaskProjectionError,
 };
 use crate::ports::{EventStore, EventStoreError};
@@ -60,13 +60,34 @@ where
         Ok(self.store.load_task(self.projection.task_id).await?)
     }
 
+    /// 如果当前执行周期已经结束，则为同一个会话开启新的排队周期。
+    ///
+    /// `TaskId` 表示会话而不是单次模型运行。外部新输入和主会话委托输入在写入前都应
+    /// 调用该方法；它会留下一个明确的 `TaskQueued` 周期边界，旧周期的终态结果仍然
+    /// 保留在事件流中。
+    ///
+    /// # Errors
+    ///
+    /// 当新的周期事件无法持久化或违反事件投影规则时返回错误。
+    pub async fn start_new_cycle_if_terminal(
+        &mut self,
+        causation_id: Option<EventId>,
+    ) -> Result<Option<EventEnvelope>, RuntimeError> {
+        if !self.projection.status.is_terminal() {
+            return Ok(None);
+        }
+        self.record(AgentEvent::control(ControlEvent::TaskQueued), causation_id)
+            .await
+            .map(Some)
+    }
+
     /// 取得底层事件存储的所有权，常用于完成任务后重建或迁移运行时。
     #[must_use]
     pub fn into_store(self) -> S {
         self.store
     }
 
-    /// 先持久化事件，再将其合并到内存中的状态投影。
+    /// 先验证事件投影，再持久化并合并到内存中的状态投影。
     ///
     /// # Errors
     ///
@@ -107,8 +128,13 @@ where
             payload,
         };
 
+        // 事件存储通常只有追加语义。先在副本投影上验证，避免底层 append 成功后才发现
+        // 终态任务或状态迁移非法，进而留下无法恢复的脏事件流。
+        let mut next_projection = self.projection.clone();
+        next_projection.apply(&event)?;
+
         match self.store.append(&event).await {
-            Ok(()) => self.projection.apply(&event)?,
+            Ok(()) => self.projection = next_projection,
             Err(error) if is_sequence_conflict(&error) => {
                 // 外部来源可能在 Agent 思考期间追加了输入。用持久化事件流刷新投影后重试
                 // 一次，避免长时间模型调用与来源写入之间产生不可恢复的序号竞争。
@@ -123,8 +149,10 @@ where
                     provenance: event.provenance.clone(),
                     payload: event.payload.clone(),
                 };
+                next_projection = self.projection.clone();
+                next_projection.apply(&event)?;
                 self.store.append(&event).await?;
-                self.projection.apply(&event)?;
+                self.projection = next_projection;
             }
             Err(error) => return Err(error.into()),
         }

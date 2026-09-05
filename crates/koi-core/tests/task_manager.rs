@@ -1,7 +1,11 @@
 use std::sync::Arc;
 
 use koi_core::agent::{RuntimeError, TaskManager, TaskManagerError, TaskRuntime};
-use koi_core::domain::{AgentEvent, ControlEvent, TaskId, TaskOperation, TaskStatus};
+use koi_core::domain::{
+    AgentEvent, ContextEnvelope, ContextKind, ContextOrigin, ContextPayload, ControlEvent,
+    EventProvenance, EventSource, IngressEvent, PermissionAssessment, PermissionLevel, Principal,
+    Scope, TaskId, TaskOperation, TaskStatus,
+};
 use koi_core::ports::{EventStore, InMemoryEventStore};
 
 #[tokio::test]
@@ -72,6 +76,179 @@ async fn child_cannot_create_management_control_events_or_target_main() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn main_can_delegate_input_to_child_with_external_authority_parent() {
+    let shared = Arc::new(InMemoryEventStore::default());
+    let manager = TaskManager::new(Arc::new(Arc::clone(&shared)));
+    let mut main = TaskRuntime::new(Arc::clone(&shared), TaskId::MAIN);
+    main.record(
+        AgentEvent::control(ControlEvent::TaskCreated {
+            trigger_event_id: None,
+        }),
+        None,
+    )
+    .await
+    .unwrap();
+    main.record(AgentEvent::control(ControlEvent::TaskQueued), None)
+        .await
+        .unwrap();
+
+    let mut created = manager.request_create_child(&mut main, None).await.unwrap();
+    created
+        .runtime
+        .record(
+            AgentEvent::control(ControlEvent::TaskCreated {
+                trigger_event_id: Some(created.accepted_event_id),
+            }),
+            Some(created.accepted_event_id),
+        )
+        .await
+        .unwrap();
+    created
+        .runtime
+        .record(AgentEvent::control(ControlEvent::TaskQueued), None)
+        .await
+        .unwrap();
+
+    let now = chrono::Utc::now();
+    let assessment = PermissionAssessment::new(
+        PermissionLevel::User,
+        PermissionLevel::User,
+        PermissionLevel::User,
+    );
+    let parent = main
+        .record_with_provenance(
+            AgentEvent::ingress(IngressEvent::ContextReceived {
+                context: Box::new(ContextEnvelope {
+                    schema_version: 1,
+                    kind: ContextKind::UserMessage,
+                    origin: ContextOrigin {
+                        source: "qq".into(),
+                        source_instance: "group-1".into(),
+                        native_event_id: "message-1".into(),
+                    },
+                    actor: Some(Principal::new("qq", "10001")),
+                    scope: Scope::new("qq_group", "1"),
+                    occurred_at: now,
+                    received_at: now,
+                    position: None,
+                    permission: PermissionLevel::User,
+                    payload: ContextPayload::Text {
+                        text: "请调查部署失败".into(),
+                        mentions: vec!["bot".into()],
+                    },
+                    causation_id: None,
+                    content_hash: "parent-input".into(),
+                }),
+                assessment,
+            }),
+            None,
+            EventProvenance {
+                creator: EventSource::External(koi_core::domain::SourceName::new("qq").unwrap()),
+                direct_permission: Some(PermissionLevel::User),
+                authority_parent_event_id: None,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let input_id = manager
+        .request_input_child(
+            &mut main,
+            created.task_id,
+            "请根据上面的请求调查部署失败并报告证据".into(),
+            parent.id,
+            PermissionLevel::User,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let child_events = shared.load_task(created.task_id).await.unwrap();
+    let input = child_events
+        .iter()
+        .find(|event| event.id == input_id)
+        .expect("子任务输入事件应已持久化");
+    assert_eq!(input.provenance.creator, EventSource::Model);
+    assert_eq!(input.provenance.authority_parent_event_id, Some(parent.id));
+    let AgentEvent::Ingress(ingress) = &input.payload else {
+        panic!("子任务投递事件必须是输入事件");
+    };
+    let IngressEvent::ContextReceived {
+        context,
+        assessment,
+    } = ingress.as_ref()
+    else {
+        panic!("子任务投递事件必须是上下文输入");
+    };
+    assert_eq!(context.kind, ContextKind::UserMessage);
+    assert_eq!(context.permission, PermissionLevel::User);
+    assert_eq!(assessment.effective_permission, PermissionLevel::User);
+
+    let injected = koi_core::agent::InputInjector::default()
+        .inject(created.task_id, input, PermissionLevel::User)
+        .unwrap();
+    assert_eq!(injected.event_id, input_id);
+    assert_eq!(injected.role, koi_core::domain::ModelInputRole::User);
+    assert_eq!(injected.permission, PermissionLevel::User);
+
+    // 当前执行周期结束后，向同一个子任务再次投递输入应开启新的周期，而不是创建一个
+    // 新会话；旧周期的完成事件仍保留在事件流中。
+    let mut finished_child = TaskRuntime::recover(Arc::clone(&shared), created.task_id)
+        .await
+        .unwrap();
+    finished_child
+        .record(AgentEvent::control(ControlEvent::TaskResumed), None)
+        .await
+        .unwrap();
+    finished_child
+        .record(
+            AgentEvent::control(ControlEvent::TaskCompleted {
+                response: Some("第一轮完成".into()),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    let second_input_id = manager
+        .request_input_child(
+            &mut main,
+            created.task_id,
+            "请继续检查刚才的服务".into(),
+            parent.id,
+            PermissionLevel::User,
+            None,
+        )
+        .await
+        .unwrap();
+    let child_events = shared.load_task(created.task_id).await.unwrap();
+    assert!(child_events.iter().any(|event| {
+        event.sequence > 5
+            && matches!(
+                &event.payload,
+                AgentEvent::Control(control)
+                    if matches!(control.as_ref(), ControlEvent::TaskQueued)
+            )
+    }));
+    assert_eq!(
+        child_events
+            .iter()
+            .filter(|event| event.id == second_input_id)
+            .count(),
+        1
+    );
+    assert_eq!(
+        TaskRuntime::recover(Arc::clone(&shared), created.task_id)
+            .await
+            .unwrap()
+            .projection()
+            .status,
+        TaskStatus::Queued
+    );
+}
+
+#[tokio::test]
 async fn completed_child_result_is_delivered_as_tool_event_to_main() {
     let store = Arc::new(InMemoryEventStore::default());
     let manager = TaskManager::new(Arc::new(Arc::clone(&store)));
@@ -127,6 +304,58 @@ async fn completed_child_result_is_delivered_as_tool_event_to_main() {
             .iter()
             .all(|event| !matches!(event.payload, AgentEvent::Tool(_)))
     );
+}
+
+#[tokio::test]
+async fn persisted_children_can_be_listed_and_inspected_without_active_leases() {
+    let store = Arc::new(InMemoryEventStore::default());
+    let manager = TaskManager::new(Arc::clone(&store));
+    let mut main = manager.open_main().await.unwrap();
+    let mut child = manager.create_child(&mut main, None).await.unwrap();
+    let child_id = child.task_id();
+
+    child
+        .runtime_mut()
+        .record(
+            AgentEvent::control(ControlEvent::TaskCreated {
+                trigger_event_id: None,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    child
+        .runtime_mut()
+        .record(AgentEvent::control(ControlEvent::TaskQueued), None)
+        .await
+        .unwrap();
+    child
+        .runtime_mut()
+        .record(AgentEvent::control(ControlEvent::TaskResumed), None)
+        .await
+        .unwrap();
+    child
+        .runtime_mut()
+        .record(
+            AgentEvent::control(ControlEvent::TaskCompleted {
+                response: Some("已确认服务恢复".into()),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    drop(child);
+
+    let summaries = manager.list_child_tasks().await.unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].task_id, child_id);
+    assert_eq!(summaries[0].status, TaskStatus::Completed);
+    assert!(summaries[0].has_result);
+
+    let details = manager.inspect_child_task(child_id).await.unwrap();
+    assert_eq!(details.summary, summaries[0]);
+    assert!(details.latest_result_event_id.is_some());
+    assert_eq!(details.latest_result.as_deref(), Some("已确认服务恢复"));
 }
 
 #[tokio::test]

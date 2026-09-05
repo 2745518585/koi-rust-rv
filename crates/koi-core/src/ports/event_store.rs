@@ -42,6 +42,18 @@ pub trait EventStore: Send + Sync {
         Err(EventStoreError::new("事件存储不支持任务事件读取"))
     }
 
+    /// 列出当前持久化的任务事件流。
+    ///
+    /// 任务管理器需要通过这个接口发现重启前创建的任务，而不能只依赖当前进程中
+    /// 的活动租约。仅支持追加、但没有任务枚举能力的旧适配器会显式返回错误。
+    ///
+    /// # Errors
+    ///
+    /// 当存储不支持任务枚举或枚举失败时返回错误。
+    async fn list_task_ids(&self) -> Result<Vec<TaskId>, EventStoreError> {
+        Err(EventStoreError::new("事件存储不支持任务枚举"))
+    }
+
     /// 读取任务内的单条事件。
     ///
     /// # Errors
@@ -57,6 +69,22 @@ pub trait EventStore: Send + Sync {
             .await?
             .into_iter()
             .find(|event| event.id == event_id))
+    }
+
+    /// 按全局事件 ID读取事件。
+    ///
+    /// 权限父事件通常位于当前任务内，但主会话委托给子任务的输入可以跨任务引用主
+    /// 会话事件。支持跨任务授权溯源的存储应实现此方法；不支持的适配器会显式失败，
+    /// 核心随后拒绝该授权链。
+    ///
+    /// # Errors
+    ///
+    /// 当存储不支持全局事件读取或读取失败时返回错误。
+    async fn load_event_any(
+        &self,
+        _event_id: EventId,
+    ) -> Result<Option<EventEnvelope>, EventStoreError> {
+        Err(EventStoreError::new("事件存储不支持按全局 ID读取事件"))
     }
 
     /// 删除一个任务的全部事件。
@@ -86,12 +114,23 @@ where
         self.as_ref().load_task(task_id).await
     }
 
+    async fn list_task_ids(&self) -> Result<Vec<TaskId>, EventStoreError> {
+        self.as_ref().list_task_ids().await
+    }
+
     async fn load_event(
         &self,
         task_id: TaskId,
         event_id: EventId,
     ) -> Result<Option<EventEnvelope>, EventStoreError> {
         self.as_ref().load_event(task_id, event_id).await
+    }
+
+    async fn load_event_any(
+        &self,
+        event_id: EventId,
+    ) -> Result<Option<EventEnvelope>, EventStoreError> {
+        self.as_ref().load_event_any(event_id).await
     }
 
     async fn delete_task(&self, task_id: TaskId) -> Result<(), EventStoreError> {
@@ -163,6 +202,31 @@ impl EventStore for InMemoryEventStore {
             .lock()
             .map_err(|_| EventStoreError::new("内存事件存储锁已中毒"))?;
         Ok(events.get(&task_id).cloned().unwrap_or_default())
+    }
+
+    async fn list_task_ids(&self) -> Result<Vec<TaskId>, EventStoreError> {
+        let events = self
+            .events
+            .lock()
+            .map_err(|_| EventStoreError::new("内存事件存储锁已中毒"))?;
+        let mut task_ids = events.keys().copied().collect::<Vec<_>>();
+        task_ids.sort_by_cached_key(ToString::to_string);
+        Ok(task_ids)
+    }
+
+    async fn load_event_any(
+        &self,
+        event_id: EventId,
+    ) -> Result<Option<EventEnvelope>, EventStoreError> {
+        let events = self
+            .events
+            .lock()
+            .map_err(|_| EventStoreError::new("内存事件存储锁已中毒"))?;
+        Ok(events
+            .values()
+            .flat_map(|task_events| task_events.iter())
+            .find(|event| event.id == event_id)
+            .cloned())
     }
 
     async fn delete_task(&self, task_id: TaskId) -> Result<(), EventStoreError> {

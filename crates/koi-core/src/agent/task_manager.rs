@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use chrono::Utc;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -9,8 +10,9 @@ use crate::agent::{
     RuntimeRecoveryError, TaskRuntime,
 };
 use crate::domain::{
-    AgentEvent, ControlEvent, EventEnvelope, EventId, EventProvenance, TaskId, TaskOperation,
-    ToolEvent, ToolResult,
+    AgentEvent, ContextEnvelope, ContextKind, ContextOrigin, ContextPayload, ControlEvent,
+    EventEnvelope, EventId, EventProvenance, IngressEvent, PermissionAssessment, PermissionLevel,
+    Scope, TaskId, TaskOperation, ToolEvent, ToolResult,
 };
 use crate::ports::EventStore;
 
@@ -231,6 +233,122 @@ impl<S: EventStore> TaskManager<S> {
             accepted_event_id: accepted.id,
             runtime: TaskRuntime::new(Arc::clone(&self.store), task_id),
         })
+    }
+
+    /// 通过主会话事件流向子任务投递一条输入事件。
+    ///
+    /// 输入事件由模型发起，但不获得模型自身的权限；它必须引用主会话中的直接外部
+    /// 输入作为授权父节点。核心重新读取并核对该父节点的已持久化权限，然后将核定的
+    /// 权限快照写入子任务输入，事件本身仍以 `Model` 来源持久化。子任务后续审查工具
+    /// 调用时，会从这条输入继续沿 `authority_parent_event_id` 跨任务追溯到主会话输入。
+    ///
+    /// # Errors
+    ///
+    /// 当目标为主会话、父事件不存在或不具备直接外部输入权限、权限快照不一致、目标
+    /// 子任务不存在或事件流无法写入时返回错误。已结束的子任务会在追加输入前开启
+    /// 一个新的排队周期，因此仍可作为持久化会话继续使用。
+    pub async fn request_input_child(
+        &self,
+        main: &mut TaskRuntime<S>,
+        task_id: TaskId,
+        message: String,
+        authority_parent_event_id: EventId,
+        effective_permission: PermissionLevel,
+        causation_id: Option<EventId>,
+    ) -> Result<EventId, TaskManagerError> {
+        let request = self
+            .record_request(
+                main,
+                TaskOperation::InputChild {
+                    task_id,
+                    message: message.clone(),
+                    authority_parent_event_id,
+                },
+                causation_id,
+            )
+            .await?;
+        if task_id.is_main() {
+            return self
+                .reject(main, request.id, "任务管理接口不能向主会话投递输入")
+                .await;
+        }
+        if !effective_permission.can_authorize() {
+            return self
+                .reject(main, request.id, "子任务输入必须具有有效的授权父事件")
+                .await;
+        }
+
+        let main_events = main.load_events().await?;
+        let Some(parent_permission) = main_events
+            .iter()
+            .find(|event| event.id == authority_parent_event_id)
+            .and_then(direct_external_input_permission)
+        else {
+            return self
+                .reject(
+                    main,
+                    request.id,
+                    "授权父事件必须是主会话中未过期的直接外部用户输入或告警",
+                )
+                .await;
+        };
+        if parent_permission != effective_permission {
+            return self
+                .reject(
+                    main,
+                    request.id,
+                    format!(
+                        "子任务输入的权限快照与授权父事件不一致：{effective_permission:?} != {parent_permission:?}"
+                    ),
+                )
+                .await;
+        }
+
+        let mut child = match TaskRuntime::recover(Arc::clone(&self.store), task_id).await {
+            Ok(child) => child,
+            Err(error) => return self.reject(main, request.id, error.to_string()).await,
+        };
+        if let Err(error) = child.start_new_cycle_if_terminal(Some(request.id)).await {
+            return self.reject(main, request.id, error.to_string()).await;
+        }
+
+        let now = Utc::now();
+        let input = child
+            .record_with_provenance(
+                AgentEvent::ingress(IngressEvent::ContextReceived {
+                    context: Box::new(ContextEnvelope {
+                        schema_version: 1,
+                        kind: ContextKind::UserMessage,
+                        origin: ContextOrigin {
+                            source: "internal-task".into(),
+                            source_instance: "main-session".into(),
+                            native_event_id: request.id.to_string(),
+                        },
+                        actor: None,
+                        scope: Scope::new("task", task_id.to_string()),
+                        occurred_at: now,
+                        received_at: now,
+                        position: None,
+                        permission: effective_permission,
+                        payload: ContextPayload::Text {
+                            text: message.clone(),
+                            mentions: Vec::new(),
+                        },
+                        causation_id: Some(request.id),
+                        content_hash: format!("task-input:{request}", request = request.id),
+                    }),
+                    assessment: PermissionAssessment::new(
+                        effective_permission,
+                        effective_permission,
+                        effective_permission,
+                    ),
+                }),
+                Some(request.id),
+                EventProvenance::model(Some(authority_parent_event_id)),
+            )
+            .await?;
+        self.accept(main, request.id, task_id).await?;
+        Ok(input.id)
     }
 
     /// 通过主会话事件流为子任务设置显示名称。
@@ -495,6 +613,81 @@ impl<S: EventStore> TaskManager<S> {
         }))
     }
 
+    /// 列出事件存储中已经存在的所有子任务。
+    ///
+    /// 这个查询故意不依赖当前进程中的活动租约，因此服务重启后仍能发现历史任务。
+    /// 主会话不会出现在结果中；删除任务后其事件流也不会再被列出。
+    ///
+    /// # Errors
+    ///
+    /// 当任务枚举、事件读取或任务投影恢复失败时返回错误。
+    pub async fn list_child_tasks(&self) -> Result<Vec<TaskSummary>, TaskManagerError> {
+        let mut summaries = Vec::new();
+        for task_id in self.store.list_task_ids().await? {
+            if task_id.is_main() {
+                continue;
+            }
+            let events = self.store.load_task(task_id).await?;
+            if events.is_empty() {
+                continue;
+            }
+            let runtime = TaskRuntime::recover(Arc::clone(&self.store), task_id).await?;
+            let status = runtime.projection().status;
+            let has_result = status.is_terminal() && child_outcome_summary(&events).is_some();
+            summaries.push(TaskSummary {
+                task_id,
+                status,
+                title: runtime.projection().title.clone(),
+                last_sequence: runtime.projection().last_sequence,
+                has_result,
+            });
+        }
+        summaries.sort_by_key(|summary| summary.task_id.to_string());
+        Ok(summaries)
+    }
+
+    /// 读取一个已经存在的子任务及其当前执行周期的最终结果。
+    ///
+    /// 只有当前状态处于终态时才暴露最终结果。任务重新排队后，上一轮的旧结果不会被
+    /// 误报成当前任务结果；调用方可以等待任务再次进入终态后重新查询。
+    ///
+    /// # Errors
+    ///
+    /// 当目标不是已存在的子任务，或事件读取、任务投影恢复失败时返回错误。
+    pub async fn inspect_child_task(
+        &self,
+        task_id: TaskId,
+    ) -> Result<TaskDetails, TaskManagerError> {
+        if task_id.is_main() {
+            return Err(TaskManagerError::OperationRejected(
+                "任务查询接口不能查询主会话".into(),
+            ));
+        }
+        let events = self.store.load_task(task_id).await?;
+        if events.is_empty() {
+            return Err(TaskManagerError::OperationRejected(format!(
+                "目标子任务不存在：{task_id}"
+            )));
+        }
+        let runtime = TaskRuntime::recover(Arc::clone(&self.store), task_id).await?;
+        let status = runtime.projection().status;
+        let outcome = status
+            .is_terminal()
+            .then(|| child_outcome_summary(&events))
+            .flatten();
+        Ok(TaskDetails {
+            summary: TaskSummary {
+                task_id,
+                status,
+                title: runtime.projection().title.clone(),
+                last_sequence: runtime.projection().last_sequence,
+                has_result: outcome.is_some(),
+            },
+            latest_result_event_id: outcome.as_ref().map(|(event_id, _)| *event_id),
+            latest_result: outcome.map(|(_, summary)| summary),
+        })
+    }
+
     /// 只读查询当前进程活动任务。
     ///
     /// # Errors
@@ -670,6 +863,24 @@ pub struct ActiveTask {
     pub cancellation_requested: bool,
 }
 
+/// 面向主会话任务发现的持久化任务摘要。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskSummary {
+    pub task_id: TaskId,
+    pub status: crate::domain::TaskStatus,
+    pub title: Option<String>,
+    pub last_sequence: u64,
+    pub has_result: bool,
+}
+
+/// 面向主会话任务查询的任务详情。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskDetails {
+    pub summary: TaskSummary,
+    pub latest_result_event_id: Option<EventId>,
+    pub latest_result: Option<String>,
+}
+
 /// `TaskManager::request_create_child` 的返回值。
 pub struct CreatedChild<S: EventStore> {
     pub task_id: TaskId,
@@ -697,6 +908,42 @@ fn is_manageable_control(control: &ControlEvent) -> bool {
             | ControlEvent::ModelSelected { .. }
             | ControlEvent::MinimumControlPermissionChanged { .. }
     )
+}
+
+/// 取得主会话中可作为子任务输入授权父节点的直接外部输入权限。
+///
+/// 这里只接受核心已经登记并持久化的用户消息或告警。控制、模型、工具和系统事件
+/// 即使携带较高的内部权限，也不能借此给子任务输入授权。
+fn direct_external_input_permission(event: &EventEnvelope) -> Option<PermissionLevel> {
+    if event
+        .provenance
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= Utc::now())
+        || !matches!(
+            event.provenance.creator,
+            crate::domain::EventSource::External(_)
+        )
+    {
+        return None;
+    }
+    let AgentEvent::Ingress(ingress) = &event.payload else {
+        return None;
+    };
+    let IngressEvent::ContextReceived {
+        context,
+        assessment,
+    } = ingress.as_ref()
+    else {
+        return None;
+    };
+    if !matches!(context.kind, ContextKind::UserMessage | ContextKind::Alert)
+        || context.permission != assessment.effective_permission
+        || assessment.effective_permission != event.provenance.direct_permission?
+        || !assessment.effective_permission.can_authorize()
+    {
+        return None;
+    }
+    Some(assessment.effective_permission)
 }
 
 /// 从子任务事件流中提取终止结论摘要。
