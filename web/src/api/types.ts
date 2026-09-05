@@ -68,6 +68,8 @@ export interface TaskEvent {
   kind: EventKind;
   title: string;
   summary: string;
+  /** 事件正文；存在时可在事件流中展开。 */
+  detail?: string | null;
   permission: PermissionLevel;
   /** 所属工具调用的原始 Proposed 事件 ID；非工具事件为 null/未提供。 */
   toolProposalEventId?: string | null;

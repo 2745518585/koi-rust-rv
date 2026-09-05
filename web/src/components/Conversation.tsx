@@ -21,7 +21,7 @@ import type { ApprovalRequest, ModelSelection, PermissionLevel, TaskEvent, TaskS
 import { useI18n } from "../i18n";
 import { groupConversationEvents, type ConversationFeedItem } from "../lib/events";
 import { formatRelative, scopeLabel } from "../lib/format";
-import { EmptyState, EventIcon, EventLine, PermissionSelector, StatusBadge } from "../lib/ui";
+import { EmptyState, EventIcon, EventLine, EventSummary, PermissionSelector, StatusBadge } from "../lib/ui";
 import { ApprovalCard } from "./ApprovalCard";
 
 type FeedMode = "conversation" | "events";
@@ -269,7 +269,10 @@ export function Conversation({
   }
 
   const pendingForTask = approvals.filter(
-    (approval) => approval.taskId === task.taskId && approval.status === "Pending",
+    (approval) =>
+      approval.taskId === task.taskId
+      && approval.status === "Pending"
+      && !["Completed", "Cancelled", "Failed", "Expired"].includes(task.status),
   );
   const terminal = ["Completed", "Cancelled", "Failed", "Expired"].includes(task.status);
   const modelValue = task.selectedModel
@@ -517,7 +520,7 @@ function ToolEventGroupLine({ events }: { events: TaskEvent[] }) {
             <span>{event.sequence.toString().padStart(3, "0")}</span>
             <div>
               <strong>{event.title}</strong>
-              <p>{event.summary}</p>
+              <EventSummary event={event} />
             </div>
           </div>
         ))}

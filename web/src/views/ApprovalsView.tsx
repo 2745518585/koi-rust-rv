@@ -45,8 +45,15 @@ export function ApprovalsView({
         noHistoryHint: "处理过的请求会保留在这里。",
       };
 
-  const pending = approvals.filter((item) => item.status === "Pending");
-  const history = approvals.filter((item) => item.status !== "Pending");
+  // 已终态任务上的待处理请求无法再写入审批事件，界面将其视为过期并隐藏，避免用户
+  // 点击后得到无法恢复的提交失败提示。
+  const visibleApprovals = approvals.filter((approval) => {
+    const task = tasks.find((item) => item.taskId === approval.taskId);
+    return approval.status !== "Expired"
+      && !["Completed", "Cancelled", "Failed", "Expired"].includes(task?.status ?? "");
+  });
+  const pending = visibleApprovals.filter((item) => item.status === "Pending");
+  const history = visibleApprovals.filter((item) => item.status !== "Pending");
 
   return (
     <section className="panel">

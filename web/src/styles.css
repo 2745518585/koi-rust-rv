@@ -444,6 +444,9 @@ textarea { resize: none; }
 .event-line-top strong { font-size: 12px; font-weight: 600; }
 .event-line-top time { margin-left: auto; flex-shrink: 0; color: var(--faint); font-family: var(--mono); font-size: 9.5px; }
 .event-line-main p { margin: 3px 0 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.event-summary { margin: 3px 0 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.event-summary summary { cursor: pointer; }
+.event-summary pre { max-height: 280px; margin: 7px 0 0; padding: 9px 10px; overflow: auto; border: 1px solid var(--line-soft); border-radius: 7px; color: #42515a; background: #f8fafb; font-family: var(--mono); font-size: 10.5px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
 .event-line-meta { color: var(--faint); font-family: var(--mono); font-size: 9.5px; white-space: nowrap; padding-top: 3px; }
 .event-line-group { border-bottom: 1px solid var(--line-soft); }
 .event-line-group:last-child { border-bottom: 0; }

@@ -333,6 +333,8 @@ pub struct EventDto {
     pub kind: String,
     pub title: String,
     pub summary: String,
+    /// 可展开查看的完整展示文本。`summary` 保持适合事件列表快速扫描的长度。
+    pub detail: Option<String>,
     pub permission: String,
     /// 工具生命周期事件所属的原始 `ToolEvent::Proposed` 事件 ID。
     ///

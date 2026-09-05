@@ -147,7 +147,7 @@ export function EventLine({
           </strong>
           <time>{formatRelative(event.occurredAt, locale)}</time>
         </div>
-        <p>{event.summary}</p>
+        <EventSummary event={event} />
       </div>
       <span className="event-line-meta">
         {event.source} · {event.permission}
@@ -160,6 +160,18 @@ export function EventLine({
     </button>
   ) : (
     <article className="event-line">{content}</article>
+  );
+}
+
+/** 长事件默认显示摘要，展开后展示服务端提供的完整正文。 */
+export function EventSummary({ event }: { event: TaskEvent }) {
+  const detail = event.detail?.trim();
+  if (!detail || detail === event.summary) return <p>{event.summary}</p>;
+  return (
+    <details className="event-summary">
+      <summary>{event.summary}</summary>
+      <pre>{detail}</pre>
+    </details>
   );
 }
 

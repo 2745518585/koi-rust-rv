@@ -1117,11 +1117,73 @@ fn event_dto(event: &EventEnvelope, events: &[EventEnvelope]) -> EventDto {
         kind: kind.into(),
         title,
         summary,
+        detail: event_detail(&event.payload),
         permission: event
             .provenance
             .direct_permission
             .map_or_else(|| "None".into(), permission_name),
         tool_proposal_event_id: tool_proposal_event_id(event, events),
+    }
+}
+
+/// 为有用户可读正文的事件保留完整文本，供 Web 审计界面按需展开。
+/// 事件摘要仍受长度限制，避免长输出淹没正常事件流。
+fn event_detail(event: &AgentEvent) -> Option<String> {
+    match event {
+        AgentEvent::Ingress(ingress) => match ingress.as_ref() {
+            IngressEvent::ContextReceived { context, .. } => match &context.payload {
+                ContextPayload::Text { text, .. } => Some(text.clone()),
+                ContextPayload::Alert { summary, .. } => Some(summary.clone()),
+                ContextPayload::Structured(value) => serde_json::to_string_pretty(value).ok(),
+            },
+            IngressEvent::CancellationRequested { reason, .. } => Some(reason.clone()),
+            IngressEvent::ApprovalSubmitted { .. } => None,
+        },
+        AgentEvent::Control(control) => match control.as_ref() {
+            ControlEvent::TaskPaused { reason }
+            | ControlEvent::TaskNamed { name: reason }
+            | ControlEvent::TaskCancelled { reason }
+            | ControlEvent::TaskFailed { reason }
+            | ControlEvent::TaskExpired { reason }
+            | ControlEvent::TaskOperationRejected { reason, .. } => Some(reason.clone()),
+            ControlEvent::TaskCompleted { response } => response.clone(),
+            _ => None,
+        },
+        AgentEvent::Model(model) => match model.as_ref() {
+            koi_core::domain::ModelEvent::Delta { content, .. } => Some(content.clone()),
+            koi_core::domain::ModelEvent::Completed { outputs, .. } => {
+                let text = outputs
+                    .iter()
+                    .filter_map(|output| match output {
+                        koi_core::domain::ModelOutput::Text { text } => Some(text.as_str()),
+                        koi_core::domain::ModelOutput::Refusal { reason } => Some(reason.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (!text.trim().is_empty()).then_some(text)
+            }
+            koi_core::domain::ModelEvent::Failed { error, .. } => Some(error.clone()),
+            koi_core::domain::ModelEvent::CallStarted { .. } => None,
+        },
+        AgentEvent::Tool(tool) => match tool.as_ref() {
+            ToolEvent::Proposed { tool_call } => {
+                serde_json::to_string_pretty(&tool_call.arguments).ok()
+            }
+            ToolEvent::Output { content, .. } => Some(content.clone()),
+            ToolEvent::Finished { result, .. } => {
+                if result.data.is_null() {
+                    Some(result.summary.clone())
+                } else {
+                    serde_json::to_string_pretty(&result.data)
+                        .ok()
+                        .map(|data| format!("{}\n\n{}", result.summary, data))
+                }
+            }
+            ToolEvent::Failed { error, .. } => Some(error.clone()),
+            ToolEvent::Cancelled { reason, .. } => Some(reason.clone()),
+            _ => None,
+        },
     }
 }
 

@@ -23,6 +23,12 @@ import { ApprovalsView } from "./views/ApprovalsView";
 import { ToolsView } from "./views/ToolsView";
 import { AuditView } from "./views/AuditView";
 
+function isActionableApproval(approval: ApprovalRequest, tasks: TaskSummary[]): boolean {
+  const task = tasks.find((item) => item.taskId === approval.taskId);
+  return approval.status === "Pending"
+    && !["Completed", "Cancelled", "Failed", "Expired"].includes(task?.status ?? "");
+}
+
 /** SSE 只负责更新本地快照；审批/控制事件仍会触发一次权威快照重读。 */
 function applyStreamEvent(snapshot: SystemSnapshot, streamEvent: StreamEvent): SystemSnapshot {
   if (streamEvent.type === "task.updated") {
@@ -88,12 +94,14 @@ export default function App() {
   const selectedTaskIdRef = useRef(selectedTaskId);
   selectedTaskIdRef.current = selectedTaskId;
 
-  const pendingApprovals = snapshot.approvals.filter((approval) => approval.status === "Pending");
+  const pendingApprovals = snapshot.approvals.filter((approval) =>
+    isActionableApproval(approval, snapshot.tasks),
+  );
   const selectedTask =
     snapshot.tasks.find((task) => task.taskId === selectedTaskId) ?? snapshot.tasks[0];
   const elevationRequest = elevationQueue[0];
   const elevationApproval = elevationRequest
-    ? snapshot.approvals.find((approval) =>
+    ? pendingApprovals.find((approval) =>
         approval.approvalRequestEventId === elevationRequest.approvalRequestEventId,
       )
     : undefined;
@@ -110,9 +118,9 @@ export default function App() {
       const approval = snapshot.approvals.find(
         (item) => item.approvalRequestEventId === request.approvalRequestEventId,
       );
-      return !approval || approval.status === "Pending";
+      return !approval || isActionableApproval(approval, snapshot.tasks);
     }));
-  }, [snapshot.approvals]);
+  }, [snapshot.approvals, snapshot.tasks]);
 
   useEffect(() => {
     api.currentUser()
@@ -373,7 +381,7 @@ export default function App() {
         />
       ) : null}
 
-      {elevationRequest ? (
+      {elevationRequest && elevationApproval ? (
         <ElevationApprovalModal
           request={elevationRequest}
           approval={elevationApproval}
@@ -382,15 +390,14 @@ export default function App() {
           busy={approvalBusy === elevationRequest.approvalRequestEventId}
           onApprove={() => {
             if (!elevationApproval) return;
-            void handleApproval(elevationApproval, true).then((submitted) => {
-              if (submitted) deferElevation(elevationApproval.approvalRequestEventId);
-            });
+            // 点击后立即关闭：网络失败会通过 toast 告知，但不把用户困在失效请求里。
+            deferElevation(elevationApproval.approvalRequestEventId);
+            void handleApproval(elevationApproval, true);
           }}
           onDeny={() => {
             if (!elevationApproval) return;
-            void handleApproval(elevationApproval, false).then((submitted) => {
-              if (submitted) deferElevation(elevationApproval.approvalRequestEventId);
-            });
+            deferElevation(elevationApproval.approvalRequestEventId);
+            void handleApproval(elevationApproval, false);
           }}
           onDefer={() => deferElevation(elevationRequest.approvalRequestEventId)}
         />
