@@ -185,12 +185,18 @@ fn ingress_evidence(
             approval_request_event_id,
             principal,
             assessment,
+            approved,
             ..
         } if matches!(creator, EventSource::External(_)) => Ok((
             AuthorizationEvidenceEventKind::Ingress,
             Some(principal.clone()),
             assessment.source_maximum_permission,
-            assessment.effective_permission,
+            if *approved {
+                assessment.effective_permission
+            } else {
+                // 拒绝决定可以被模型看见，但绝不能成为后续工具调用的授权证据。
+                PermissionLevel::None
+            },
             Some(*approval_request_event_id),
         )),
         IngressEvent::ApprovalSubmitted { .. } => {
@@ -204,7 +210,8 @@ fn ingress_evidence(
             AuthorizationEvidenceEventKind::Ingress,
             Some(principal.clone()),
             assessment.source_maximum_permission,
-            assessment.effective_permission,
+            // 取消请求的语义是撤回或停止当前流程，不是对任何工具调用的授权。
+            PermissionLevel::None,
             None,
         )),
         IngressEvent::CancellationRequested { .. } => {

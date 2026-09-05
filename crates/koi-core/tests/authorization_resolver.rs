@@ -2,8 +2,8 @@ use chrono::Utc;
 use koi_core::agent::PersistedAuthorizationEvidenceResolver;
 use koi_core::domain::{
     AgentEvent, ContextEnvelope, ContextKind, ContextOrigin, ContextPayload, EventEnvelope,
-    EventProvenance, EventSource, IngressEvent, PermissionAssessment, PermissionLevel, Principal,
-    Scope, SourceName, TaskId,
+    EventId, EventProvenance, EventSource, IngressEvent, PermissionAssessment, PermissionLevel,
+    Principal, Scope, SourceName, TaskId,
 };
 use koi_core::ports::{AuthorizationEvidenceResolver, EventStore, InMemoryEventStore};
 
@@ -154,6 +154,74 @@ async fn tool_results_never_provide_authorization_even_if_persisted_incorrectly(
             assessment.effective_permission = PermissionLevel::Admin;
         }
     }
+    store.append(&event).await.unwrap();
+
+    let resolver = PersistedAuthorizationEvidenceResolver::new(&store);
+    let evidence = resolver.resolve(task_id, event.id).await.unwrap();
+    assert_eq!(evidence.permission, PermissionLevel::None);
+    assert!(!evidence.is_usable());
+}
+
+#[tokio::test]
+async fn denied_approval_never_provides_authorization() {
+    let store = InMemoryEventStore::default();
+    let task_id = TaskId::new();
+    let assessment = PermissionAssessment::new(
+        PermissionLevel::Admin,
+        PermissionLevel::Admin,
+        PermissionLevel::Admin,
+    );
+    let mut event = EventEnvelope::new(
+        task_id,
+        1,
+        None,
+        AgentEvent::ingress(IngressEvent::ApprovalSubmitted {
+            approval_request_event_id: EventId::new(),
+            principal: Principal::new("web", "alice"),
+            scope: Scope::new("service", "order-api"),
+            assessment,
+            approved: false,
+        }),
+    );
+    event.provenance = EventProvenance {
+        creator: EventSource::External(SourceName::new("web").unwrap()),
+        direct_permission: Some(PermissionLevel::Admin),
+        authority_parent_event_id: None,
+        expires_at: None,
+    };
+    store.append(&event).await.unwrap();
+
+    let resolver = PersistedAuthorizationEvidenceResolver::new(&store);
+    let evidence = resolver.resolve(task_id, event.id).await.unwrap();
+    assert_eq!(evidence.permission, PermissionLevel::None);
+    assert!(!evidence.is_usable());
+}
+
+#[tokio::test]
+async fn cancellation_request_never_provides_authorization() {
+    let store = InMemoryEventStore::default();
+    let task_id = TaskId::new();
+    let mut event = EventEnvelope::new(
+        task_id,
+        1,
+        None,
+        AgentEvent::ingress(IngressEvent::CancellationRequested {
+            principal: Principal::new("web", "alice"),
+            scope: Scope::new("service", "order-api"),
+            assessment: PermissionAssessment::new(
+                PermissionLevel::Admin,
+                PermissionLevel::Admin,
+                PermissionLevel::Admin,
+            ),
+            reason: "停止当前任务".into(),
+        }),
+    );
+    event.provenance = EventProvenance {
+        creator: EventSource::External(SourceName::new("web").unwrap()),
+        direct_permission: Some(PermissionLevel::Admin),
+        authority_parent_event_id: None,
+        expires_at: None,
+    };
     store.append(&event).await.unwrap();
 
     let resolver = PersistedAuthorizationEvidenceResolver::new(&store);

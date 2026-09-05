@@ -69,6 +69,20 @@ const messages = {
     disconnectedTitle: "控制台未连接到可用后端",
     connBroken: "无法读取后端数据：请检查服务日志、登录权限或事件存储。",
     retry: "重新连接",
+    elevationEyebrow: "提权请求",
+    elevationTitle: "Agent 需要你的确认",
+    elevationCopy: "该工具操作正在等待授权。请在确认目标和参数后决定是否放行。",
+    elevationTool: "请求的工具",
+    elevationSession: "会话",
+    elevationScope: "作用域",
+    elevationRequested: "请求时间",
+    elevationArguments: "请求参数",
+    elevationLoading: "正在从安全事件记录读取审批详情…",
+    elevationNotice: "批准或拒绝都会写入审计事件；暂缓不会放行操作。",
+    elevationDefer: "稍后处理",
+    elevationDeny: "拒绝",
+    elevationApprove: "批准操作",
+    elevationQueue: "另有 {{count}} 个提权请求等待处理",
   },
   en: {
     language: "中文",
@@ -136,12 +150,30 @@ const messages = {
     disconnectedTitle: "Console is not connected to a backend",
     connBroken: "Cannot read backend data: check service logs, permissions or the event store.",
     retry: "Reconnect",
+    elevationEyebrow: "Authorization request",
+    elevationTitle: "The agent needs your confirmation",
+    elevationCopy: "This tool operation is waiting for authorization. Review its target and arguments before deciding.",
+    elevationTool: "Requested tool",
+    elevationSession: "Session",
+    elevationScope: "Scope",
+    elevationRequested: "Requested",
+    elevationArguments: "Arguments",
+    elevationLoading: "Reading approval details from the secure event record…",
+    elevationNotice: "Approving or denying writes an audit event; deferring does not allow the operation.",
+    elevationDefer: "Review later",
+    elevationDeny: "Deny",
+    elevationApprove: "Approve operation",
+    elevationQueue: "{{count}} more authorization requests are waiting",
   },
 } as const;
 
 export type MessageKey = keyof (typeof messages)["zh-CN"];
 
-type I18n = { locale: Locale; setLocale: (locale: Locale) => void; t: (key: MessageKey) => string };
+type I18n = {
+  locale: Locale;
+  setLocale: (locale: Locale) => void;
+  t: (key: MessageKey, variables?: Record<string, string | number>) => string;
+};
 const I18nContext = createContext<I18n | null>(null);
 
 export function I18nProvider({ children }: { children: React.ReactNode }) {
@@ -152,7 +184,20 @@ export function I18nProvider({ children }: { children: React.ReactNode }) {
     document.documentElement.lang = locale;
     window.localStorage.setItem("koi.locale", locale);
   }, [locale]);
-  const value = useMemo<I18n>(() => ({ locale, setLocale, t: (key) => messages[locale][key] }), [locale]);
+  const value = useMemo<I18n>(
+    () => ({
+      locale,
+      setLocale,
+      t: (key, variables) => {
+        const message = messages[locale][key] as string;
+        return Object.entries(variables ?? {}).reduce(
+          (current, [name, value]) => current.replaceAll(`{{${name}}}`, String(value)),
+          message,
+        );
+      },
+    }),
+    [locale],
+  );
   return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>;
 }
 

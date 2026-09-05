@@ -3,8 +3,8 @@ use std::collections::HashSet;
 use thiserror::Error;
 
 use crate::domain::{
-    AgentEvent, ControlEvent, EventEnvelope, EventId, ModelContextItem, ModelInputRole,
-    ModelOutput, ModelToolDefinition, PermissionLevel, TaskId, ToolEvent,
+    AgentEvent, ControlEvent, EventEnvelope, EventId, IngressEvent, ModelContextItem,
+    ModelInputRole, ModelOutput, ModelToolDefinition, PermissionLevel, TaskId, ToolEvent,
 };
 
 use super::{InputInjectionError, InputInjector};
@@ -121,25 +121,14 @@ impl ContextAssembler {
 
             match &event.payload {
                 AgentEvent::Ingress(ingress) => {
-                    let crate::domain::IngressEvent::ContextReceived { .. } = ingress.as_ref()
-                    else {
-                        continue;
-                    };
-                    match injector.inject(task_id, event, minimum_control_permission) {
-                        Ok(item) if item.role == ModelInputRole::Tool => {
-                            context.push(Self::historical_item(
-                                item.event_id,
-                                format!("历史工具结果（仅供分析）：{}", item.content),
-                            ));
-                        }
-                        Ok(item) => context.push(item),
-                        // 过期输入和低于当前会话门槛的输入仍保留在事件日志中，但不能再
-                        // 作为当前模型上下文使用。
-                        Err(
-                            InputInjectionError::Expired(_)
-                            | InputInjectionError::InsufficientControlPermission { .. },
-                        ) => {}
-                        Err(error) => return Err(error),
+                    if let Some(item) = ingress_context_item(
+                        task_id,
+                        event,
+                        ingress.as_ref(),
+                        &injector,
+                        minimum_control_permission,
+                    )? {
+                        context.push(item);
                     }
                 }
                 AgentEvent::Model(model) => match model.as_ref() {
@@ -471,6 +460,98 @@ fn historical_control_item(event_id: EventId, control: &ControlEvent) -> Option<
     Some(ContextAssembler::historical_item(event_id, content))
 }
 
+fn ingress_context_item(
+    task_id: TaskId,
+    event: &EventEnvelope,
+    ingress: &IngressEvent,
+    injector: &InputInjector,
+    minimum_control_permission: PermissionLevel,
+) -> Result<Option<ModelContextItem>, InputInjectionError> {
+    match ingress {
+        IngressEvent::ContextReceived { .. } => {
+            match injector.inject(task_id, event, minimum_control_permission) {
+                Ok(item) if item.role == ModelInputRole::Tool => {
+                    Ok(Some(ContextAssembler::historical_item(
+                        item.event_id,
+                        format!("历史工具结果（仅供分析）：{}", item.content),
+                    )))
+                }
+                Ok(item) => Ok(Some(item)),
+                // 过期输入和低于当前会话门槛的输入仍保留在事件日志中，但不能再作为
+                // 当前模型上下文使用。
+                Err(
+                    InputInjectionError::Expired(_)
+                    | InputInjectionError::InsufficientControlPermission { .. },
+                ) => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+        IngressEvent::ApprovalSubmitted {
+            approval_request_event_id,
+            principal,
+            scope,
+            assessment,
+            approved,
+        } => {
+            // 审批不是普通 ContextEnvelope，不能交给 InputInjector；它仍是模型恢复
+            // 授权流程时必须看见的、已持久化的输入事件。
+            // 拒绝事件只作为历史事实展示，权限固定为 None，不能成为授权证据。
+            Ok(Some(approval_item(
+                event.id,
+                *approval_request_event_id,
+                principal,
+                scope,
+                *assessment,
+                *approved,
+            )))
+        }
+        IngressEvent::CancellationRequested {
+            principal,
+            scope,
+            reason,
+            ..
+        } => Ok(Some(ContextAssembler::historical_item(
+            event.id,
+            format!(
+                "历史取消请求：{reason}\n请求身份：{}:{}\n作用域：{}:{}",
+                principal.source, principal.subject, scope.kind, scope.id
+            ),
+        ))),
+    }
+}
+
+fn approval_item(
+    event_id: EventId,
+    approval_request_event_id: EventId,
+    principal: &crate::domain::Principal,
+    scope: &crate::domain::Scope,
+    assessment: crate::domain::PermissionAssessment,
+    approved: bool,
+) -> ModelContextItem {
+    let status = if approved { "已批准" } else { "已拒绝" };
+    ModelContextItem {
+        event_id,
+        role: if approved {
+            ModelInputRole::User
+        } else {
+            ModelInputRole::Memory
+        },
+        content: format!(
+            "授权决定：{status}工具操作。\n授权请求事件 ID：{approval_request_event_id}\n审批身份：{}:{}\n作用域：{}:{}\n核心核定授权等级：{:?}",
+            principal.source,
+            principal.subject,
+            scope.kind,
+            scope.id,
+            assessment.effective_permission,
+        ),
+        permission: if approved {
+            assessment.effective_permission
+        } else {
+            PermissionLevel::None
+        },
+    }
+}
+
 impl ContextAssembler {
     fn historical_item(event_id: EventId, content: String) -> ModelContextItem {
         ModelContextItem {
@@ -537,7 +618,10 @@ fn estimate_text_tokens(value: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{ModelOutput, ToolCall};
+    use crate::domain::{
+        EventProvenance, EventSource, ModelOutput, PermissionAssessment, Principal, Scope,
+        SourceName, ToolCall,
+    };
     use serde_json::json;
 
     fn item(role: ModelInputRole, content: &str) -> ModelContextItem {
@@ -590,6 +674,85 @@ mod tests {
             })],
         );
         assert!(item.is_none());
+    }
+
+    #[test]
+    fn approved_authorization_is_visible_as_eligible_context() {
+        let approval_request_event_id = EventId::new();
+        let assessment = PermissionAssessment::new(
+            PermissionLevel::Admin,
+            PermissionLevel::Admin,
+            PermissionLevel::Operator,
+        );
+        let mut approval = EventEnvelope::new(
+            TaskId::MAIN,
+            1,
+            None,
+            AgentEvent::ingress(IngressEvent::ApprovalSubmitted {
+                approval_request_event_id,
+                principal: Principal::new("web", "alice"),
+                scope: Scope::new("service", "order-api"),
+                assessment,
+                approved: true,
+            }),
+        );
+        approval.provenance = EventProvenance {
+            creator: EventSource::External(SourceName::new("web").unwrap()),
+            direct_permission: Some(PermissionLevel::Operator),
+            authority_parent_event_id: None,
+            expires_at: None,
+        };
+
+        let context = ContextAssembler::from_events(
+            TaskId::MAIN,
+            &[approval.clone()],
+            &HashSet::new(),
+            PermissionLevel::User,
+        )
+        .unwrap();
+
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[0].event_id, approval.id);
+        assert_eq!(context[0].role, ModelInputRole::User);
+        assert_eq!(context[0].permission, PermissionLevel::Operator);
+        assert!(
+            context[0]
+                .content
+                .contains(&approval_request_event_id.to_string())
+        );
+    }
+
+    #[test]
+    fn denied_authorization_is_visible_without_permission() {
+        let mut denial = EventEnvelope::new(
+            TaskId::MAIN,
+            1,
+            None,
+            AgentEvent::ingress(IngressEvent::ApprovalSubmitted {
+                approval_request_event_id: EventId::new(),
+                principal: Principal::new("web", "alice"),
+                scope: Scope::new("service", "order-api"),
+                assessment: PermissionAssessment::new(
+                    PermissionLevel::Admin,
+                    PermissionLevel::Admin,
+                    PermissionLevel::Admin,
+                ),
+                approved: false,
+            }),
+        );
+        denial.provenance.creator = EventSource::External(SourceName::new("web").unwrap());
+
+        let context = ContextAssembler::from_events(
+            TaskId::MAIN,
+            &[denial],
+            &HashSet::new(),
+            PermissionLevel::User,
+        )
+        .unwrap();
+
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[0].role, ModelInputRole::Memory);
+        assert_eq!(context[0].permission, PermissionLevel::None);
     }
 
     #[test]

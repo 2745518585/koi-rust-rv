@@ -5,6 +5,7 @@ import type { AuthUser } from "./api/client";
 import { createEmptySnapshot, MAIN_TASK_ID } from "./api/snapshot";
 import type {
   ApprovalRequest,
+  AuthorizationNotification,
   PermissionLevel,
   StreamEvent,
   SystemSnapshot,
@@ -17,6 +18,7 @@ import { AuthScreen } from "./components/AuthScreen";
 import { Sidebar } from "./components/Sidebar";
 import { Conversation } from "./components/Conversation";
 import { TaskComposerModal } from "./components/TaskComposerModal";
+import { ElevationApprovalModal } from "./components/ElevationApprovalModal";
 import { ApprovalsView } from "./views/ApprovalsView";
 import { ToolsView } from "./views/ToolsView";
 import { AuditView } from "./views/AuditView";
@@ -80,6 +82,7 @@ export default function App() {
   const [authChecked, setAuthChecked] = useState(false);
   const [apiError, setApiError] = useState<string | null>(null);
   const [eventsRevision, setEventsRevision] = useState(0);
+  const [elevationQueue, setElevationQueue] = useState<AuthorizationNotification[]>([]);
 
   // 快照加载只在登录状态变化时触发；选中会话通过 ref 读取，避免切换会话时整页重载。
   const selectedTaskIdRef = useRef(selectedTaskId);
@@ -88,12 +91,28 @@ export default function App() {
   const pendingApprovals = snapshot.approvals.filter((approval) => approval.status === "Pending");
   const selectedTask =
     snapshot.tasks.find((task) => task.taskId === selectedTaskId) ?? snapshot.tasks[0];
+  const elevationRequest = elevationQueue[0];
+  const elevationApproval = elevationRequest
+    ? snapshot.approvals.find((approval) =>
+        approval.approvalRequestEventId === elevationRequest.approvalRequestEventId,
+      )
+    : undefined;
 
   useEffect(() => {
     if (!toast) return;
     const timer = window.setTimeout(() => setToast(null), 3200);
     return () => window.clearTimeout(timer);
   }, [toast]);
+
+  // 若用户从审批中心处理了同一请求，关闭仍在前台的对应弹窗。
+  useEffect(() => {
+    setElevationQueue((current) => current.filter((request) => {
+      const approval = snapshot.approvals.find(
+        (item) => item.approvalRequestEventId === request.approvalRequestEventId,
+      );
+      return !approval || approval.status === "Pending";
+    }));
+  }, [snapshot.approvals]);
 
   useEffect(() => {
     api.currentUser()
@@ -147,6 +166,11 @@ export default function App() {
           setEventsRevision((current) => current + 1);
         }
         if (event.type === "authorization.requested") {
+          setElevationQueue((current) =>
+            current.some((request) => request.approvalRequestEventId === event.request.approvalRequestEventId)
+              ? current
+              : [...current, event.request],
+          );
           void api.getSnapshot().then(setSnapshot).catch(() => undefined);
         }
         if (
@@ -177,25 +201,35 @@ export default function App() {
     }
   }
 
-  async function handleApproval(approval: ApprovalRequest, approved: boolean) {
+  async function handleApproval(approval: ApprovalRequest, approved: boolean): Promise<boolean> {
     setApprovalBusy(approval.approvalRequestEventId);
     if (!isLive) {
       setApprovalBusy(null);
       setToast(t("backendOffline"));
-      return;
+      return false;
     }
     try {
+      // 审批是对既有授权请求作出的决定，不是页面输入框发起的新操作；它必须
+      // 使用该请求的目标权限，不能被会话输入区的全局建议等级降级。
       const updated = await api.submitApproval(approval.approvalRequestEventId, {
         approved,
-        suggestedPermission,
+        suggestedPermission: approval.requiredPermission,
       });
       setSnapshot((current) => applyStreamEvent(current, { type: "approval.updated", approval: updated }));
       setToast(approved ? t("approvalSubmitted") : t("approvalDenied"));
+      return true;
     } catch {
       setToast(t("approvalFailed"));
+      return false;
     } finally {
       setApprovalBusy(null);
     }
+  }
+
+  function deferElevation(approvalRequestEventId: string) {
+    setElevationQueue((current) => current.filter(
+      (request) => request.approvalRequestEventId !== approvalRequestEventId,
+    ));
   }
 
   function handleNewTask(task: TaskSummary) {
@@ -336,6 +370,29 @@ export default function App() {
           onClose={() => setComposerOpen(false)}
           onCreated={handleNewTask}
           onToast={setToast}
+        />
+      ) : null}
+
+      {elevationRequest ? (
+        <ElevationApprovalModal
+          request={elevationRequest}
+          approval={elevationApproval}
+          task={snapshot.tasks.find((task) => task.taskId === elevationRequest.taskId)}
+          queueSize={elevationQueue.length}
+          busy={approvalBusy === elevationRequest.approvalRequestEventId}
+          onApprove={() => {
+            if (!elevationApproval) return;
+            void handleApproval(elevationApproval, true).then((submitted) => {
+              if (submitted) deferElevation(elevationApproval.approvalRequestEventId);
+            });
+          }}
+          onDeny={() => {
+            if (!elevationApproval) return;
+            void handleApproval(elevationApproval, false).then((submitted) => {
+              if (submitted) deferElevation(elevationApproval.approvalRequestEventId);
+            });
+          }}
+          onDefer={() => deferElevation(elevationRequest.approvalRequestEventId)}
         />
       ) : null}
 

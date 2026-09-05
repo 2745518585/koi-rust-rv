@@ -861,10 +861,11 @@ fn chat_role(role: ModelInputRole) -> &'static str {
     }
 }
 
-/// 为模型渲染上下文。只有用户/告警类、且本身具有授权能力的输入才公开可引用的事件 ID。
+/// 为模型渲染上下文。所有持久化上下文都公开稳定事件 ID，方便模型定位更早的事实；
+/// 只有用户/告警类、且本身具有授权能力的输入才使用可作为授权依据的 `KOI_CONTEXT`。
+/// `KOI_HISTORY` 仅用于标识历史资料，绝不能作为授权父事件。
 ///
 /// `event_id` 不是从消息正文提取的用户数据，而是核心绑定到上下文项的持久化事件标识。
-/// 其他角色即使有内部事件 ID，也不能成为工具授权的父节点，因此不向模型声明为证据。
 fn model_context_content(item: &ModelContextItem) -> String {
     if item.role == ModelInputRole::User && item.permission.can_authorize() {
         format!(
@@ -872,7 +873,10 @@ fn model_context_content(item: &ModelContextItem) -> String {
             item.event_id, item.permission, item.content
         )
     } else {
-        item.content.clone()
+        format!(
+            "[KOI_HISTORY event_id={} role={:?}]\n{}",
+            item.event_id, item.role, item.content
+        )
     }
 }
 
@@ -2275,6 +2279,17 @@ mod tests {
         let chat = chat_messages(&request.instructions, &request.context, &[]);
         let chat_content = chat[1]["content"].as_str().unwrap();
         assert!(chat_content.contains(&format!("KOI_CONTEXT event_id={eligible_id}")));
+
+        let history_id = EventId::new();
+        let history = ModelContextItem {
+            event_id: history_id,
+            role: ModelInputRole::Memory,
+            content: "更早的历史事实".into(),
+            permission: PermissionLevel::None,
+        };
+        let rendered_history = model_context_content(&history);
+        assert!(rendered_history.contains(&format!("KOI_HISTORY event_id={history_id}")));
+        assert!(rendered_history.contains("更早的历史事实"));
 
         for schema in [
             &responses_tool(&request.tools[0])["parameters"],
