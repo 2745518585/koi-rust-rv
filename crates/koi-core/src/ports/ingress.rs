@@ -73,6 +73,65 @@ pub trait IngressPermissionResolver: Send + Sync {
     ) -> Result<PermissionLevel, IngressRegistrationError>;
 }
 
+/// 由宿主应用从受保护的静态配置加载的身份权限目录。
+///
+/// 目录属于核心的权限裁决模型：外部来源只能提交建议权限，不能写入或提升其中的
+/// 身份记录。宿主应用可以选择 TOML、数据库或其他只读部署配置作为加载方式。
+#[derive(Clone, Debug, Default)]
+pub struct StaticPermissionDirectory {
+    source_defaults: BTreeMap<String, PermissionLevel>,
+    principals: BTreeMap<(String, String), PermissionLevel>,
+}
+
+impl StaticPermissionDirectory {
+    #[must_use]
+    pub fn new(
+        source_defaults: impl IntoIterator<Item = (String, PermissionLevel)>,
+        principals: impl IntoIterator<Item = (String, String, PermissionLevel)>,
+    ) -> Self {
+        Self {
+            source_defaults: source_defaults.into_iter().collect(),
+            principals: principals
+                .into_iter()
+                .map(|(source, subject, permission)| ((source, subject), permission))
+                .collect(),
+        }
+    }
+
+    /// 返回身份在核心目录中的实际最高权限；精确身份记录优先于来源默认值，未配置时
+    /// 失败关闭为 `None`。
+    #[must_use]
+    pub fn permission_for(&self, source: &str, subject: &str) -> PermissionLevel {
+        self.principals
+            .get(&(source.into(), subject.into()))
+            .copied()
+            .or_else(|| self.source_defaults.get(source).copied())
+            .unwrap_or(PermissionLevel::None)
+    }
+}
+
+#[async_trait]
+impl IngressPermissionResolver for StaticPermissionDirectory {
+    async fn maximum_permission(
+        &self,
+        subject: IngressSubject,
+    ) -> Result<PermissionLevel, IngressRegistrationError> {
+        let Some(principal) = subject.principal else {
+            return Ok(self
+                .source_defaults
+                .get(&subject.source)
+                .copied()
+                .unwrap_or(PermissionLevel::None));
+        };
+        if principal.source != subject.source {
+            return Err(IngressRegistrationError::permission_resolution(
+                "输入来源与身份来源不匹配",
+            ));
+        }
+        Ok(self.permission_for(&subject.source, &principal.subject))
+    }
+}
+
 /// 将外部草稿转换为唯一、可审计的 Ingress 事件的核心服务。
 pub struct IngressRegistrar<'a> {
     sources: &'a IngressSourceRegistry,
@@ -244,4 +303,40 @@ impl IngressRegistrationError {
 pub struct RegisteredTaskInput {
     pub task_id: TaskId,
     pub ingress_event_id: EventId,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{Principal, Scope};
+
+    #[tokio::test]
+    async fn static_directory_prefers_named_identity_and_fails_closed() {
+        let directory = StaticPermissionDirectory::new(
+            [("web".into(), PermissionLevel::User)],
+            [("web".into(), "zyc".into(), PermissionLevel::Admin)],
+        );
+        assert_eq!(
+            directory.permission_for("web", "zyc"),
+            PermissionLevel::Admin
+        );
+        assert_eq!(
+            directory.permission_for("web", "guest"),
+            PermissionLevel::User
+        );
+        assert_eq!(
+            directory.permission_for("qq", "10001"),
+            PermissionLevel::None
+        );
+
+        let permission = directory
+            .maximum_permission(IngressSubject {
+                source: "web".into(),
+                principal: Some(Principal::new("web", "zyc")),
+                scope: Scope::new("web", "console"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(permission, PermissionLevel::Admin);
+    }
 }

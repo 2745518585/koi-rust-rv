@@ -1,0 +1,21 @@
+# 核心权限目录示例。复制为 authorization.toml 后按部署环境填写。
+
+# 每个来源的默认身份权限；未出现的来源和身份默认为 None。
+[[source_defaults]]
+source = "web"
+permission = "User"
+
+[[source_defaults]]
+source = "alertmanager"
+permission = "User"
+
+# 精确身份记录优先于来源默认值。
+[[principals]]
+source = "web"
+subject = "admin_ops"
+permission = "Admin"
+
+[[principals]]
+source = "qq"
+subject = "10001"
+permission = "Operator"

@@ -4,8 +4,12 @@ use std::sync::Arc;
 
 use koi_api::{WebApi, WebAuth};
 use koi_core::agent::DEFAULT_CONTEXT_WINDOW_TOKENS;
-use koi_core::domain::{EventSource, ModelGenerationOptions, ModelProtocol, ModelSelection};
-use koi_core::ports::{EventStore, SourceAuthorizationRegistry, ToolRegistry};
+use koi_core::domain::{
+    EventSource, ModelGenerationOptions, ModelProtocol, ModelSelection, PermissionLevel,
+};
+use koi_core::ports::{
+    EventStore, SourceAuthorizationRegistry, StaticPermissionDirectory, ToolRegistry,
+};
 use koi_infra::event_store::JsonlEventStore;
 use koi_infra::llm::{
     ModelProviderEntry, ModelProviderRegistry, OpenAiCompatibleModelConfig,
@@ -33,6 +37,28 @@ struct RuntimeConfig {
     agent: AgentConfig,
     #[serde(default)]
     usage: UsageConfig,
+}
+
+/// 独立于 Agent 与工具配置的静态权限目录文件。
+#[derive(Debug, Deserialize)]
+struct AuthorizationConfig {
+    #[serde(default)]
+    source_defaults: Vec<SourcePermissionConfig>,
+    #[serde(default)]
+    principals: Vec<PrincipalPermissionConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourcePermissionConfig {
+    source: String,
+    permission: PermissionLevel,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrincipalPermissionConfig {
+    source: String,
+    subject: String,
+    permission: PermissionLevel,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -113,6 +139,7 @@ async fn main() {
 #[allow(clippy::too_many_lines)]
 async fn run() -> Result<(), ServerError> {
     let config = load_runtime_config()?;
+    let permissions = Arc::new(load_authorization_directory()?);
     let prompts = prompts::ServerPromptProvider;
     let model_registry = build_model_registry(&config)?;
 
@@ -136,8 +163,10 @@ async fn run() -> Result<(), ServerError> {
     let task_manager = Arc::new(koi_core::agent::TaskManager::new(Arc::new(Arc::clone(
         &store,
     ))));
-    let identities =
-        Arc::new(WebUserStore::open(&config.server.user_store_path).map_err(ServerError::WebApi)?);
+    let identities = Arc::new(
+        WebUserStore::open(&config.server.user_store_path, Arc::clone(&permissions))
+            .map_err(ServerError::WebApi)?,
+    );
     let source = Arc::new(
         KoiWebSource::new(
             Arc::clone(&store),
@@ -351,6 +380,7 @@ async fn bootstrap_main_session(store: &Arc<JsonlEventStore>) -> Result<(), Stri
 }
 
 const RUNTIME_CONFIG_PATH: &str = "config/agent.toml";
+const AUTHORIZATION_CONFIG_PATH: &str = "config/authorization.toml";
 
 fn load_runtime_config() -> Result<RuntimeConfig, ServerError> {
     let contents = fs::read_to_string(RUNTIME_CONFIG_PATH).map_err(|error| {
@@ -358,6 +388,26 @@ fn load_runtime_config() -> Result<RuntimeConfig, ServerError> {
     })?;
     toml::from_str::<RuntimeConfig>(&contents)
         .map_err(|error| ServerError::Configuration(format!("运行配置解析失败：{error}")))
+}
+
+fn load_authorization_directory() -> Result<StaticPermissionDirectory, ServerError> {
+    let contents = fs::read_to_string(AUTHORIZATION_CONFIG_PATH).map_err(|error| {
+        ServerError::Configuration(format!(
+            "读取权限配置 {AUTHORIZATION_CONFIG_PATH} 失败：{error}"
+        ))
+    })?;
+    let config: AuthorizationConfig = toml::from_str(&contents)
+        .map_err(|error| ServerError::Configuration(format!("权限配置解析失败：{error}")))?;
+    Ok(StaticPermissionDirectory::new(
+        config
+            .source_defaults
+            .into_iter()
+            .map(|entry| (entry.source, entry.permission)),
+        config
+            .principals
+            .into_iter()
+            .map(|entry| (entry.source, entry.subject, entry.permission)),
+    ))
 }
 
 #[derive(Debug, Error)]

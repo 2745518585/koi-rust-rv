@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
 use argon2::Argon2;
@@ -16,7 +16,7 @@ use koi_api::{
     LoginCommand, RegisterUserCommand, WebApiError, WebIdentityProvider, WebPrincipal, WebSession,
     WebUserDto,
 };
-use koi_core::domain::PermissionLevel;
+use koi_core::ports::StaticPermissionDirectory;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -25,6 +25,7 @@ pub struct WebUserStore {
     path: PathBuf,
     users: RwLock<BTreeMap<String, StoredUser>>,
     sessions: Mutex<BTreeMap<String, StoredSession>>,
+    permissions: Arc<StaticPermissionDirectory>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -38,33 +39,6 @@ struct StoredUser {
     email: String,
     username: String,
     password_hash: String,
-    /// Web 账户只能被授予 User 或 Admin，不能通过用户库获得 System 权限。
-    /// 缺少该字段的旧用户记录按 User 处理，保证向后兼容。
-    #[serde(default)]
-    permission: StoredUserPermission,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
-enum StoredUserPermission {
-    #[default]
-    User,
-    Admin,
-}
-
-impl StoredUserPermission {
-    fn as_core_permission(self) -> PermissionLevel {
-        match self {
-            Self::User => PermissionLevel::User,
-            Self::Admin => PermissionLevel::Admin,
-        }
-    }
-
-    fn as_label(self) -> &'static str {
-        match self {
-            Self::User => "User",
-            Self::Admin => "Admin",
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -81,7 +55,10 @@ impl WebUserStore {
     /// # Errors
     ///
     /// Returns an error when the user database cannot be read, parsed, or initialized.
-    pub fn open(path: impl Into<PathBuf>) -> Result<Self, WebApiError> {
+    pub fn open(
+        path: impl Into<PathBuf>,
+        permissions: Arc<StaticPermissionDirectory>,
+    ) -> Result<Self, WebApiError> {
         let path = path.into();
         let users = if path.exists() {
             let body = fs::read_to_string(&path)
@@ -100,6 +77,7 @@ impl WebUserStore {
             path,
             users: RwLock::new(users),
             sessions: Mutex::new(BTreeMap::new()),
+            permissions,
         })
     }
 
@@ -108,12 +86,17 @@ impl WebUserStore {
             && self.display_name_for(&principal.subject) == principal.display_name
     }
 
-    pub fn permission_for(&self, subject: &str) -> Option<PermissionLevel> {
+    pub fn permission_for(&self, subject: &str) -> Option<koi_core::domain::PermissionLevel> {
         self.users
             .read()
             .ok()?
             .get(subject)
-            .map(|user| user.permission.as_core_permission())
+            .map(|_| self.permissions.permission_for("web", subject))
+    }
+
+    #[must_use]
+    pub fn permissions(&self) -> Arc<StaticPermissionDirectory> {
+        Arc::clone(&self.permissions)
     }
 
     fn display_name_for(&self, subject: &str) -> Option<String> {
@@ -150,10 +133,11 @@ impl WebUserStore {
                     expires_at: SystemTime::now() + SESSION_TTL,
                 },
             );
+        let permission = self.permissions.permission_for("web", &user.username);
         Ok(WebSession {
             token,
-            principal: principal_for(user),
-            user: user_dto(user),
+            principal: principal_for(user, permission),
+            user: user_dto(user, permission),
         })
     }
 }
@@ -179,7 +163,6 @@ impl WebIdentityProvider for WebUserStore {
             email,
             username: username.clone(),
             password_hash,
-            permission: StoredUserPermission::User,
         };
         users.insert(username, user.clone());
         self.persist(&users)?;
@@ -223,10 +206,11 @@ impl WebIdentityProvider for WebUserStore {
             .get(&username)
             .cloned()
             .ok_or_else(|| WebApiError::Forbidden("用户已不存在".into()))?;
+        let permission = self.permissions.permission_for("web", &user.username);
         Ok(WebSession {
             token: token.into(),
-            principal: principal_for(&user),
-            user: user_dto(&user),
+            principal: principal_for(&user, permission),
+            user: user_dto(&user, permission),
         })
     }
 
@@ -239,20 +223,20 @@ impl WebIdentityProvider for WebUserStore {
     }
 }
 
-fn principal_for(user: &StoredUser) -> WebPrincipal {
+fn principal_for(user: &StoredUser, permission: koi_core::domain::PermissionLevel) -> WebPrincipal {
     WebPrincipal {
         subject: user.username.clone(),
         display_name: Some(user.username.clone()),
-        permission: user.permission.as_core_permission(),
+        permission,
     }
 }
 
-fn user_dto(user: &StoredUser) -> WebUserDto {
+fn user_dto(user: &StoredUser, permission: koi_core::domain::PermissionLevel) -> WebUserDto {
     WebUserDto {
         user_id: user.username.clone(),
         username: user.username.clone(),
         email: user.email.clone(),
-        permission: user.permission.as_label().into(),
+        permission: format!("{permission:?}"),
     }
 }
 
@@ -290,11 +274,19 @@ fn validate_password(password: &str) -> Result<(), WebApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use koi_core::domain::PermissionLevel;
 
     #[test]
     fn registered_username_is_the_core_principal_subject() {
         let path = std::env::temp_dir().join(format!("koi-web-users-{}.json", Uuid::new_v4()));
-        let store = WebUserStore::open(&path).unwrap();
+        let store = WebUserStore::open(
+            &path,
+            Arc::new(StaticPermissionDirectory::new(
+                [("web".into(), PermissionLevel::User)],
+                std::iter::empty(),
+            )),
+        )
+        .unwrap();
         let session = store
             .register(RegisterUserCommand {
                 email: "Ada@Example.com".into(),
@@ -308,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn stored_admin_permission_is_exposed_to_core_and_legacy_users_stay_user() {
+    fn permission_is_resolved_from_static_directory_not_user_store() {
         let path = std::env::temp_dir().join(format!("koi-web-users-{}.json", Uuid::new_v4()));
         let body = r#"
         {
@@ -317,8 +309,7 @@ mod tests {
             {
               "email": "admin@example.com",
               "username": "admin_ops",
-              "password_hash": "not-used-in-this-test",
-              "permission": "Admin"
+              "password_hash": "not-used-in-this-test"
             },
             {
               "email": "legacy@example.com",
@@ -330,7 +321,11 @@ mod tests {
         "#;
         std::fs::write(&path, body).unwrap();
 
-        let store = WebUserStore::open(&path).unwrap();
+        let directory = Arc::new(StaticPermissionDirectory::new(
+            [("web".into(), PermissionLevel::User)],
+            [("web".into(), "admin_ops".into(), PermissionLevel::Admin)],
+        ));
+        let store = WebUserStore::open(&path, directory).unwrap();
         assert_eq!(
             store.permission_for("admin_ops"),
             Some(PermissionLevel::Admin)
@@ -339,19 +334,6 @@ mod tests {
             store.permission_for("legacy_ops"),
             Some(PermissionLevel::User)
         );
-
-        let admin_user = store
-            .users
-            .read()
-            .unwrap()
-            .get("admin_ops")
-            .cloned()
-            .unwrap();
-        assert_eq!(
-            principal_for(&admin_user).permission,
-            PermissionLevel::Admin
-        );
-        assert_eq!(user_dto(&admin_user).permission, "Admin");
 
         std::fs::remove_file(path).unwrap();
     }

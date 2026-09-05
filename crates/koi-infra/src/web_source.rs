@@ -24,15 +24,15 @@ use koi_core::agent::{
 };
 use koi_core::domain::{
     AgentEvent, ContextEnvelope, ContextKind, ContextOrigin, ContextPayload, ControlEvent,
-    EventEnvelope, EventId, EventSource, IngressDraft, IngressEvent, IngressSubject,
-    ModelSelection, PermissionLevel, Principal, Scope, SourceName, TaskId, TaskProjection,
-    ToolDefinition, ToolEvent,
+    EventEnvelope, EventId, EventSource, IngressDraft, IngressEvent, ModelSelection,
+    PermissionLevel, Principal, Scope, SourceName, TaskId, TaskProjection, ToolDefinition,
+    ToolEvent,
 };
 use koi_core::domain::{AuthorizationRequest, AuthorizationRequestResult};
 use koi_core::ports::{
-    AuthorizationError, EventStore, IngressPermissionResolver, IngressRegistrar,
-    IngressRegistrationError, IngressSourceDefinition, IngressSourceRegistry,
-    SourceAuthorizationProvider,
+    AuthorizationError, EventStore, IngressRegistrar, IngressRegistrationError,
+    IngressSourceDefinition, IngressSourceRegistry, SourceAuthorizationProvider,
+    StaticPermissionDirectory,
 };
 use tokio::sync::{Mutex, broadcast};
 
@@ -41,7 +41,8 @@ const WEB_INSTANCE: &str = "http-api";
 pub struct KoiWebSource {
     store: Arc<JsonlEventStore>,
     sources: IngressSourceRegistry,
-    permissions: WebPermissionResolver,
+    identities: Arc<WebUserStore>,
+    permissions: Arc<StaticPermissionDirectory>,
     task_manager: Arc<TaskManager<Arc<JsonlEventStore>>>,
     write_lock: Mutex<()>,
     events: broadcast::Sender<WebStreamEvent>,
@@ -54,8 +55,9 @@ pub struct KoiWebSource {
 impl KoiWebSource {
     /// Creates the server-side Web source adapter.
     ///
-    /// `identities` is the authoritative credential directory. It owns the mapping from Web
-    /// usernames to core principal subjects and permissions; HTTP JSON never supplies either.
+    /// `identities` only authenticates Web credentials and maps usernames to stable principal
+    /// subjects. `permissions` is the core-owned static permission directory; HTTP JSON and the
+    /// Web account database cannot change it.
     /// `task_manager` must be the same instance the agent supervisor uses, so Web-created
     /// sessions and model-created sessions share one task registry.
     ///
@@ -84,7 +86,8 @@ impl KoiWebSource {
         Ok(Self {
             store,
             sources,
-            permissions: WebPermissionResolver { identities },
+            permissions: identities.permissions(),
+            identities,
             task_manager,
             write_lock: Mutex::new(()),
             events,
@@ -111,7 +114,7 @@ impl KoiWebSource {
     }
 
     fn validate_principal(&self, principal: &WebPrincipal) -> Result<(), WebApiError> {
-        if !self.permissions.identities.accepts(principal) {
+        if !self.identities.accepts(principal) {
             return Err(WebApiError::Forbidden("Web 身份未通过服务器侧认证".into()));
         }
         Ok(())
@@ -298,7 +301,7 @@ impl KoiWebSource {
             causation_id: None,
             content_hash: fingerprint(&command.message),
         };
-        let registrar = IngressRegistrar::new(&self.sources, &self.permissions);
+        let registrar = IngressRegistrar::new(&self.sources, self.permissions.as_ref());
         registrar
             .register(
                 runtime,
@@ -345,7 +348,7 @@ impl KoiWebSource {
             causation_id: None,
             content_hash: fingerprint(&message),
         };
-        IngressRegistrar::new(&self.sources, &self.permissions)
+        IngressRegistrar::new(&self.sources, self.permissions.as_ref())
             .register(
                 runtime,
                 IngressDraft::Context {
@@ -661,7 +664,7 @@ impl WebCommandPort for KoiWebSource {
         let mut runtime = TaskRuntime::recover(Arc::clone(&self.store), task_id)
             .await
             .map_err(|error| WebApiError::internal(error.to_string()))?;
-        let recorded = IngressRegistrar::new(&self.sources, &self.permissions)
+        let recorded = IngressRegistrar::new(&self.sources, self.permissions.as_ref())
             .register(
                 &mut runtime,
                 IngressDraft::Cancellation {
@@ -724,7 +727,7 @@ impl WebCommandPort for KoiWebSource {
             .await
             .map_err(|error| WebApiError::internal(error.to_string()))?;
         let domain_principal = Self::domain_principal(&principal);
-        let registrar = IngressRegistrar::new(&self.sources, &self.permissions);
+        let registrar = IngressRegistrar::new(&self.sources, self.permissions.as_ref());
         let submitted = registrar
             .register(
                 &mut runtime,
@@ -926,37 +929,6 @@ struct TaskRecord {
     minimum_control_permission: PermissionLevel,
     summary: TaskDto,
     events: Vec<EventEnvelope>,
-}
-
-struct WebPermissionResolver {
-    identities: Arc<WebUserStore>,
-}
-
-#[async_trait]
-impl IngressPermissionResolver for WebPermissionResolver {
-    async fn maximum_permission(
-        &self,
-        subject: IngressSubject,
-    ) -> Result<PermissionLevel, IngressRegistrationError> {
-        if subject.source != WEB_SOURCE_NAME {
-            return Err(IngressRegistrationError::permission_resolution(
-                "来源不是 web",
-            ));
-        }
-        let Some(principal) = subject.principal else {
-            return Err(IngressRegistrationError::permission_resolution(
-                "Web 输入缺少身份",
-            ));
-        };
-        if principal.source != WEB_SOURCE_NAME {
-            return Err(IngressRegistrationError::permission_resolution(
-                "Web 身份来源不匹配",
-            ));
-        }
-        self.identities
-            .permission_for(&principal.subject)
-            .ok_or_else(|| IngressRegistrationError::permission_resolution("Web 身份未授权"))
-    }
 }
 
 fn validate_create_command(command: &CreateTaskCommand) -> Result<(), WebApiError> {
@@ -1449,7 +1421,16 @@ mod tests {
             }"#,
         )
         .unwrap();
-        Arc::new(WebUserStore::open(path).unwrap())
+        Arc::new(
+            WebUserStore::open(
+                path,
+                Arc::new(StaticPermissionDirectory::new(
+                    [("web".into(), PermissionLevel::User)],
+                    [("web".into(), "admin_ops".into(), PermissionLevel::Admin)],
+                )),
+            )
+            .unwrap(),
+        )
     }
 
     fn test_admin() -> WebPrincipal {
