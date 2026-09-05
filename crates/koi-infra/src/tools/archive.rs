@@ -59,7 +59,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
     [
         (
             "archive.list",
-            "列出 tar.gz 归档内容。",
+            "List tar.gz archive contents.",
             ArchiveAction::List,
             PermissionLevel::User,
             ToolSideEffect::ReadOnly,
@@ -67,7 +67,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "archive.create",
-            "在允许目录中创建 tar.gz 归档。",
+            "Create a tar.gz archive in an allowed directory.",
             ArchiveAction::Create,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -75,7 +75,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "archive.extract",
-            "将 tar.gz 归档解压到允许目录。",
+            "Extract a tar.gz archive to an allowed directory.",
             ArchiveAction::Extract,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -134,11 +134,11 @@ impl ToolExecutor for ArchiveTool {
                 let args: ArchiveArgs = parse_args(invocation.tool_call.arguments)?;
                 let archive = existing_path(&self.policy, &args.archive)?;
                 if !archive.is_file() {
-                    return Err(invalid("归档必须是文件"));
+                    return Err(invalid("Archive must be a file"));
                 }
                 self.run(
                     vec!["-tzf".into(), archive.to_string_lossy().into_owned()],
-                    "归档列表",
+                    "Archive listing",
                     cancel,
                     false,
                 )
@@ -150,22 +150,26 @@ impl ToolExecutor for ArchiveTool {
                 let source = existing_path(&self.policy, &args.source)?;
                 let archive = new_path(&self.policy, &args.archive)?;
                 if archive == source || (source.is_dir() && archive.starts_with(&source)) {
-                    return Err(invalid("归档目标不能位于归档源目录内"));
+                    return Err(invalid(
+                        "Archive target must not be inside the archive source directory",
+                    ));
                 }
                 if std::fs::symlink_metadata(&archive)
                     .is_ok_and(|metadata| metadata.file_type().is_symlink())
                 {
-                    return Err(invalid("不能覆盖符号链接归档目标"));
+                    return Err(invalid("Cannot overwrite a symbolic link archive target"));
                 }
                 if archive.exists() && !args.overwrite {
-                    return Err(invalid("归档目标已存在，请显式设置 overwrite=true"));
+                    return Err(invalid(
+                        "Archive target already exists; explicitly set overwrite=true",
+                    ));
                 }
                 let parent = archive
                     .parent()
-                    .ok_or_else(|| invalid("归档目标没有父目录"))?;
+                    .ok_or_else(|| invalid("Archive target has no parent directory"))?;
                 let source_name = source
                     .file_name()
-                    .ok_or_else(|| invalid("归档源缺少名称"))?;
+                    .ok_or_else(|| invalid("Archive source is missing a name"))?;
                 self.run(
                     vec![
                         "-czf".into(),
@@ -175,7 +179,7 @@ impl ToolExecutor for ArchiveTool {
                         "--".into(),
                         source_name.to_string_lossy().into_owned(),
                     ],
-                    "创建归档",
+                    "Create archive",
                     cancel,
                     true,
                 )
@@ -183,54 +187,67 @@ impl ToolExecutor for ArchiveTool {
             }
             ArchiveAction::Extract => {
                 let args: ExtractArgs = parse_args(invocation.tool_call.arguments)?;
-                self.policy.require_mutation()?;
-                let archive = existing_path(&self.policy, &args.archive)?;
-                let destination = existing_path(&self.policy, &args.destination)?;
-                if !archive.is_file() || !destination.is_dir() {
-                    return Err(invalid("归档必须是文件且目标必须是目录"));
-                }
-                let listing = self
-                    .runner
-                    .run(
-                        CommandSpec {
-                            program: "tar".into(),
-                            args: vec!["-tvzf".into(), archive.to_string_lossy().into_owned()],
-                            cwd: None,
-                            stdin: None,
-                            requires_sudo: false,
-                        },
-                        self.definition.timeout_ms,
-                        cancel.clone(),
-                    )
-                    .await?;
-                ensure_success("检查归档", &listing)?;
-                if listing.truncated {
-                    return Err(invalid("归档内容过大，无法在完整校验后解压"));
-                }
-                validate_archive_listing(&listing.stdout)?;
-                validate_archive_types(&listing.stdout)?;
-                let mut extract_args = vec![
-                    "-xzf".into(),
-                    archive.to_string_lossy().into_owned(),
-                    "-C".into(),
-                    destination.to_string_lossy().into_owned(),
-                    "--no-same-owner".into(),
-                    "--no-same-permissions".into(),
-                    "--no-overwrite-dir".into(),
-                ];
-                if args.overwrite {
-                    extract_args.push("--overwrite".into());
-                } else {
-                    extract_args.push("--keep-old-files".into());
-                }
-                extract_args.push("--".into());
-                self.run(extract_args, "解压归档", cancel, true).await
+                self.extract(args, cancel).await
             }
         }
     }
 }
 
 impl ArchiveTool {
+    async fn extract(
+        &self,
+        args: ExtractArgs,
+        cancel: CancellationToken,
+    ) -> Result<ToolResult, ToolError> {
+        self.policy.require_mutation()?;
+        let archive = existing_path(&self.policy, &args.archive)?;
+        let destination = existing_path(&self.policy, &args.destination)?;
+        if !archive.is_file() || !destination.is_dir() {
+            return Err(invalid(
+                "Archive must be a file and destination must be a directory",
+            ));
+        }
+        let listing = self
+            .runner
+            .run(
+                CommandSpec {
+                    program: "tar".into(),
+                    args: vec!["-tvzf".into(), archive.to_string_lossy().into_owned()],
+                    cwd: None,
+                    stdin: None,
+                    requires_sudo: false,
+                },
+                self.definition.timeout_ms,
+                cancel.clone(),
+            )
+            .await?;
+        ensure_success("Validate archive", &listing)?;
+        if listing.truncated {
+            return Err(invalid(
+                "Archive contents are too large to validate completely before extraction",
+            ));
+        }
+        validate_archive_listing(&listing.stdout)?;
+        validate_archive_types(&listing.stdout)?;
+        let mut extract_args = vec![
+            "-xzf".into(),
+            archive.to_string_lossy().into_owned(),
+            "-C".into(),
+            destination.to_string_lossy().into_owned(),
+            "--no-same-owner".into(),
+            "--no-same-permissions".into(),
+            "--no-overwrite-dir".into(),
+        ];
+        extract_args.push(if args.overwrite {
+            "--overwrite".into()
+        } else {
+            "--keep-old-files".into()
+        });
+        extract_args.push("--".into());
+        self.run(extract_args, "Extract archive", cancel, true)
+            .await
+    }
+
     async fn run(
         &self,
         args: Vec<String>,
@@ -280,7 +297,9 @@ fn validate_archive_listing(listing: &str) -> Result<(), ToolError> {
                 .any(|component| matches!(component, std::path::Component::ParentDir))
             || parent_component
         {
-            return Err(invalid(format!("归档包含越界路径：{entry}")));
+            return Err(invalid(format!(
+                "Archive contains an escaping path: {entry}"
+            )));
         }
     }
     Ok(())
@@ -290,7 +309,9 @@ fn validate_archive_types(listing: &str) -> Result<(), ToolError> {
     for line in listing.lines().filter(|line| !line.trim().is_empty()) {
         let (kind, _) = parse_verbose_entry(line)?;
         if !matches!(kind, '-' | 'd') {
-            return Err(invalid(format!("归档包含不允许的特殊文件类型：{kind}")));
+            return Err(invalid(format!(
+                "Archive contains a disallowed special file type: {kind}"
+            )));
         }
     }
     Ok(())
@@ -306,12 +327,12 @@ fn parse_verbose_entry(line: &str) -> Result<(char, &str), ToolError> {
     }
     let name = rest.trim();
     if name.is_empty() {
-        return Err(invalid("无法解析归档条目名称"));
+        return Err(invalid("Unable to parse archive entry name"));
     }
     let kind = mode
         .chars()
         .next()
-        .ok_or_else(|| invalid("无法解析归档条目类型"))?;
+        .ok_or_else(|| invalid("Unable to parse archive entry type"))?;
     Ok((kind, name))
 }
 
@@ -319,7 +340,7 @@ fn take_listing_field(input: &str) -> Result<(&str, &str), ToolError> {
     let input = input.trim_start();
     let boundary = input
         .find(char::is_whitespace)
-        .ok_or_else(|| invalid("无法解析归档详细列表"))?;
+        .ok_or_else(|| invalid("Unable to parse detailed archive listing"))?;
     Ok((&input[..boundary], &input[boundary..]))
 }
 

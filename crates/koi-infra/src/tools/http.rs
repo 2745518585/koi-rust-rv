@@ -51,22 +51,22 @@ pub(crate) fn tools(policy: &ToolPolicy) -> Vec<Arc<dyn ToolExecutor>> {
     [
         (
             "http.get",
-            "向策略允许的 HTTP 主机发起只读 GET 请求。",
+            "Send a read-only GET request to a policy-allowed HTTP host.",
             HttpAction::Get,
         ),
         (
             "curl.get",
-            "以结构化参数执行受限的只读 curl GET 请求。",
+            "Send a restricted read-only curl-style GET request with structured arguments.",
             HttpAction::Get,
         ),
         (
             "http.request",
-            "向策略允许的 HTTP 主机发起受限的写请求。",
+            "Send a restricted mutating request to a policy-allowed HTTP host.",
             HttpAction::Request,
         ),
         (
             "curl.request",
-            "以结构化参数执行受限的 curl 写请求。",
+            "Send a restricted mutating curl-style request with structured arguments.",
             HttpAction::Request,
         ),
     ]
@@ -140,7 +140,11 @@ impl ToolExecutor for HttpTool {
                     "PUT" => Method::PUT,
                     "PATCH" => Method::PATCH,
                     "DELETE" => Method::DELETE,
-                    _ => return Err(invalid("http.request 只允许 POST、PUT、PATCH 或 DELETE")),
+                    _ => {
+                        return Err(invalid(
+                            "http.request only supports POST, PUT, PATCH, or DELETE",
+                        ));
+                    }
                 };
                 self.policy.require_mutation()?;
                 let timeout_ms = self
@@ -171,18 +175,18 @@ impl HttpTool {
         timeout_ms: u64,
         cancel: CancellationToken,
     ) -> Result<ToolResult, ToolError> {
-        let url = Url::parse(&raw_url).map_err(|error| invalid(format!("URL 无效：{error}")))?;
+        let url = Url::parse(&raw_url).map_err(|error| invalid(format!("Invalid URL: {error}")))?;
         self.policy.require_http_host_for_url(&raw_url)?;
         if !url.username().is_empty() || url.password().is_some() {
-            return Err(invalid("URL 不允许包含用户名或密码"));
+            return Err(invalid("URL must not include a user name or password"));
         }
         let resolved = tokio::select! {
-            () = cancel.cancelled() => return Err(ToolError::new(ToolErrorKind::Cancelled, "HTTP 主机解析已取消", true)),
+            () = cancel.cancelled() => return Err(ToolError::new(ToolErrorKind::Cancelled, "HTTP host resolution was cancelled", true)),
             result = tokio::time::timeout(
                 Duration::from_millis(timeout_ms),
                 resolve_http_addresses(&url, self.policy.allow_private_http_addresses),
             ) => result
-                .map_err(|_| ToolError::new(ToolErrorKind::Timeout, format!("HTTP 主机解析超过 {timeout_ms} 毫秒"), true))??,
+                .map_err(|_| ToolError::new(ToolErrorKind::Timeout, format!("HTTP host resolution exceeded {timeout_ms} milliseconds"), true))??,
         };
         let mut client_builder = Client::builder()
             .no_proxy()
@@ -201,13 +205,13 @@ impl HttpTool {
         let mut has_content_type = false;
         if let Some(headers) = headers {
             if headers.len() > 128 {
-                return Err(invalid("HTTP Header 数量不能超过 128 个"));
+                return Err(invalid("HTTP header count must not exceed 128"));
             }
             for (name, value) in headers {
                 let name = reqwest::header::HeaderName::try_from(name.as_str())
-                    .map_err(|error| invalid(format!("HTTP Header 名称无效：{error}")))?;
+                    .map_err(|error| invalid(format!("Invalid HTTP header name: {error}")))?;
                 let value = reqwest::header::HeaderValue::try_from(value.as_str())
-                    .map_err(|error| invalid(format!("HTTP Header 值无效：{error}")))?;
+                    .map_err(|error| invalid(format!("Invalid HTTP header value: {error}")))?;
                 if matches!(
                     name.as_str(),
                     "connection"
@@ -217,7 +221,7 @@ impl HttpTool {
                         | "proxy-connection"
                         | "transfer-encoding"
                 ) {
-                    return Err(invalid(format!("HTTP Header 不允许由调用方设置：{name}")));
+                    return Err(invalid(format!("Caller must not set HTTP header: {name}")));
                 }
                 header_bytes = header_bytes
                     .saturating_add(name.as_str().len())
@@ -230,16 +234,17 @@ impl HttpTool {
         }
         if header_bytes > self.policy.max_http_header_bytes {
             return Err(invalid(format!(
-                "HTTP Header 总大小超过 {} 字节限制",
+                "Total HTTP header size exceeds the {} byte limit. The limit is controlled by [security].max_http_header_bytes in agent.toml",
                 self.policy.max_http_header_bytes
             )));
         }
         if let Some(body) = body {
-            let serialized = serde_json::to_vec(&body)
-                .map_err(|error| invalid(format!("HTTP 请求体无法序列化：{error}")))?;
+            let serialized = serde_json::to_vec(&body).map_err(|error| {
+                invalid(format!("Unable to serialize HTTP request body: {error}"))
+            })?;
             if serialized.len() > self.policy.max_input_bytes {
                 return Err(invalid(format!(
-                    "HTTP 请求体超过 {} 字节限制",
+                    "HTTP request body exceeds the {} byte limit. The limit is controlled by [security].max_input_bytes in agent.toml",
                     self.policy.max_input_bytes
                 )));
             }
@@ -250,7 +255,7 @@ impl HttpTool {
         }
 
         let response = tokio::select! {
-            () = cancel.cancelled() => return Err(ToolError::new(ToolErrorKind::Cancelled, "HTTP 请求已取消", true)),
+            () = cancel.cancelled() => return Err(ToolError::new(ToolErrorKind::Cancelled, "HTTP request was cancelled", true)),
             result = request.send() => result.map_err(|error| map_request_error(&error, timeout_ms))?,
         };
         let status = response.status();
@@ -263,7 +268,7 @@ impl HttpTool {
         let mut bytes = Vec::new();
         let mut truncated = false;
         while let Some(chunk) = tokio::select! {
-            () = cancel.cancelled() => return Err(ToolError::new(ToolErrorKind::Cancelled, "HTTP 响应读取已取消", true)),
+            () = cancel.cancelled() => return Err(ToolError::new(ToolErrorKind::Cancelled, "HTTP response read was cancelled", true)),
             item = stream.next() => item,
         } {
             let chunk = chunk.map_err(|error| {
@@ -280,7 +285,12 @@ impl HttpTool {
         let response_text = String::from_utf8_lossy(&bytes).into_owned();
         let summary_url = safe_url_for_summary(&url);
         Ok(ToolResult {
-            summary: format!("HTTP {} {} 返回 {}", method, summary_url, status.as_u16()),
+            summary: format!(
+                "HTTP {} {} returned {}",
+                method,
+                summary_url,
+                status.as_u16()
+            ),
             data: json!({
                 "status": status.as_u16(),
                 "success": status.is_success(),
@@ -296,12 +306,14 @@ async fn resolve_http_addresses(
     url: &Url,
     allow_private: bool,
 ) -> Result<Vec<SocketAddr>, ToolError> {
-    let host = url.host_str().ok_or_else(|| invalid("URL 缺少主机名"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| invalid("URL is missing a host name"))?;
     let port = url
         .port_or_known_default()
-        .ok_or_else(|| invalid("URL 缺少可识别的端口"))?;
+        .ok_or_else(|| invalid("URL is missing a recognized port"))?;
     if port == 0 {
-        return Err(invalid("HTTP 端口必须位于 1 到 65535 之间"));
+        return Err(invalid("HTTP port must be between 1 and 65535"));
     }
     let literal_ip = host.parse::<IpAddr>().ok();
     let mut addresses = if let Some(ip) = literal_ip {
@@ -312,7 +324,7 @@ async fn resolve_http_addresses(
             .map_err(|error| {
                 ToolError::new(
                     ToolErrorKind::TargetUnavailable,
-                    format!("HTTP 主机解析失败：{host}：{error}"),
+                    format!("Failed to resolve HTTP host {host}: {error}"),
                     true,
                 )
             })?
@@ -323,7 +335,7 @@ async fn resolve_http_addresses(
     if addresses.is_empty() {
         return Err(ToolError::new(
             ToolErrorKind::TargetUnavailable,
-            format!("HTTP 主机没有可连接地址：{host}"),
+            format!("HTTP host has no connectable address: {host}"),
             true,
         ));
     }
@@ -334,7 +346,9 @@ async fn resolve_http_addresses(
     {
         return Err(ToolError::new(
             ToolErrorKind::TargetUnavailable,
-            format!("HTTP 主机解析到了受限地址：{host}"),
+            format!(
+                "HTTP host resolved to a restricted address: {host}. To allow private, loopback, or link-local access, an administrator must set [security].allow_private_http_addresses = true in agent.toml."
+            ),
             false,
         ));
     }
@@ -378,7 +392,7 @@ fn map_request_error(error: &reqwest::Error, timeout_ms: u64) -> ToolError {
     if error.is_timeout() {
         ToolError::new(
             ToolErrorKind::Timeout,
-            format!("HTTP 请求超过 {timeout_ms} 毫秒"),
+            format!("HTTP request exceeded {timeout_ms} milliseconds"),
             true,
         )
     } else if error.is_connect() {
@@ -390,10 +404,10 @@ fn map_request_error(error: &reqwest::Error, timeout_ms: u64) -> ToolError {
 
 impl ToolPolicy {
     fn require_http_host_for_url(&self, raw_url: &str) -> Result<(), ToolError> {
-        let url = Url::parse(raw_url).map_err(|error| invalid(format!("URL 无效：{error}")))?;
+        let url = Url::parse(raw_url).map_err(|error| invalid(format!("Invalid URL: {error}")))?;
         match url.scheme() {
             "http" | "https" => {}
-            _ => return Err(invalid("只允许 http 或 https URL")),
+            _ => return Err(invalid("Only http and https URLs are allowed")),
         }
         self.require_http_host(url.host_str())
     }

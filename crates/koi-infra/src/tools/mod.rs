@@ -96,7 +96,8 @@ pub(crate) fn parse_args<T>(value: serde_json::Value) -> Result<T, ToolError>
 where
     T: serde::de::DeserializeOwned,
 {
-    serde_json::from_value(value).map_err(|error| invalid(format!("工具参数无效：{error}")))
+    serde_json::from_value(value)
+        .map_err(|error| invalid(format!("Invalid tool arguments: {error}")))
 }
 
 pub(crate) async fn blocking<T, F>(operation: F) -> Result<T, ToolError>
@@ -106,17 +107,21 @@ where
 {
     tokio::task::spawn_blocking(operation)
         .await
-        .map_err(|error| internal(format!("阻塞操作异常结束：{error}")))?
+        .map_err(|error| {
+            internal(format!(
+                "Blocking operation terminated unexpectedly: {error}"
+            ))
+        })?
 }
 
 pub(crate) fn command_result(label: &str, output: &CommandOutput) -> koi_core::domain::ToolResult {
     let exit_code = output.exit_code;
     let suffix = exit_code.map_or_else(
-        || "未取得退出码".to_owned(),
-        |code| format!("退出码 {code}"),
+        || "exit code unavailable".to_owned(),
+        |code| format!("exit code {code}"),
     );
     koi_core::domain::ToolResult {
-        summary: format!("{label}完成（{suffix}）"),
+        summary: format!("{label} completed ({suffix})"),
         data: serde_json::json!({
             "exit_code": exit_code,
             "stdout": redact_text(&output.stdout),
@@ -135,9 +140,17 @@ pub(crate) fn ensure_success(label: &str, output: &CommandOutput) -> Result<(), 
     } else {
         redact_text(output.stderr.trim())
     };
+    let sudo_hint = if output.used_sudo {
+        "; this operation used sudo -n. Confirm that the runtime account has non-interactive sudoers authorization, or have an administrator review [security].use_sudo in agent.toml"
+    } else {
+        ""
+    };
     Err(ToolError::new(
         ToolErrorKind::ExecutionFailed,
-        format!("{label}失败（退出码 {:?}）：{detail}", output.exit_code),
+        format!(
+            "{label} failed (exit code {:?}): {detail}{sudo_hint}",
+            output.exit_code
+        ),
         false,
     ))
 }

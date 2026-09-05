@@ -29,6 +29,7 @@ pub(crate) struct CommandOutput {
     pub stdout: String,
     pub stderr: String,
     pub truncated: bool,
+    pub used_sudo: bool,
 }
 
 impl CommandRunner {
@@ -47,7 +48,7 @@ impl CommandRunner {
         if spec.program.trim().is_empty() {
             return Err(ToolError::new(
                 ToolErrorKind::InvalidArguments,
-                "程序名不能为空",
+                "Program name must not be empty",
                 false,
             ));
         }
@@ -59,14 +60,14 @@ impl CommandRunner {
         {
             return Err(ToolError::new(
                 ToolErrorKind::InvalidArguments,
-                "程序或参数不能包含控制字符",
+                "Program name and arguments must not contain control characters",
                 false,
             ));
         }
         if spec.args.len() > 256 {
             return Err(ToolError::new(
                 ToolErrorKind::InvalidArguments,
-                "命令参数数量不能超过 256 个",
+                "A command may not contain more than 256 arguments",
                 false,
             ));
         }
@@ -80,7 +81,7 @@ impl CommandRunner {
             return Err(ToolError::new(
                 ToolErrorKind::InvalidArguments,
                 format!(
-                    "命令参数总大小超过 {} 字节限制",
+                    "Total command argument size exceeds the {} byte limit. The limit is controlled by [security].max_input_bytes in agent.toml",
                     self.policy.max_input_bytes
                 ),
                 false,
@@ -93,14 +94,18 @@ impl CommandRunner {
         {
             return Err(ToolError::new(
                 ToolErrorKind::InvalidArguments,
-                format!("命令标准输入超过 {} 字节限制", self.policy.max_input_bytes),
+                format!(
+                    "Command standard input exceeds the {} byte limit. The limit is controlled by [security].max_input_bytes in agent.toml",
+                    self.policy.max_input_bytes
+                ),
                 false,
             ));
         }
         let timeout_ms = self.policy.timeout(Some(timeout_ms), timeout_ms)?;
         let mut program = spec.program;
         let mut args = spec.args;
-        if spec.requires_sudo && self.policy.use_sudo && cfg!(unix) {
+        let used_sudo = spec.requires_sudo && self.policy.use_sudo && cfg!(unix);
+        if used_sudo {
             args.insert(0, program);
             args.insert(0, "-n".into());
             program = "sudo".into();
@@ -140,14 +145,27 @@ impl CommandRunner {
             } else {
                 ToolErrorKind::ExecutionFailed
             };
-            ToolError::new(kind, format!("无法启动 {program}：{error}"), false)
+            let hint = if used_sudo && error.kind() == std::io::ErrorKind::NotFound {
+                "; this operation requires sudo because [security].use_sudo=true. Install sudo, or have an administrator set [security].use_sudo=false only after confirming the runtime account already has the required privileges"
+            } else {
+                ""
+            };
+            ToolError::new(kind, format!("Unable to start {program}: {error}{hint}"), false)
         })?;
         let child_pid = child.id();
         let stdout = child.stdout.take().ok_or_else(|| {
-            ToolError::new(ToolErrorKind::Internal, "无法取得命令标准输出", false)
+            ToolError::new(
+                ToolErrorKind::Internal,
+                "Unable to capture command standard output",
+                false,
+            )
         })?;
         let stderr = child.stderr.take().ok_or_else(|| {
-            ToolError::new(ToolErrorKind::Internal, "无法取得命令标准错误", false)
+            ToolError::new(
+                ToolErrorKind::Internal,
+                "Unable to capture command standard error",
+                false,
+            )
         })?;
         let stdin = child.stdin.take();
         let input = spec.stdin;
@@ -159,14 +177,14 @@ impl CommandRunner {
                     stdin.write_all(&input).await.map_err(|error| {
                         ToolError::new(
                             ToolErrorKind::ExecutionFailed,
-                            format!("写入命令标准输入失败：{error}"),
+                            format!("Failed to write command standard input: {error}"),
                             false,
                         )
                     })?;
                     stdin.shutdown().await.map_err(|error| {
                         ToolError::new(
                             ToolErrorKind::ExecutionFailed,
-                            format!("关闭命令标准输入失败：{error}"),
+                            format!("Failed to close command standard input: {error}"),
                             false,
                         )
                     })?;
@@ -179,7 +197,7 @@ impl CommandRunner {
                 child.wait().await.map_err(|error| {
                     ToolError::new(
                         ToolErrorKind::ExecutionFailed,
-                        format!("等待命令结束失败：{error}"),
+                        format!("Failed while waiting for the command to exit: {error}"),
                         false,
                     )
                 })
@@ -196,20 +214,21 @@ impl CommandRunner {
                 stdout: String::from_utf8_lossy(&stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&stderr).into_owned(),
                 truncated: stdout_truncated || stderr_truncated,
+                used_sudo,
             })
         };
 
         tokio::select! {
             () = cancel.cancelled() => {
                 terminate_process_tree(child_pid).await;
-                Err(ToolError::new(ToolErrorKind::Cancelled, "命令执行已取消", true))
+                Err(ToolError::new(ToolErrorKind::Cancelled, "Command execution was cancelled", true))
             },
             result = tokio::time::timeout(Duration::from_millis(timeout_ms), run) => {
                 if let Ok(result) = result {
                     result
                 } else {
                     terminate_process_tree(child_pid).await;
-                    Err(ToolError::new(ToolErrorKind::Timeout, format!("命令执行超过 {timeout_ms} 毫秒"), true))
+                    Err(ToolError::new(ToolErrorKind::Timeout, format!("Command execution exceeded {timeout_ms} milliseconds"), true))
                 }
             }
         }
@@ -261,7 +280,7 @@ where
     reader.read_to_end(&mut buffer).await.map_err(|error| {
         ToolError::new(
             ToolErrorKind::ExecutionFailed,
-            format!("读取命令输出失败：{error}"),
+            format!("Failed to read command output: {error}"),
             false,
         )
     })?;

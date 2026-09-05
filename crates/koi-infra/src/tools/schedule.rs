@@ -42,10 +42,10 @@ struct ContentArgs {
 
 pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn ToolExecutor>> {
     [
-        ("schedule.list", "读取当前用户的 crontab。", ScheduleAction::List, PermissionLevel::User, ToolSideEffect::ReadOnly, true),
-        ("schedule.timers", "读取 systemd 定时器。", ScheduleAction::Timers, PermissionLevel::User, ToolSideEffect::ReadOnly, true),
-        ("schedule.install", "替换当前用户的 crontab；原内容不会自动合并。", ScheduleAction::Install, PermissionLevel::Operator, ToolSideEffect::Destructive, true),
-        ("schedule.clear", "删除当前用户的 crontab。", ScheduleAction::Clear, PermissionLevel::Operator, ToolSideEffect::Destructive, true),
+        ("schedule.list", "Read the current user's crontab.", ScheduleAction::List, PermissionLevel::User, ToolSideEffect::ReadOnly, true),
+        ("schedule.timers", "Read systemd timers.", ScheduleAction::Timers, PermissionLevel::User, ToolSideEffect::ReadOnly, true),
+        ("schedule.install", "Replace the current user's crontab; existing content is not merged automatically.", ScheduleAction::Install, PermissionLevel::Operator, ToolSideEffect::Destructive, true),
+        ("schedule.clear", "Delete the current user's crontab.", ScheduleAction::Clear, PermissionLevel::Operator, ToolSideEffect::Destructive, true),
     ]
     .into_iter()
     .map(|(name, description, action, permission, side_effect, model_visible)| {
@@ -86,7 +86,7 @@ impl ToolExecutor for ScheduleTool {
                         stdin: None,
                         requires_sudo: false,
                     },
-                    "读取 crontab",
+                    "Read crontab",
                     cancel,
                     false,
                 )
@@ -102,7 +102,7 @@ impl ToolExecutor for ScheduleTool {
                         stdin: None,
                         requires_sudo: false,
                     },
-                    "读取 systemd 定时器",
+                    "Read systemd timers",
                     cancel,
                     false,
                 )
@@ -113,7 +113,7 @@ impl ToolExecutor for ScheduleTool {
                 self.policy.require_mutation()?;
                 if args.content.trim().is_empty() {
                     return Err(invalid(
-                        "crontab 内容不能为空；清空任务请使用 schedule.clear",
+                        "crontab content must not be empty; use schedule.clear to remove scheduled jobs",
                     ));
                 }
                 validate_content(&args.content, self.policy.max_file_bytes)?;
@@ -125,7 +125,7 @@ impl ToolExecutor for ScheduleTool {
                         stdin: Some(args.content.into_bytes()),
                         requires_sudo: false,
                     },
-                    "安装 crontab",
+                    "Install crontab",
                     cancel,
                     true,
                 )
@@ -142,7 +142,7 @@ impl ToolExecutor for ScheduleTool {
                         stdin: None,
                         requires_sudo: false,
                     },
-                    "清理 crontab",
+                    "Clear crontab",
                     cancel,
                     true,
                 )
@@ -173,13 +173,17 @@ impl ScheduleTool {
 
 fn validate_content(content: &str, max_bytes: usize) -> Result<(), ToolError> {
     if content.len() > max_bytes {
-        return Err(invalid(format!("crontab 内容超过 {max_bytes} 字节限制")));
+        return Err(invalid(format!(
+            "crontab content exceeds the {max_bytes} byte limit. The limit is controlled by [security].max_file_bytes in agent.toml"
+        )));
     }
     if content
         .chars()
         .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
     {
-        return Err(invalid("crontab 内容包含不允许的控制字符"));
+        return Err(invalid(
+            "crontab content contains disallowed control characters",
+        ));
     }
     Ok(())
 }

@@ -133,7 +133,7 @@ impl ToolPolicy {
         } else {
             Err(ToolError::new(
                 ToolErrorKind::ExecutionFailed,
-                "写操作已被当前工具策略禁用",
+                "Mutating tools are disabled by policy. To allow this operation, an administrator must set [security].allow_mutating_tools = true in agent.toml.",
                 false,
             ))
         }
@@ -145,7 +145,7 @@ impl ToolPolicy {
         } else {
             Err(ToolError::new(
                 ToolErrorKind::ExecutionFailed,
-                "Admin 任意命令工具未在当前策略中启用",
+                "Admin command tools are disabled by policy. To allow this operation, an administrator must set [security].allow_admin_commands = true in agent.toml.",
                 false,
             ))
         }
@@ -162,7 +162,9 @@ impl ToolPolicy {
         {
             return Err(ToolError::new(
                 ToolErrorKind::InvalidArguments,
-                format!("服务未被策略允许：{service}"),
+                format!(
+                    "Service is not allowed by policy: {service}. To allow access, an administrator must add it to [security].allowed_services in agent.toml."
+                ),
                 false,
             ));
         }
@@ -173,14 +175,16 @@ impl ToolPolicy {
         let Some(host) = host.map(str::to_ascii_lowercase) else {
             return Err(ToolError::new(
                 ToolErrorKind::InvalidArguments,
-                "URL 缺少主机名",
+                "URL is missing a host name",
                 false,
             ));
         };
         if !self.allowed_http_hosts.contains(&host) {
             return Err(ToolError::new(
                 ToolErrorKind::TargetUnavailable,
-                format!("HTTP 主机未被策略允许：{host}"),
+                format!(
+                    "HTTP host is not allowed by policy: {host}. To allow access, an administrator must add it to [security].allowed_http_hosts in agent.toml."
+                ),
                 false,
             ));
         }
@@ -192,7 +196,9 @@ impl ToolPolicy {
         if !self.allowed_network_hosts.contains(&normalized) {
             return Err(ToolError::new(
                 ToolErrorKind::TargetUnavailable,
-                format!("网络探测目标未被策略允许：{host}"),
+                format!(
+                    "Network probe target is not allowed by policy: {host}. To allow probing, an administrator must add it to [security].allowed_network_hosts in agent.toml."
+                ),
                 false,
             ));
         }
@@ -208,7 +214,9 @@ impl ToolPolicy {
         {
             return Err(ToolError::new(
                 ToolErrorKind::TargetUnavailable,
-                format!("数据库目标未被策略允许：{target}"),
+                format!(
+                    "Database target is not allowed by policy: {target}. To allow access, an administrator must add it to [security].allowed_database_targets in agent.toml."
+                ),
                 false,
             ));
         }
@@ -224,7 +232,10 @@ impl ToolPolicy {
         if timeout == 0 || timeout > self.max_timeout_ms {
             return Err(ToolError::new(
                 ToolErrorKind::InvalidArguments,
-                format!("超时时间必须位于 1 到 {} 毫秒之间", self.max_timeout_ms),
+                format!(
+                    "Timeout must be between 1 and {} milliseconds. The upper limit is controlled by [security].max_timeout_ms in agent.toml.",
+                    self.max_timeout_ms
+                ),
                 false,
             ));
         }
@@ -263,7 +274,7 @@ pub(crate) fn absolute_path(path: &Path) -> Result<PathBuf, ToolError> {
             .map_err(|error| {
                 ToolError::new(
                     ToolErrorKind::TargetUnavailable,
-                    format!("无法取得当前目录：{error}"),
+                    format!("Unable to resolve the current directory: {error}"),
                     false,
                 )
             })
@@ -283,14 +294,23 @@ fn allowed_roots(policy: &ToolPolicy) -> Vec<PathBuf> {
 
 fn ensure_within(policy: &ToolPolicy, path: &Path) -> Result<(), ToolError> {
     let roots = allowed_roots(policy);
-    if roots.is_empty()
-        || !roots
-            .iter()
-            .any(|root| path == root || path.starts_with(root))
+    if roots.is_empty() {
+        return Err(ToolError::new(
+            ToolErrorKind::TargetUnavailable,
+            "No allowed paths are configured. An administrator must configure directories in [security].allowed_roots in agent.toml.",
+            false,
+        ));
+    }
+    if !roots
+        .iter()
+        .any(|root| path == root || path.starts_with(root))
     {
         return Err(ToolError::new(
             ToolErrorKind::TargetUnavailable,
-            format!("路径不在允许范围内：{}", path.display()),
+            format!(
+                "Path is outside the allowed roots: {}. To allow access, an administrator must add its parent directory to [security].allowed_roots in agent.toml.",
+                path.display()
+            ),
             false,
         ));
     }
@@ -301,7 +321,7 @@ pub(crate) fn existing_path(policy: &ToolPolicy, raw: &str) -> Result<PathBuf, T
     if raw.trim().is_empty() {
         return Err(ToolError::new(
             ToolErrorKind::InvalidArguments,
-            "路径不能为空",
+            "Path must not be empty",
             false,
         ));
     }
@@ -309,7 +329,7 @@ pub(crate) fn existing_path(policy: &ToolPolicy, raw: &str) -> Result<PathBuf, T
     let canonical = std::fs::canonicalize(&absolute).map_err(|error| {
         ToolError::new(
             ToolErrorKind::TargetUnavailable,
-            format!("路径不可用：{}：{error}", absolute.display()),
+            format!("Path is unavailable: {}: {error}", absolute.display()),
             false,
         )
     })?;
@@ -321,23 +341,34 @@ pub(crate) fn new_path(policy: &ToolPolicy, raw: &str) -> Result<PathBuf, ToolEr
     if raw.trim().is_empty() {
         return Err(ToolError::new(
             ToolErrorKind::InvalidArguments,
-            "路径不能为空",
+            "Path must not be empty",
             false,
         ));
     }
     let absolute = absolute_path(Path::new(raw))?;
     let parent = absolute.parent().ok_or_else(|| {
-        ToolError::new(ToolErrorKind::InvalidArguments, "目标路径没有父目录", false)
+        ToolError::new(
+            ToolErrorKind::InvalidArguments,
+            "Target path has no parent directory",
+            false,
+        )
     })?;
     let canonical_parent = std::fs::canonicalize(parent).map_err(|error| {
         ToolError::new(
             ToolErrorKind::TargetUnavailable,
-            format!("目标父目录不可用：{}：{error}", parent.display()),
+            format!(
+                "Target parent directory is unavailable: {}: {error}",
+                parent.display()
+            ),
             false,
         )
     })?;
     let candidate = canonical_parent.join(absolute.file_name().ok_or_else(|| {
-        ToolError::new(ToolErrorKind::InvalidArguments, "目标路径缺少文件名", false)
+        ToolError::new(
+            ToolErrorKind::InvalidArguments,
+            "Target path is missing a file name",
+            false,
+        )
     })?);
     ensure_within(policy, &candidate)?;
     Ok(candidate)
@@ -348,7 +379,7 @@ pub(crate) fn existing_entry(policy: &ToolPolicy, raw: &str) -> Result<PathBuf, 
     std::fs::symlink_metadata(&path).map_err(|error| {
         ToolError::new(
             ToolErrorKind::TargetUnavailable,
-            format!("路径不可用：{}：{error}", path.display()),
+            format!("Path is unavailable: {}: {error}", path.display()),
             false,
         )
     })?;
@@ -365,7 +396,7 @@ pub(crate) fn relative_arg(repo: &Path, raw: &str) -> Result<String, ToolError> 
     {
         return Err(ToolError::new(
             ToolErrorKind::InvalidArguments,
-            format!("路径参数必须是仓库内相对路径：{raw}"),
+            format!("Path argument must be relative to the repository: {raw}"),
             false,
         ));
     }
@@ -377,10 +408,40 @@ pub(crate) fn relative_arg(repo: &Path, raw: &str) -> Result<String, ToolError> 
         if canonical != repo && !canonical.starts_with(repo) {
             return Err(ToolError::new(
                 ToolErrorKind::TargetUnavailable,
-                format!("仓库路径越界：{raw}"),
+                format!("Repository path escapes the repository root: {raw}"),
                 false,
             ));
         }
     }
     Ok(raw.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ToolPolicy, existing_path};
+
+    #[test]
+    fn policy_rejections_explain_the_relevant_configuration() {
+        let policy = ToolPolicy::default();
+        assert!(
+            policy
+                .require_mutation()
+                .unwrap_err()
+                .message
+                .contains("[security].allow_mutating_tools")
+        );
+        assert!(
+            policy
+                .require_http_host(Some("example.com"))
+                .unwrap_err()
+                .message
+                .contains("[security].allowed_http_hosts")
+        );
+        assert!(
+            existing_path(&policy, ".")
+                .unwrap_err()
+                .message
+                .contains("[security].allowed_roots")
+        );
+    }
 }

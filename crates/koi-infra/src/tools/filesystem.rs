@@ -103,7 +103,7 @@ pub(crate) fn tools(policy: &ToolPolicy) -> Vec<Arc<dyn ToolExecutor>> {
     [
         (
             "fs.list",
-            "列出允许范围内的目录内容。",
+            "List directory contents within the allowed roots.",
             FileAction::List,
             PermissionLevel::User,
             ToolSideEffect::ReadOnly,
@@ -111,7 +111,7 @@ pub(crate) fn tools(policy: &ToolPolicy) -> Vec<Arc<dyn ToolExecutor>> {
         ),
         (
             "fs.stat",
-            "读取允许范围内的文件或目录元数据。",
+            "Read file or directory metadata within the allowed roots.",
             FileAction::Stat,
             PermissionLevel::User,
             ToolSideEffect::ReadOnly,
@@ -119,7 +119,7 @@ pub(crate) fn tools(policy: &ToolPolicy) -> Vec<Arc<dyn ToolExecutor>> {
         ),
         (
             "fs.read",
-            "读取允许范围内的文件内容。",
+            "Read a file within the allowed roots.",
             FileAction::Read,
             PermissionLevel::User,
             ToolSideEffect::ReadOnly,
@@ -127,7 +127,7 @@ pub(crate) fn tools(policy: &ToolPolicy) -> Vec<Arc<dyn ToolExecutor>> {
         ),
         (
             "fs.find",
-            "在允许范围内递归查找文件。",
+            "Recursively find files within the allowed roots.",
             FileAction::Find,
             PermissionLevel::User,
             ToolSideEffect::ReadOnly,
@@ -135,7 +135,7 @@ pub(crate) fn tools(policy: &ToolPolicy) -> Vec<Arc<dyn ToolExecutor>> {
         ),
         (
             "fs.search",
-            "在允许范围内搜索文件内容。",
+            "Search file contents within the allowed roots.",
             FileAction::Search,
             PermissionLevel::User,
             ToolSideEffect::ReadOnly,
@@ -143,7 +143,7 @@ pub(crate) fn tools(policy: &ToolPolicy) -> Vec<Arc<dyn ToolExecutor>> {
         ),
         (
             "fs.mkdir",
-            "在允许范围内创建目录。",
+            "Create a directory within the allowed roots.",
             FileAction::Mkdir,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -151,7 +151,7 @@ pub(crate) fn tools(policy: &ToolPolicy) -> Vec<Arc<dyn ToolExecutor>> {
         ),
         (
             "fs.write",
-            "在允许范围内写入文件。",
+            "Write a file within the allowed roots.",
             FileAction::Write,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -159,7 +159,7 @@ pub(crate) fn tools(policy: &ToolPolicy) -> Vec<Arc<dyn ToolExecutor>> {
         ),
         (
             "fs.copy",
-            "在允许范围内复制文件。",
+            "Copy a file within the allowed roots.",
             FileAction::Copy,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -167,7 +167,7 @@ pub(crate) fn tools(policy: &ToolPolicy) -> Vec<Arc<dyn ToolExecutor>> {
         ),
         (
             "fs.move",
-            "在允许范围内移动文件。",
+            "Move a file within the allowed roots.",
             FileAction::Move,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -175,7 +175,7 @@ pub(crate) fn tools(policy: &ToolPolicy) -> Vec<Arc<dyn ToolExecutor>> {
         ),
         (
             "fs.delete",
-            "删除允许范围内的文件或目录。",
+            "Delete a file or directory within the allowed roots.",
             FileAction::Delete,
             PermissionLevel::Operator,
             ToolSideEffect::Destructive,
@@ -283,7 +283,7 @@ impl FileTool {
         blocking(move || {
             let metadata = fs::metadata(&path).map_err(|error| invalid(error.to_string()))?;
             if !metadata.is_dir() {
-                return Err(invalid("fs.list 的目标必须是目录"));
+                return Err(invalid("The fs.list target must be a directory"));
             }
             let mut entries = Vec::new();
             let mut truncated = false;
@@ -301,7 +301,7 @@ impl FileTool {
                 }));
             }
             Ok(ToolResult {
-                summary: format!("已列出 {} 项：{}", entries.len(), path.display()),
+                summary: format!("Listed {} entries: {}", entries.len(), path.display()),
                 data: json!({"path": path, "entries": entries}),
                 truncated,
             })
@@ -322,7 +322,7 @@ impl FileTool {
                 "file"
             };
             Ok(ToolResult {
-                summary: format!("已读取文件信息：{}", path.display()),
+                summary: format!("Read file metadata: {}", path.display()),
                 data: json!({
                     "path": path,
                     "kind": kind,
@@ -346,12 +346,12 @@ impl FileTool {
         blocking(move || {
             let metadata = fs::metadata(&path).map_err(|error| invalid(error.to_string()))?;
             if !metadata.is_file() {
-                return Err(invalid("fs.read 的目标必须是文件"));
+                return Err(invalid("The fs.read target must be a file"));
             }
             let (bytes, truncated) = read_limited_file(&path, limit)?;
             let content = String::from_utf8_lossy(&bytes).into_owned();
             Ok(ToolResult {
-                summary: format!("已读取文件：{}", path.display()),
+                summary: format!("Read file: {}", path.display()),
                 data: json!({"path": path, "content": content, "size_bytes": bytes.len()}),
                 truncated,
             })
@@ -363,7 +363,9 @@ impl FileTool {
         let root = existing_path(&self.policy, &args.path)?;
         let name = args.name.unwrap_or_default();
         if name.chars().any(char::is_control) || name.len() > 4_096 {
-            return Err(invalid("文件名过滤器不能包含控制字符且不能超过 4096 字节"));
+            return Err(invalid(
+                "File name filter must not contain control characters or exceed 4096 bytes",
+            ));
         }
         let max_results = positive_limit(args.max_results, 200, 2_000, "max_results")?;
         let max_scanned_paths = self.policy.max_scanned_paths.max(1);
@@ -383,7 +385,7 @@ impl FileTool {
                 .collect();
             let truncated = scan_truncated || matching.next().is_some();
             Ok(ToolResult {
-                summary: format!("找到 {} 个路径", results.len()),
+                summary: format!("Found {} paths", results.len()),
                 data: json!({"root": root, "results": results}),
                 truncated,
             })
@@ -393,10 +395,12 @@ impl FileTool {
 
     async fn search(&self, args: SearchArgs) -> Result<ToolResult, ToolError> {
         if args.pattern.is_empty() {
-            return Err(invalid("搜索模式不能为空"));
+            return Err(invalid("Search pattern must not be empty"));
         }
         if args.pattern.chars().any(char::is_control) || args.pattern.len() > 4_096 {
-            return Err(invalid("搜索模式不能包含控制字符且不能超过 4096 字节"));
+            return Err(invalid(
+                "Search pattern must not contain control characters or exceed 4096 bytes",
+            ));
         }
         let root = existing_path(&self.policy, &args.path)?;
         let pattern = args.pattern;
@@ -433,7 +437,7 @@ impl FileTool {
                 }
             }
             Ok(ToolResult {
-                summary: format!("找到 {} 条匹配", results.len()),
+                summary: format!("Found {} matches", results.len()),
                 data: json!({"root": root, "pattern": pattern, "results": results}),
                 truncated,
             })
@@ -446,11 +450,12 @@ impl FileTool {
         let path = new_path(&self.policy, &args.path)?;
         blocking(move || {
             if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-                return Err(invalid("不能通过符号链接创建目录"));
+                return Err(invalid("Cannot create a directory through a symbolic link"));
             }
-            fs::create_dir_all(&path).map_err(|error| invalid(format!("创建目录失败：{error}")))?;
+            fs::create_dir_all(&path)
+                .map_err(|error| invalid(format!("Failed to create directory: {error}")))?;
             Ok(ToolResult {
-                summary: format!("已创建目录：{}", path.display()),
+                summary: format!("Created directory: {}", path.display()),
                 data: json!({"path": path}),
                 truncated: false,
             })
@@ -462,7 +467,7 @@ impl FileTool {
         self.policy.require_mutation()?;
         if args.content.len() > self.policy.max_file_bytes {
             return Err(invalid(format!(
-                "文件内容超过 {} 字节限制",
+                "File content exceeds the {} byte limit. The limit is controlled by [security].max_file_bytes in agent.toml",
                 self.policy.max_file_bytes
             )));
         }
@@ -471,7 +476,7 @@ impl FileTool {
         let content = args.content;
         blocking(move || {
             if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-                return Err(invalid("不能通过符号链接写入文件"));
+                return Err(invalid("Cannot write a file through a symbolic link"));
             }
             let mut options = OpenOptions::new();
             options.create(true).write(true);
@@ -482,11 +487,11 @@ impl FileTool {
             }
             let mut file = options
                 .open(&path)
-                .map_err(|error| invalid(format!("打开目标文件失败：{error}")))?;
+                .map_err(|error| invalid(format!("Failed to open target file: {error}")))?;
             file.write_all(content.as_bytes())
-                .map_err(|error| invalid(format!("写入文件失败：{error}")))?;
+                .map_err(|error| invalid(format!("Failed to write file: {error}")))?;
             Ok(ToolResult {
-                summary: format!("已写入文件：{}", path.display()),
+                summary: format!("Wrote file: {}", path.display()),
                 data: json!({"path": path, "bytes_written": content.len(), "append": append}),
                 truncated: false,
             })
@@ -505,38 +510,42 @@ impl FileTool {
         let overwrite = args.overwrite;
         blocking(move || {
             let source_metadata = fs::symlink_metadata(&source)
-                .map_err(|error| invalid(format!("读取源文件失败：{error}")))?;
+                .map_err(|error| invalid(format!("Failed to read source file: {error}")))?;
             if source_metadata.file_type().is_symlink() {
-                return Err(invalid("不支持复制或移动符号链接"));
+                return Err(invalid("Copying or moving symbolic links is not supported"));
             }
             if !source_metadata.is_file() {
-                return Err(invalid("复制或移动目前只支持普通文件"));
+                return Err(invalid(
+                    "Copy and move currently support regular files only",
+                ));
             }
             if fs::symlink_metadata(&destination)
                 .is_ok_and(|metadata| metadata.file_type().is_symlink())
             {
-                return Err(invalid("不能覆盖符号链接目标"));
+                return Err(invalid("Cannot overwrite a symbolic link target"));
             }
             if destination.exists() {
                 if !overwrite {
-                    return Err(invalid("目标已存在，未开启 overwrite"));
+                    return Err(invalid(
+                        "Destination already exists; overwrite is not enabled",
+                    ));
                 }
                 if destination.is_dir() {
-                    return Err(invalid("不能覆盖目标目录"));
+                    return Err(invalid("Cannot overwrite a destination directory"));
                 }
                 fs::remove_file(&destination).map_err(|error| invalid(error.to_string()))?;
             }
             if move_file {
                 fs::rename(&source, &destination)
-                    .map_err(|error| invalid(format!("移动失败：{error}")))?;
+                    .map_err(|error| invalid(format!("Failed to move file: {error}")))?;
             } else {
                 fs::copy(&source, &destination)
-                    .map_err(|error| invalid(format!("复制失败：{error}")))?;
+                    .map_err(|error| invalid(format!("Failed to copy file: {error}")))?;
             }
             Ok(ToolResult {
                 summary: format!(
-                    "已{}：{} -> {}",
-                    if move_file { "移动" } else { "复制" },
+                    "{} completed: {} -> {}",
+                    if move_file { "Move" } else { "Copy" },
                     source.display(),
                     destination.display()
                 ),
@@ -557,23 +566,25 @@ impl FileTool {
             .iter()
             .any(|root| fs::canonicalize(root).is_ok_and(|canonical| canonical == path))
         {
-            return Err(invalid("不能删除配置的允许根目录"));
+            return Err(invalid(
+                "Configured allowed root directories cannot be deleted",
+            ));
         }
         blocking(move || {
             let metadata =
                 fs::symlink_metadata(&path).map_err(|error| invalid(error.to_string()))?;
             if metadata.is_dir() {
                 if !recursive {
-                    return Err(invalid("删除目录必须显式设置 recursive=true"));
+                    return Err(invalid("Deleting a directory requires recursive=true"));
                 }
                 fs::remove_dir_all(&path)
-                    .map_err(|error| invalid(format!("删除目录失败：{error}")))?;
+                    .map_err(|error| invalid(format!("Failed to delete directory: {error}")))?;
             } else {
                 fs::remove_file(&path)
-                    .map_err(|error| invalid(format!("删除文件失败：{error}")))?;
+                    .map_err(|error| invalid(format!("Failed to delete file: {error}")))?;
             }
             Ok(ToolResult {
-                summary: format!("已删除：{}", path.display()),
+                summary: format!("Deleted: {}", path.display()),
                 data: json!({"path": path, "recursive": recursive}),
                 truncated: false,
             })
@@ -590,7 +601,7 @@ fn positive_limit(
 ) -> Result<usize, ToolError> {
     let limit = value.unwrap_or(default);
     if limit == 0 {
-        return Err(invalid(format!("{name} 必须大于 0")));
+        return Err(invalid(format!("{name} must be greater than zero")));
     }
     Ok(limit.min(maximum))
 }
@@ -622,7 +633,7 @@ fn collect_paths(
             return Ok(true);
         }
         let file_type = fs::symlink_metadata(&current)
-            .map_err(|error| invalid(format!("读取路径失败：{error}")))?
+            .map_err(|error| invalid(format!("Failed to read path: {error}")))?
             .file_type();
         if file_type.is_symlink() {
             continue;

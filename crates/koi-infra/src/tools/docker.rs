@@ -118,7 +118,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
     [
         (
             "docker.ps",
-            "读取容器列表。",
+            "Read the container list.",
             DockerAction::Ps,
             PermissionLevel::User,
             ToolSideEffect::ReadOnly,
@@ -126,7 +126,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "docker.images",
-            "读取本地镜像列表。",
+            "Read the local image list.",
             DockerAction::Images,
             PermissionLevel::User,
             ToolSideEffect::ReadOnly,
@@ -134,7 +134,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "docker.inspect",
-            "读取容器或镜像详情。",
+            "Read container or image details.",
             DockerAction::Inspect,
             PermissionLevel::User,
             ToolSideEffect::ReadOnly,
@@ -142,7 +142,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "docker.logs",
-            "读取容器日志。",
+            "Read container logs.",
             DockerAction::Logs,
             PermissionLevel::User,
             ToolSideEffect::ReadOnly,
@@ -150,7 +150,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "docker.stats",
-            "读取容器资源使用情况。",
+            "Read container resource usage.",
             DockerAction::Stats,
             PermissionLevel::User,
             ToolSideEffect::ReadOnly,
@@ -158,7 +158,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "docker.version",
-            "读取 Docker 版本和服务信息。",
+            "Read Docker version and daemon information.",
             DockerAction::Version,
             PermissionLevel::User,
             ToolSideEffect::ReadOnly,
@@ -166,7 +166,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "docker.pull",
-            "拉取 Docker 镜像。",
+            "Pull a Docker image.",
             DockerAction::Pull,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -174,7 +174,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "docker.start",
-            "启动 Docker 容器。",
+            "Start a Docker container.",
             DockerAction::Start,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -182,7 +182,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "docker.stop",
-            "停止 Docker 容器。",
+            "Stop a Docker container.",
             DockerAction::Stop,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -190,7 +190,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "docker.restart",
-            "重启 Docker 容器。",
+            "Restart a Docker container.",
             DockerAction::Restart,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -198,7 +198,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "docker.rm",
-            "删除 Docker 容器。",
+            "Remove a Docker container.",
             DockerAction::Remove,
             PermissionLevel::Operator,
             ToolSideEffect::Destructive,
@@ -206,7 +206,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "docker.build",
-            "以 Admin 权限构建 Docker 镜像；Dockerfile 可执行任意构建指令。",
+            "Build a Docker image with Admin permission; a Dockerfile can execute arbitrary build instructions.",
             DockerAction::Build,
             PermissionLevel::Admin,
             ToolSideEffect::Stateful,
@@ -214,7 +214,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "docker.tag",
-            "为 Docker 镜像添加标签。",
+            "Add a tag to a Docker image.",
             DockerAction::Tag,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -222,7 +222,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "docker.push",
-            "推送 Docker 镜像。",
+            "Push a Docker image.",
             DockerAction::Push,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -230,7 +230,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "docker.compose_up",
-            "以 Admin 权限启动 allowlist 目录中的 Docker Compose 项目。",
+            "Start a Docker Compose project from an allowlisted directory with Admin permission.",
             DockerAction::ComposeUp,
             PermissionLevel::Admin,
             ToolSideEffect::Stateful,
@@ -238,7 +238,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "docker.compose_down",
-            "以 Admin 权限停止 allowlist 目录中的 Docker Compose 项目。",
+            "Stop a Docker Compose project from an allowlisted directory with Admin permission.",
             DockerAction::ComposeDown,
             PermissionLevel::Admin,
             ToolSideEffect::Destructive,
@@ -246,7 +246,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "docker.exec",
-            "以 Admin 权限在容器中执行任意程序；默认不对模型可见。",
+            "Execute an arbitrary program in a container with Admin permission; hidden from the model by default.",
             DockerAction::Exec,
             PermissionLevel::Admin,
             ToolSideEffect::Destructive,
@@ -254,7 +254,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "docker.run",
-            "以 Admin 权限创建容器并运行可选程序；默认不对模型可见。",
+            "Create a container and run an optional program with Admin permission; hidden from the model by default.",
             DockerAction::Run,
             PermissionLevel::Admin,
             ToolSideEffect::Destructive,
@@ -262,7 +262,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "docker.prune",
-            "清理 Docker 未使用资源；需要 Admin。",
+            "Prune unused Docker resources; requires Admin permission.",
             DockerAction::Prune,
             PermissionLevel::Admin,
             ToolSideEffect::Destructive,
@@ -348,7 +348,7 @@ impl ToolExecutor for DockerTool {
                 let _: EmptyArgs = parse_args(invocation.tool_call.arguments)?;
                 self.fixed(
                     vec!["ps".into(), "--all".into(), "--no-trunc".into()],
-                    "Docker 容器",
+                    "Docker containers",
                     cancel,
                 )
                 .await
@@ -357,14 +357,14 @@ impl ToolExecutor for DockerTool {
                 let _: EmptyArgs = parse_args(invocation.tool_call.arguments)?;
                 self.fixed(
                     vec!["images".into(), "--no-trunc".into()],
-                    "Docker 镜像",
+                    "Docker images",
                     cancel,
                 )
                 .await
             }
             DockerAction::Version => {
                 let _: EmptyArgs = parse_args(invocation.tool_call.arguments)?;
-                self.fixed(vec!["version".into()], "Docker 版本", cancel)
+                self.fixed(vec!["version".into()], "Docker version", cancel)
                     .await
             }
             DockerAction::Inspect => {
@@ -377,7 +377,7 @@ impl ToolExecutor for DockerTool {
                 let args: LogsArgs = parse_args(invocation.tool_call.arguments)?;
                 validate_name(&args.container)?;
                 if args.tail == Some(0) {
-                    return Err(invalid("Docker 日志行数必须大于 0"));
+                    return Err(invalid("Docker log line count must be greater than zero"));
                 }
                 self.fixed(
                     vec![
@@ -386,7 +386,7 @@ impl ToolExecutor for DockerTool {
                         args.tail.unwrap_or(200).min(5_000).to_string(),
                         args.container,
                     ],
-                    "Docker 日志",
+                    "Docker logs",
                     cancel,
                 )
                 .await
@@ -396,7 +396,7 @@ impl ToolExecutor for DockerTool {
                 validate_name(&args.name)?;
                 self.fixed(
                     vec!["stats".into(), "--no-stream".into(), args.name],
-                    "Docker 资源",
+                    "Docker resources",
                     cancel,
                 )
                 .await
@@ -410,8 +410,12 @@ impl ToolExecutor for DockerTool {
                 } else {
                     "push"
                 };
-                self.fixed_checked(vec![action.into(), args.image], "Docker 镜像操作", cancel)
-                    .await
+                self.fixed_checked(
+                    vec![action.into(), args.image],
+                    "Docker image operation",
+                    cancel,
+                )
+                .await
             }
             DockerAction::Start
             | DockerAction::Stop
@@ -426,8 +430,12 @@ impl ToolExecutor for DockerTool {
                     DockerAction::Restart => "restart",
                     _ => "rm",
                 };
-                self.fixed_checked(vec![action.into(), args.name], "Docker 容器操作", cancel)
-                    .await
+                self.fixed_checked(
+                    vec![action.into(), args.name],
+                    "Docker container operation",
+                    cancel,
+                )
+                .await
             }
             DockerAction::Build => {
                 let args: BuildArgs = parse_args(invocation.tool_call.arguments)?;
@@ -436,7 +444,7 @@ impl ToolExecutor for DockerTool {
                 self.policy.require_mutation()?;
                 let path = existing_path(&self.policy, &args.path)?;
                 if !path.is_dir() {
-                    return Err(invalid("Docker build 路径必须是目录"));
+                    return Err(invalid("Docker build path must be a directory"));
                 }
                 self.fixed_checked(
                     vec![
@@ -445,7 +453,7 @@ impl ToolExecutor for DockerTool {
                         args.tag,
                         path.to_string_lossy().into_owned(),
                     ],
-                    "Docker 构建",
+                    "Docker build",
                     cancel,
                 )
                 .await
@@ -457,7 +465,7 @@ impl ToolExecutor for DockerTool {
                 self.policy.require_mutation()?;
                 self.fixed_checked(
                     vec!["tag".into(), args.image, args.target],
-                    "Docker 标签",
+                    "Docker tag",
                     cancel,
                 )
                 .await
@@ -468,7 +476,7 @@ impl ToolExecutor for DockerTool {
                 self.policy.require_mutation()?;
                 let path = existing_path(&self.policy, &args.path)?;
                 if !path.is_dir() {
-                    return Err(invalid("Compose 项目路径必须是目录"));
+                    return Err(invalid("Compose project path must be a directory"));
                 }
                 let compose_file = find_compose_file(&self.policy, &path)?;
                 let action = if matches!(self.action, DockerAction::ComposeUp) {
@@ -512,7 +520,7 @@ impl ToolExecutor for DockerTool {
                 command.push(args.image);
                 if let Some(program) = args.command {
                     if program.is_empty() {
-                        return Err(invalid("docker.run command 不能为空"));
+                        return Err(invalid("docker.run command must not be empty"));
                     }
                     for item in &program {
                         validate_program(item)?;
@@ -529,7 +537,7 @@ impl ToolExecutor for DockerTool {
                 if args.volumes {
                     command.push("--volumes".into());
                 }
-                self.fixed_checked(command, "Docker 清理", cancel).await
+                self.fixed_checked(command, "Docker prune", cancel).await
             }
         }
     }
@@ -590,14 +598,16 @@ fn validate_name(value: &str) -> Result<(), ToolError> {
             .chars()
             .any(|character| character.is_whitespace() || character.is_control())
     {
-        return Err(invalid("Docker 名称或镜像引用无效"));
+        return Err(invalid("Invalid Docker name or image reference"));
     }
     Ok(())
 }
 
 fn validate_program(value: &str) -> Result<(), ToolError> {
     if value.trim().is_empty() || value.len() > 4_096 || value.chars().any(char::is_control) {
-        return Err(invalid("Docker 程序参数不能为空且不能包含控制字符"));
+        return Err(invalid(
+            "Docker program argument must not be empty or contain control characters",
+        ));
     }
     Ok(())
 }
@@ -620,7 +630,7 @@ fn find_compose_file(
     Err(ToolError::new(
         koi_core::domain::ToolErrorKind::TargetUnavailable,
         format!(
-            "Compose 项目目录缺少受支持的配置文件：{}",
+            "Compose project directory has no supported configuration file: {}",
             project_directory.display()
         ),
         false,

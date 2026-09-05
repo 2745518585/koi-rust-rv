@@ -47,7 +47,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         Arc::new(ProcessTool {
             definition: definition(
                 "process.signal",
-                "向指定进程发送受限信号。",
+                "Send a restricted signal to a specified process.",
                 json!({"type":"object","required":["pid"],"properties":{"pid":{"type":"integer","minimum":2},"signal":{"type":["string","null"],"enum":["TERM","INT","HUP","KILL","STOP","CONT",null]}},"additionalProperties":false}),
                 PermissionLevel::Operator,
                 ToolSideEffect::Destructive,
@@ -61,7 +61,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         Arc::new(ProcessTool {
             definition: definition(
                 "process.renice",
-                "调整指定进程的调度优先级。",
+                "Adjust the scheduling priority of a specified process.",
                 json!({"type":"object","required":["pid","priority"],"properties":{"pid":{"type":"integer","minimum":2},"priority":{"type":"integer","minimum":-20,"maximum":19}},"additionalProperties":false}),
                 PermissionLevel::Operator,
                 ToolSideEffect::Stateful,
@@ -91,18 +91,18 @@ impl ToolExecutor for ProcessTool {
             ProcessAction::Signal => {
                 let args: SignalArgs = parse_args(invocation.tool_call.arguments)?;
                 if args.pid <= 1 {
-                    return Err(invalid("不能操作 PID 1 或更低的进程"));
+                    return Err(invalid("Processes with PID 1 or lower cannot be modified"));
                 }
                 let signal = args.signal.unwrap_or_else(|| "TERM".into());
                 if !matches!(
                     signal.as_str(),
                     "TERM" | "INT" | "HUP" | "KILL" | "STOP" | "CONT"
                 ) {
-                    return Err(invalid("不支持的进程信号"));
+                    return Err(invalid("Unsupported process signal"));
                 }
                 self.run(
                     vec![format!("-{signal}"), args.pid.to_string()],
-                    "进程信号",
+                    "Process signal",
                     cancel,
                 )
                 .await
@@ -110,10 +110,10 @@ impl ToolExecutor for ProcessTool {
             ProcessAction::Renice => {
                 let args: ReniceArgs = parse_args(invocation.tool_call.arguments)?;
                 if args.pid <= 1 {
-                    return Err(invalid("不能操作 PID 1 或更低的进程"));
+                    return Err(invalid("Processes with PID 1 or lower cannot be modified"));
                 }
                 if !(-20..=19).contains(&args.priority) {
-                    return Err(invalid("进程优先级必须位于 -20 到 19 之间"));
+                    return Err(invalid("Process priority must be between -20 and 19"));
                 }
                 self.run(
                     vec![
@@ -122,7 +122,7 @@ impl ToolExecutor for ProcessTool {
                         "-p".into(),
                         args.pid.to_string(),
                     ],
-                    "进程优先级",
+                    "Process priority",
                     cancel,
                 )
                 .await

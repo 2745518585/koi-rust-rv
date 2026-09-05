@@ -40,12 +40,12 @@ struct LimitArgs {
 
 pub(crate) fn tools(runner: &CommandRunner) -> Vec<Arc<dyn ToolExecutor>> {
     [
-        ("system.info", "读取主机、内核和运行时间信息。", SystemAction::Info, "{}"),
-        ("system.resources", "读取 CPU、内存和基础资源信息。", SystemAction::Resources, "{}"),
-        ("system.processes", "读取当前进程列表。", SystemAction::Processes, "limit"),
-        ("system.filesystems", "读取文件系统和磁盘挂载使用情况。", SystemAction::Filesystems, "{}"),
-        ("system.logs", "读取系统日志。", SystemAction::Logs, "limit"),
-        ("system.kernel_messages", "读取内核消息中的告警和错误。", SystemAction::KernelMessages, "{}"),
+        ("system.info", "Read host, kernel, and uptime information.", SystemAction::Info, "{}"),
+        ("system.resources", "Read CPU, memory, and base resource information.", SystemAction::Resources, "{}"),
+        ("system.processes", "Read the current process list.", SystemAction::Processes, "limit"),
+        ("system.filesystems", "Read filesystem and mount usage information.", SystemAction::Filesystems, "{}"),
+        ("system.logs", "Read system logs.", SystemAction::Logs, "limit"),
+        ("system.kernel_messages", "Read warnings and errors from kernel messages.", SystemAction::KernelMessages, "{}"),
     ]
     .into_iter()
     .map(|(name, description, action, schema_kind)| {
@@ -86,7 +86,7 @@ impl ToolExecutor for SystemTool {
             SystemAction::Info => {
                 let _: EmptyArgs = parse_args(invocation.tool_call.arguments)?;
                 self.run(
-                    "系统信息",
+                    "System information",
                     CommandSpec {
                         program: "uname".into(),
                         args: vec!["-a".into()],
@@ -101,7 +101,7 @@ impl ToolExecutor for SystemTool {
             SystemAction::Resources => {
                 let _: EmptyArgs = parse_args(invocation.tool_call.arguments)?;
                 self.run(
-                    "系统资源",
+                    "System resources",
                     CommandSpec {
                         program: "free".into(),
                         args: vec!["-h".into()],
@@ -118,7 +118,7 @@ impl ToolExecutor for SystemTool {
                 let limit = limit_value(args.limit, 100)?;
                 let result = self
                     .run(
-                        "进程列表",
+                        "Process list",
                         CommandSpec {
                             program: "ps".into(),
                             args: vec![
@@ -138,7 +138,7 @@ impl ToolExecutor for SystemTool {
             SystemAction::Filesystems => {
                 let _: EmptyArgs = parse_args(invocation.tool_call.arguments)?;
                 self.run(
-                    "文件系统信息",
+                    "Filesystem information",
                     CommandSpec {
                         program: "df".into(),
                         args: vec!["-hT".into()],
@@ -154,7 +154,7 @@ impl ToolExecutor for SystemTool {
                 let args: LimitArgs = parse_args(invocation.tool_call.arguments)?;
                 let limit = limit_value(args.limit, 200)?;
                 self.run(
-                    "系统日志",
+                    "System logs",
                     CommandSpec {
                         program: "journalctl".into(),
                         args: vec!["--no-pager".into(), "-n".into(), limit.to_string()],
@@ -169,7 +169,7 @@ impl ToolExecutor for SystemTool {
             SystemAction::KernelMessages => {
                 let _: EmptyArgs = parse_args(invocation.tool_call.arguments)?;
                 self.run(
-                    "内核消息",
+                    "Kernel messages",
                     CommandSpec {
                         program: "dmesg".into(),
                         args: vec!["--ctime".into(), "--level=err,warn".into()],
@@ -188,7 +188,7 @@ impl ToolExecutor for SystemTool {
 fn limit_value(value: Option<u32>, default: u32) -> Result<usize, ToolError> {
     let limit = value.unwrap_or(default);
     if limit == 0 {
-        return Err(super::invalid("limit 必须大于 0"));
+        return Err(super::invalid("limit must be greater than zero"));
     }
     Ok(limit.min(1_000) as usize)
 }
@@ -233,7 +233,7 @@ mod tests {
     fn process_limit_is_applied_to_command_output() {
         let result = limit_stdout(
             ToolResult {
-                summary: "进程列表".into(),
+                summary: "Process list".into(),
                 data: json!({"stdout":"header\nfirst\nsecond\nthird\n"}),
                 truncated: false,
             },

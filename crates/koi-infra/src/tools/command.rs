@@ -35,7 +35,7 @@ impl CommandTool {
         Self {
             definition: definition(
                 "system.command",
-                "以 Admin 权限执行一个任意程序及其参数；默认不对模型可见。",
+                "Execute an arbitrary program and arguments with Admin permission; hidden from the model by default.",
                 json!({
                     "type": "object",
                     "additionalProperties": false,
@@ -73,7 +73,9 @@ impl ToolExecutor for CommandTool {
         self.policy.require_admin_commands()?;
         let args: CommandArgs = parse_args(invocation.tool_call.arguments)?;
         if args.program.trim().is_empty() || args.program.chars().any(char::is_control) {
-            return Err(invalid("程序名不能为空且不能包含控制字符"));
+            return Err(invalid(
+                "Program name must not be empty or contain control characters",
+            ));
         }
         if args
             .args
@@ -82,19 +84,22 @@ impl ToolExecutor for CommandTool {
             .chain(args.stdin.iter())
             .any(|value| value.chars().any(char::is_control))
         {
-            return Err(invalid("命令参数不能包含控制字符"));
+            return Err(invalid(
+                "Command arguments must not contain control characters",
+            ));
         }
         if let Some(cwd) = &args.cwd {
-            let metadata = std::fs::metadata(cwd)
-                .map_err(|error| invalid(format!("工作目录不可用：{cwd}：{error}")))?;
+            let metadata = std::fs::metadata(cwd).map_err(|error| {
+                invalid(format!("Working directory is unavailable: {cwd}: {error}"))
+            })?;
             if !metadata.is_dir() {
-                return Err(invalid("工作目录必须是目录"));
+                return Err(invalid("Working directory must be a directory"));
             }
         }
         if let Some(stdin) = &args.stdin {
             if stdin.len() > self.policy.max_file_bytes {
                 return Err(invalid(format!(
-                    "标准输入超过 {} 字节限制",
+                    "Standard input exceeds the {} byte limit. The limit is controlled by [security].max_file_bytes in agent.toml",
                     self.policy.max_file_bytes
                 )));
             }
@@ -116,6 +121,6 @@ impl ToolExecutor for CommandTool {
                 cancel,
             )
             .await?;
-        Ok(command_result("任意命令", &output))
+        Ok(command_result("Arbitrary command", &output))
     }
 }

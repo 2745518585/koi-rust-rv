@@ -149,7 +149,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
     [
         (
             "git.status",
-            "读取 Git 工作区状态。",
+            "Read Git working tree status.",
             GitAction::Status,
             PermissionLevel::User,
             ToolSideEffect::ReadOnly,
@@ -157,7 +157,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "git.log",
-            "读取 Git 提交记录。",
+            "Read Git commit history.",
             GitAction::Log,
             PermissionLevel::User,
             ToolSideEffect::ReadOnly,
@@ -165,7 +165,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "git.diff",
-            "读取 Git 工作区差异。",
+            "Read Git working tree differences.",
             GitAction::Diff,
             PermissionLevel::User,
             ToolSideEffect::ReadOnly,
@@ -173,7 +173,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "git.show",
-            "读取 Git 提交或对象详情。",
+            "Read Git commit or object details.",
             GitAction::Show,
             PermissionLevel::User,
             ToolSideEffect::ReadOnly,
@@ -181,7 +181,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "git.branch",
-            "读取 Git 分支信息。",
+            "Read Git branch information.",
             GitAction::Branch,
             PermissionLevel::User,
             ToolSideEffect::ReadOnly,
@@ -189,7 +189,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "git.remote",
-            "读取 Git 远程仓库信息。",
+            "Read Git remote repository information.",
             GitAction::Remote,
             PermissionLevel::User,
             ToolSideEffect::ReadOnly,
@@ -197,7 +197,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "git.clone",
-            "将 Git 仓库克隆到允许目录。",
+            "Clone a Git repository into an allowed directory.",
             GitAction::Clone,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -205,7 +205,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "git.fetch",
-            "从 Git 远程仓库获取更新。",
+            "Fetch updates from a Git remote repository.",
             GitAction::Fetch,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -213,7 +213,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "git.pull",
-            "以 fast-forward only 模式更新 Git 工作区。",
+            "Update a Git working tree in fast-forward-only mode.",
             GitAction::Pull,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -221,7 +221,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "git.checkout",
-            "切换或创建 Git 分支。",
+            "Switch or create a Git branch.",
             GitAction::Checkout,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -229,7 +229,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "git.add",
-            "将指定文件加入 Git 暂存区。",
+            "Add specified files to the Git staging area.",
             GitAction::Add,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -237,7 +237,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "git.commit",
-            "创建 Git 提交。",
+            "Create a Git commit.",
             GitAction::Commit,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -245,7 +245,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "git.stash",
-            "保存 Git 工作区变更。",
+            "Stash Git working tree changes.",
             GitAction::Stash,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -253,7 +253,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "git.merge",
-            "合并指定 Git 分支。",
+            "Merge a specified Git branch.",
             GitAction::Merge,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -261,7 +261,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "git.rebase",
-            "对 Git 工作区执行 rebase。",
+            "Rebase a Git working tree.",
             GitAction::Rebase,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -269,7 +269,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "git.push",
-            "推送 Git 提交到远程仓库。",
+            "Push Git commits to a remote repository.",
             GitAction::Push,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -277,7 +277,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "git.reset",
-            "执行 Git reset；高风险模式需要 Admin。",
+            "Execute Git reset; high-risk modes require Admin permission.",
             GitAction::Reset,
             PermissionLevel::Admin,
             ToolSideEffect::Destructive,
@@ -285,7 +285,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "git.clean",
-            "清理 Git 未跟踪文件；需要 Admin。",
+            "Clean untracked Git files; requires Admin permission.",
             GitAction::Clean,
             PermissionLevel::Admin,
             ToolSideEffect::Destructive,
@@ -380,7 +380,7 @@ impl ToolExecutor for GitTool {
                 self.repo_command(
                     invocation.tool_call.arguments,
                     vec!["status".into(), "--short".into(), "--branch".into()],
-                    "Git 状态",
+                    "Git status",
                     cancel,
                 )
                 .await
@@ -389,7 +389,7 @@ impl ToolExecutor for GitTool {
                 self.repo_command(
                     invocation.tool_call.arguments,
                     vec!["branch".into(), "--all".into(), "--no-color".into()],
-                    "Git 分支",
+                    "Git branches",
                     cancel,
                 )
                 .await
@@ -398,7 +398,7 @@ impl ToolExecutor for GitTool {
                 self.repo_command(
                     invocation.tool_call.arguments,
                     vec!["remote".into(), "-v".into()],
-                    "Git 远程仓库",
+                    "Git remotes",
                     cancel,
                 )
                 .await
@@ -416,7 +416,7 @@ impl ToolExecutor for GitTool {
                         "-n".into(),
                         limit.to_string(),
                     ],
-                    "Git 日志",
+                    "Git log",
                     cancel,
                 )
                 .await
@@ -432,7 +432,7 @@ impl ToolExecutor for GitTool {
                 if let Some(file) = args.file {
                     command.push(relative_arg(&repo, &file)?);
                 }
-                self.run_repo(repo, command, "Git 差异", cancel).await
+                self.run_repo(repo, command, "Git diff", cancel).await
             }
             GitAction::Show => {
                 let args: ShowArgs = parse_args(invocation.tool_call.arguments)?;
@@ -446,7 +446,7 @@ impl ToolExecutor for GitTool {
                         "--oneline".into(),
                         args.revision,
                     ],
-                    "Git 对象",
+                    "Git object",
                     cancel,
                 )
                 .await
@@ -459,7 +459,9 @@ impl ToolExecutor for GitTool {
                 if std::fs::symlink_metadata(&destination)
                     .is_ok_and(|metadata| metadata.file_type().is_symlink())
                 {
-                    return Err(invalid("不能将 Git 仓库克隆到符号链接目标"));
+                    return Err(invalid(
+                        "Cannot clone a Git repository to a symbolic link target",
+                    ));
                 }
                 self.run(
                     CommandSpec {
@@ -478,7 +480,7 @@ impl ToolExecutor for GitTool {
                         stdin: None,
                         requires_sudo: false,
                     },
-                    "Git 克隆",
+                    "Git clone",
                     cancel,
                     true,
                 )
@@ -515,13 +517,13 @@ impl ToolExecutor for GitTool {
                     command.push("--create".into());
                 }
                 command.push(args.branch);
-                self.run_repo_checked(repo, command, "Git 分支切换", cancel)
+                self.run_repo_checked(repo, command, "Git branch switch", cancel)
                     .await
             }
             GitAction::Add => {
                 let args: AddArgs = parse_args(invocation.tool_call.arguments)?;
                 if args.files.is_empty() {
-                    return Err(invalid("git.add 至少需要一个文件"));
+                    return Err(invalid("git.add requires at least one file"));
                 }
                 self.policy.require_mutation()?;
                 let repo = self.repo(&args.path)?;
@@ -529,7 +531,7 @@ impl ToolExecutor for GitTool {
                 for file in args.files {
                     command.push(relative_arg(&repo, &file)?);
                 }
-                self.run_repo_checked(repo, command, "Git 暂存", cancel)
+                self.run_repo_checked(repo, command, "Git staging", cancel)
                     .await
             }
             GitAction::Commit => {
@@ -540,7 +542,7 @@ impl ToolExecutor for GitTool {
                 self.run_repo_checked(
                     repo,
                     vec!["commit".into(), "-m".into(), args.message],
-                    "Git 提交",
+                    "Git commit",
                     cancel,
                 )
                 .await
@@ -570,7 +572,7 @@ impl ToolExecutor for GitTool {
                 self.run_repo_checked(
                     repo,
                     vec![action.into(), args.branch],
-                    "Git 分支操作",
+                    "Git branch operation",
                     cancel,
                 )
                 .await
@@ -597,7 +599,7 @@ impl ToolExecutor for GitTool {
                 self.policy.require_mutation()?;
                 let mode = args.mode.unwrap_or_else(|| "mixed".into());
                 if !matches!(mode.as_str(), "soft" | "mixed" | "hard") {
-                    return Err(invalid("git.reset mode 只能是 soft、mixed 或 hard"));
+                    return Err(invalid("git.reset mode must be soft, mixed, or hard"));
                 }
                 let revision = args.revision.unwrap_or_else(|| "HEAD".into());
                 validate_git_atom(&revision)?;
@@ -633,7 +635,7 @@ impl GitTool {
     fn repo(&self, path: &str) -> Result<std::path::PathBuf, ToolError> {
         let repo = existing_path(&self.policy, path)?;
         if !repo.is_dir() {
-            return Err(invalid("Git 仓库路径必须是目录"));
+            return Err(invalid("Git repository path must be a directory"));
         }
         Ok(repo)
     }
@@ -746,7 +748,9 @@ fn validate_git_atom(value: &str) -> Result<(), ToolError> {
             .chars()
             .any(|character| character.is_whitespace() || character.is_control())
     {
-        return Err(invalid("Git 参数包含空值、空白或选项前缀"));
+        return Err(invalid(
+            "Git argument is empty, contains whitespace, or begins with an option prefix",
+        ));
     }
     Ok(())
 }
@@ -754,7 +758,7 @@ fn validate_git_atom(value: &str) -> Result<(), ToolError> {
 fn validate_message(value: &str) -> Result<(), ToolError> {
     if value.trim().is_empty() || value.len() > 4_000 || value.chars().any(char::is_control) {
         return Err(invalid(
-            "Git 提交消息不能为空、不能超过 4000 字节且不能包含控制字符",
+            "Git commit message must not be empty, exceed 4000 bytes, or contain control characters",
         ));
     }
     Ok(())
@@ -766,7 +770,9 @@ fn validate_urlish(value: &str) -> Result<(), ToolError> {
             .chars()
             .any(|character| character.is_whitespace() || character.is_control())
     {
-        return Err(invalid("Git URL 不能为空且不能包含空白或控制字符"));
+        return Err(invalid(
+            "Git URL must not be empty or contain whitespace or control characters",
+        ));
     }
     Ok(())
 }
@@ -775,12 +781,12 @@ fn validate_clone_source(policy: &ToolPolicy, value: &str) -> Result<(), ToolErr
     validate_urlish(value)?;
     let lower = value.to_ascii_lowercase();
     if lower.starts_with("ext::") || lower.starts_with("fd::") {
-        return Err(invalid("Git 克隆不允许 ext 或 fd 协议"));
+        return Err(invalid("Git clone does not allow ext or fd protocols"));
     }
     if std::path::Path::new(value).exists() {
         let source = existing_path(policy, value)?;
         if !source.is_dir() {
-            return Err(invalid("Git 本地克隆源必须是目录"));
+            return Err(invalid("Local Git clone source must be a directory"));
         }
         return Ok(());
     }
@@ -788,23 +794,28 @@ fn validate_clone_source(policy: &ToolPolicy, value: &str) -> Result<(), ToolErr
         if matches!(url.scheme(), "http" | "https")
             && (!url.username().is_empty() || url.password().is_some())
         {
-            return Err(invalid("Git HTTP URL 不能包含用户名或密码"));
+            return Err(invalid(
+                "Git HTTP URL must not include a user name or password",
+            ));
         }
         if matches!(url.scheme(), "ssh" | "git+ssh") && url.password().is_some() {
-            return Err(invalid("Git SSH URL 不能包含密码"));
+            return Err(invalid("Git SSH URL must not include a password"));
         }
         if !matches!(url.scheme(), "http" | "https" | "git" | "ssh" | "git+ssh") {
             if url.scheme() == "file" {
                 let path = url
                     .to_file_path()
-                    .map_err(|()| invalid("Git file URL 无法转换为本地路径"))?;
+                    .map_err(|()| invalid("Git file URL cannot be converted to a local path"))?;
                 let source = existing_path(policy, &path.to_string_lossy())?;
                 if !source.is_dir() {
-                    return Err(invalid("Git 本地克隆源必须是目录"));
+                    return Err(invalid("Local Git clone source must be a directory"));
                 }
                 return Ok(());
             }
-            return Err(invalid(format!("Git URL 协议不允许：{}", url.scheme())));
+            return Err(invalid(format!(
+                "Git URL scheme is not allowed: {}",
+                url.scheme()
+            )));
         }
     }
     Ok(())

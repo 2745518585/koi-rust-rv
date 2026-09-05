@@ -56,12 +56,12 @@ pub(crate) fn tools(
     runner: &CommandRunner,
 ) -> Vec<Arc<dyn ToolExecutor>> {
     [
-        ("network.interfaces", "读取网络接口信息。", NetworkAction::Interfaces),
-        ("network.routes", "读取网络路由信息。", NetworkAction::Routes),
-        ("network.connections", "读取当前网络连接和监听信息。", NetworkAction::Connections),
-        ("network.dns_lookup", "查询 DNS 解析结果。", NetworkAction::DnsLookup),
-        ("network.port_check", "检查目标 TCP 端口是否可连接。", NetworkAction::PortCheck),
-        ("network.tls_check", "检查目标 TLS 服务握手信息。", NetworkAction::TlsCheck),
+        ("network.interfaces", "Read network interface information.", NetworkAction::Interfaces),
+        ("network.routes", "Read network routing information.", NetworkAction::Routes),
+        ("network.connections", "Read active network connections and listeners.", NetworkAction::Connections),
+        ("network.dns_lookup", "Query DNS resolution results.", NetworkAction::DnsLookup),
+        ("network.port_check", "Check whether a target TCP port is reachable.", NetworkAction::PortCheck),
+        ("network.tls_check", "Check TLS handshake information for a target service.", NetworkAction::TlsCheck),
     ]
     .into_iter()
     .map(|(name, description, action)| {
@@ -105,7 +105,7 @@ impl ToolExecutor for NetworkTool {
             NetworkAction::Interfaces => {
                 let _: EmptyArgs = parse_args(invocation.tool_call.arguments)?;
                 self.run(
-                    "网络接口",
+                    "Network interfaces",
                     "ip",
                     vec!["-brief".into(), "address".into()],
                     cancel,
@@ -114,20 +114,25 @@ impl ToolExecutor for NetworkTool {
             }
             NetworkAction::Routes => {
                 let _: EmptyArgs = parse_args(invocation.tool_call.arguments)?;
-                self.run("网络路由", "ip", vec!["route".into()], cancel)
+                self.run("Network routes", "ip", vec!["route".into()], cancel)
                     .await
             }
             NetworkAction::Connections => {
                 let _: EmptyArgs = parse_args(invocation.tool_call.arguments)?;
-                self.run("网络连接", "ss", vec!["-tunap".into()], cancel)
+                self.run("Network connections", "ss", vec!["-tunap".into()], cancel)
                     .await
             }
             NetworkAction::DnsLookup => {
                 let args: HostArgs = parse_args(invocation.tool_call.arguments)?;
                 validate_host(&args.host)?;
                 self.policy.require_network_host(&args.host)?;
-                self.run("DNS 查询", "dig", vec!["+short".into(), args.host], cancel)
-                    .await
+                self.run(
+                    "DNS lookup",
+                    "dig",
+                    vec!["+short".into(), args.host],
+                    cancel,
+                )
+                .await
             }
             NetworkAction::PortCheck => {
                 let args: HostPortArgs = parse_args(invocation.tool_call.arguments)?;
@@ -145,7 +150,7 @@ impl ToolExecutor for NetworkTool {
                     .policy
                     .timeout(args.timeout_ms, self.definition.timeout_ms)?;
                 self.run_with_timeout(
-                    "TLS 检查",
+                    "TLS check",
                     CommandSpec {
                         program: "openssl".into(),
                         args: vec![
@@ -218,16 +223,16 @@ impl NetworkTool {
         let port = args.port;
         let connect = TcpStream::connect((host.as_str(), port));
         tokio::select! {
-            () = cancel.cancelled() => Err(ToolError::new(ToolErrorKind::Cancelled, "端口检查已取消", true)),
+            () = cancel.cancelled() => Err(ToolError::new(ToolErrorKind::Cancelled, "Port check was cancelled", true)),
             result = tokio::time::timeout(Duration::from_millis(timeout_ms), connect) => {
                 match result {
                     Ok(Ok(_stream)) => Ok(ToolResult {
-                        summary: format!("{host}:{port} 可连接"),
+                        summary: format!("{host}:{port} is reachable"),
                         data: json!({"host": host, "port": port, "reachable": true}),
                         truncated: false,
                     }),
-                    Ok(Err(error)) => Err(ToolError::new(ToolErrorKind::TargetUnavailable, format!("{host}:{port} 不可连接：{error}"), true)),
-                    Err(_) => Err(ToolError::new(ToolErrorKind::Timeout, format!("连接 {host}:{port} 超过 {timeout_ms} 毫秒"), true)),
+                    Ok(Err(error)) => Err(ToolError::new(ToolErrorKind::TargetUnavailable, format!("{host}:{port} is unreachable: {error}"), true)),
+                    Err(_) => Err(ToolError::new(ToolErrorKind::Timeout, format!("Connection to {host}:{port} exceeded {timeout_ms} milliseconds"), true)),
                 }
             }
         }
@@ -243,14 +248,16 @@ fn validate_host(host: &str) -> Result<(), ToolError> {
             .chars()
             .any(|character| character.is_whitespace() || character.is_control())
     {
-        return Err(invalid("主机名不能为空且不能包含空白或控制字符"));
+        return Err(invalid(
+            "Host name must not be empty or contain whitespace or control characters",
+        ));
     }
     Ok(())
 }
 
 fn validate_port(port: u16) -> Result<(), ToolError> {
     if port == 0 {
-        return Err(invalid("端口必须位于 1 到 65535 之间"));
+        return Err(invalid("Port must be between 1 and 65535"));
     }
     Ok(())
 }

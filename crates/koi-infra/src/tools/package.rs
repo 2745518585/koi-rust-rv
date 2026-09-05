@@ -60,7 +60,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
     [
         (
             "package.list",
-            "读取已安装软件包信息。",
+            "Read installed package information.",
             PackageAction::List,
             PermissionLevel::User,
             ToolSideEffect::ReadOnly,
@@ -68,7 +68,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "package.search",
-            "搜索软件包。",
+            "Search packages.",
             PackageAction::Search,
             PermissionLevel::User,
             ToolSideEffect::ReadOnly,
@@ -76,7 +76,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "package.install",
-            "安装软件包。",
+            "Install packages.",
             PackageAction::Install,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -84,7 +84,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "package.upgrade",
-            "升级软件包。",
+            "Upgrade packages.",
             PackageAction::Upgrade,
             PermissionLevel::Operator,
             ToolSideEffect::Stateful,
@@ -92,7 +92,7 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
         ),
         (
             "package.remove",
-            "卸载软件包。",
+            "Remove packages.",
             PackageAction::Remove,
             PermissionLevel::Operator,
             ToolSideEffect::Destructive,
@@ -153,7 +153,7 @@ impl ToolExecutor for PackageTool {
                 let name = args.name.unwrap_or_default();
                 if !name.is_empty() {
                     if name.len() > 512 {
-                        return Err(invalid("软件包名称不能超过 512 字节"));
+                        return Err(invalid("Package name must not exceed 512 bytes"));
                     }
                     validate_package(&name)?;
                 }
@@ -162,7 +162,7 @@ impl ToolExecutor for PackageTool {
             PackageAction::Search => {
                 let args: QueryArgs = parse_args(invocation.tool_call.arguments)?;
                 if args.query.len() > 512 {
-                    return Err(invalid("软件包搜索条件不能超过 512 字节"));
+                    return Err(invalid("Package search query must not exceed 512 bytes"));
                 }
                 validate_package(&args.query)?;
                 package_command(manager, PackageAction::Search, vec![args.query])
@@ -170,10 +170,10 @@ impl ToolExecutor for PackageTool {
             PackageAction::Install | PackageAction::Upgrade | PackageAction::Remove => {
                 let args: PackagesArgs = parse_args(invocation.tool_call.arguments)?;
                 if args.packages.is_empty() {
-                    return Err(invalid("至少需要一个软件包名称"));
+                    return Err(invalid("At least one package name is required"));
                 }
                 if args.packages.len() > 100 {
-                    return Err(invalid("一次最多处理 100 个软件包"));
+                    return Err(invalid("At most 100 packages may be processed at once"));
                 }
                 for package in &args.packages {
                     validate_package(package)?;
@@ -197,9 +197,9 @@ impl ToolExecutor for PackageTool {
             )
             .await?;
         if requires_sudo {
-            ensure_success("软件包操作", &output)?;
+            ensure_success("Package operation", &output)?;
         }
-        Ok(command_result("软件包操作", &output))
+        Ok(command_result("Package operation", &output))
     }
 }
 
@@ -215,7 +215,7 @@ fn detect_manager() -> Result<PackageManager, ToolError> {
     }
     Err(ToolError::new(
         koi_core::domain::ToolErrorKind::TargetUnavailable,
-        "未检测到 apt、dnf 或 apk",
+        "No supported package manager was detected (apt, dnf, or apk)",
         false,
     ))
 }
@@ -357,7 +357,7 @@ fn validate_package(value: &str) -> Result<(), ToolError> {
             .chars()
             .any(|character| character.is_whitespace() || character.is_control())
     {
-        return Err(invalid(format!("软件包名称无效：{value}")));
+        return Err(invalid(format!("Invalid package name: {value}")));
     }
     Ok(())
 }

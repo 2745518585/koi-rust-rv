@@ -56,17 +56,17 @@ struct EmptyArgs {}
 
 pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn ToolExecutor>> {
     [
-        ("service.status", "读取 allowlist 服务的当前状态。", ServiceAction::Status, PermissionLevel::User, ToolSideEffect::ReadOnly, true),
-        ("service.logs", "读取 allowlist 服务的日志。", ServiceAction::Logs, PermissionLevel::User, ToolSideEffect::ReadOnly, true),
-        ("service.start", "启动 allowlist 服务。", ServiceAction::Start, PermissionLevel::Operator, ToolSideEffect::Stateful, true),
-        ("service.stop", "停止 allowlist 服务。", ServiceAction::Stop, PermissionLevel::Operator, ToolSideEffect::Stateful, true),
-        ("service.restart", "重启 allowlist 服务。", ServiceAction::Restart, PermissionLevel::Operator, ToolSideEffect::Stateful, true),
-        ("service.reload", "重新加载 allowlist 服务。", ServiceAction::Reload, PermissionLevel::Operator, ToolSideEffect::Stateful, true),
-        ("service.enable", "设置 allowlist 服务开机启动。", ServiceAction::Enable, PermissionLevel::Operator, ToolSideEffect::Stateful, true),
-        ("service.disable", "取消 allowlist 服务开机启动。", ServiceAction::Disable, PermissionLevel::Operator, ToolSideEffect::Stateful, true),
-        ("service.mask", "屏蔽 allowlist 服务。", ServiceAction::Mask, PermissionLevel::Operator, ToolSideEffect::Destructive, true),
-        ("service.unmask", "解除 allowlist 服务屏蔽。", ServiceAction::Unmask, PermissionLevel::Operator, ToolSideEffect::Stateful, true),
-        ("service.daemon_reload", "重新加载 systemd 配置。", ServiceAction::DaemonReload, PermissionLevel::Operator, ToolSideEffect::Stateful, true),
+        ("service.status", "Read the current status of an allowlisted service.", ServiceAction::Status, PermissionLevel::User, ToolSideEffect::ReadOnly, true),
+        ("service.logs", "Read logs for an allowlisted service.", ServiceAction::Logs, PermissionLevel::User, ToolSideEffect::ReadOnly, true),
+        ("service.start", "Start an allowlisted service.", ServiceAction::Start, PermissionLevel::Operator, ToolSideEffect::Stateful, true),
+        ("service.stop", "Stop an allowlisted service.", ServiceAction::Stop, PermissionLevel::Operator, ToolSideEffect::Stateful, true),
+        ("service.restart", "Restart an allowlisted service.", ServiceAction::Restart, PermissionLevel::Operator, ToolSideEffect::Stateful, true),
+        ("service.reload", "Reload an allowlisted service.", ServiceAction::Reload, PermissionLevel::Operator, ToolSideEffect::Stateful, true),
+        ("service.enable", "Enable an allowlisted service at boot.", ServiceAction::Enable, PermissionLevel::Operator, ToolSideEffect::Stateful, true),
+        ("service.disable", "Disable an allowlisted service at boot.", ServiceAction::Disable, PermissionLevel::Operator, ToolSideEffect::Stateful, true),
+        ("service.mask", "Mask an allowlisted service.", ServiceAction::Mask, PermissionLevel::Operator, ToolSideEffect::Destructive, true),
+        ("service.unmask", "Unmask an allowlisted service.", ServiceAction::Unmask, PermissionLevel::Operator, ToolSideEffect::Stateful, true),
+        ("service.daemon_reload", "Reload the systemd configuration.", ServiceAction::DaemonReload, PermissionLevel::Operator, ToolSideEffect::Stateful, true),
     ]
     .into_iter()
     .map(|(name, description, action, permission, side_effect, model_visible)| {
@@ -102,7 +102,7 @@ impl ToolExecutor for ServiceTool {
             let args: LogsArgs = super::parse_args(invocation.tool_call.arguments)?;
             let lines = args.lines.unwrap_or(200);
             if lines == 0 {
-                return Err(invalid("日志行数必须大于 0"));
+                return Err(invalid("Log line count must be greater than zero"));
             }
             (Some(args.service), Some(lines.min(2_000)))
         } else if matches!(self.action, ServiceAction::DaemonReload) {
@@ -166,8 +166,8 @@ impl ToolExecutor for ServiceTool {
             )
             .await?;
         if requires_sudo {
-            ensure_success("服务操作", &output)?;
+            ensure_success("Service operation", &output)?;
         }
-        Ok(command_result("服务操作", &output))
+        Ok(command_result("Service operation", &output))
     }
 }

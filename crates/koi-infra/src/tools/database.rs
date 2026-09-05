@@ -48,12 +48,12 @@ pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn 
     [
         (
             "database.status",
-            "检查 allowlist 数据库目标是否可用。",
+            "Check whether an allowlisted database target is available.",
             DatabaseAction::Status,
         ),
         (
             "database.query_readonly",
-            "执行受限的数据库只读查询。",
+            "Execute a restricted read-only database query.",
             DatabaseAction::QueryReadonly,
         ),
     ]
@@ -113,7 +113,7 @@ impl ToolExecutor for DatabaseTool {
                         cancel,
                     )
                     .await?;
-                Ok(command_result("数据库状态", &output))
+                Ok(command_result("Database status", &output))
             }
             DatabaseAction::QueryReadonly => {
                 let args: QueryArgs = parse_args(invocation.tool_call.arguments)?;
@@ -136,8 +136,8 @@ impl ToolExecutor for DatabaseTool {
                         cancel,
                     )
                     .await?;
-                ensure_success("数据库只读查询", &output)?;
-                Ok(command_result("数据库只读查询", &output))
+                ensure_success("Read-only database query", &output)?;
+                Ok(command_result("Read-only database query", &output))
             }
         }
     }
@@ -180,7 +180,7 @@ fn status_command(
                 ],
             ))
         }
-        _ => Err(invalid("不支持的数据库引擎")),
+        _ => Err(invalid("Unsupported database engine")),
     }
 }
 
@@ -231,7 +231,9 @@ fn query_command(
                 None,
             ))
         }
-        _ => Err(invalid("只读查询只支持 postgres、mysql 或 sqlite")),
+        _ => Err(invalid(
+            "Read-only queries support postgres, mysql, or sqlite only",
+        )),
     }
 }
 
@@ -239,12 +241,14 @@ fn validate_readonly_query(engine: &str, query: &str) -> Result<(), ToolError> {
     let trimmed = query.trim();
     if trimmed.is_empty() || trimmed.len() > 32_000 || trimmed.chars().any(char::is_control) {
         return Err(invalid(
-            "查询不能为空、不能超过 32000 字节且不能包含控制字符",
+            "Query must not be empty, exceed 32000 bytes, or contain control characters",
         ));
     }
     let without_trailing_semicolon = trimmed.strip_suffix(';').unwrap_or(trimmed).trim();
     if without_trailing_semicolon.contains(';') {
-        return Err(invalid("只读查询不允许包含多条 SQL 语句"));
+        return Err(invalid(
+            "Read-only queries must not contain multiple SQL statements",
+        ));
     }
     let upper = without_trailing_semicolon.to_ascii_uppercase();
     let allowed = match engine {
@@ -258,11 +262,11 @@ fn validate_readonly_query(engine: &str, query: &str) -> Result<(), ToolError> {
         ]
         .as_slice(),
         "sqlite" => ["SELECT ", "WITH ", "EXPLAIN ", "PRAGMA "].as_slice(),
-        _ => return Err(invalid("不支持的数据库引擎")),
+        _ => return Err(invalid("Unsupported database engine")),
     };
     if !allowed.iter().any(|prefix| upper.starts_with(prefix)) {
         return Err(invalid(
-            "只读查询必须以 SELECT、WITH、SHOW、DESCRIBE、EXPLAIN 或 PRAGMA 开头",
+            "Read-only query must begin with SELECT, WITH, SHOW, DESCRIBE, EXPLAIN, or PRAGMA",
         ));
     }
     let forbidden = [
@@ -283,7 +287,9 @@ fn validate_readonly_query(engine: &str, query: &str) -> Result<(), ToolError> {
         "PRAGMA WAL_CHECKPOINT",
     ];
     if forbidden.iter().any(|keyword| upper.contains(keyword)) {
-        return Err(invalid("查询包含可能改变数据或数据库状态的关键字"));
+        return Err(invalid(
+            "Query contains keywords that may change data or database state",
+        ));
     }
     if let Some(pragma) = upper.strip_prefix("PRAGMA ") {
         validate_readonly_pragma(pragma)?;
@@ -300,7 +306,7 @@ fn validate_target_credentials(engine: &str, target: &str) -> Result<(), ToolErr
             .chars()
             .any(|character| character.is_whitespace() || character.is_control())
     {
-        return Err(invalid(format!("{engine} 数据库目标格式无效")));
+        return Err(invalid(format!("Invalid {engine} database target format")));
     }
     if [
         "password=",
@@ -314,13 +320,15 @@ fn validate_target_credentials(engine: &str, target: &str) -> Result<(), ToolErr
     .any(|marker| lower.contains(marker))
     {
         return Err(invalid(format!(
-            "{engine} 数据库目标不能包含内嵌凭据或令牌"
+            "{engine} database target must not contain embedded credentials or tokens"
         )));
     }
     if let Ok(url) = reqwest::Url::parse(target)
         && (!url.username().is_empty() || url.password().is_some())
     {
-        return Err(invalid("数据库目标 URL 不能包含用户名或密码"));
+        return Err(invalid(
+            "Database target URL must not include a user name or password",
+        ));
     }
     Ok(())
 }
@@ -366,7 +374,9 @@ fn query_body(query: &str) -> &str {
 
 fn validate_readonly_pragma(pragma: &str) -> Result<(), ToolError> {
     if pragma.contains('=') {
-        return Err(invalid("只读查询不允许修改 SQLite PRAGMA 设置"));
+        return Err(invalid(
+            "Read-only queries must not modify SQLite PRAGMA settings",
+        ));
     }
     let name = pragma
         .split(['(', ' ', '\t'])
@@ -402,7 +412,7 @@ fn validate_readonly_pragma(pragma: &str) -> Result<(), ToolError> {
         Ok(())
     } else {
         Err(invalid(format!(
-            "SQLite PRAGMA 不在只读 allowlist 中：{name}"
+            "SQLite PRAGMA is not in the read-only allowlist: {name}"
         )))
     }
 }

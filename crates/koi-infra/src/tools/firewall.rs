@@ -47,9 +47,9 @@ struct PortArgs {
 
 pub(crate) fn tools(policy: &ToolPolicy, runner: &CommandRunner) -> Vec<Arc<dyn ToolExecutor>> {
     [
-        ("firewall.status", "读取防火墙状态或规则。", FirewallAction::Status, PermissionLevel::User, ToolSideEffect::ReadOnly, true),
-        ("firewall.port", "通过受限端口规则修改防火墙。", FirewallAction::Port, PermissionLevel::Operator, ToolSideEffect::Stateful, true),
-        ("firewall.reload", "重新加载防火墙配置。", FirewallAction::Reload, PermissionLevel::Operator, ToolSideEffect::Stateful, true),
+        ("firewall.status", "Read firewall status or rules.", FirewallAction::Status, PermissionLevel::User, ToolSideEffect::ReadOnly, true),
+        ("firewall.port", "Modify the firewall through restricted port rules.", FirewallAction::Port, PermissionLevel::Operator, ToolSideEffect::Stateful, true),
+        ("firewall.reload", "Reload the firewall configuration.", FirewallAction::Reload, PermissionLevel::Operator, ToolSideEffect::Stateful, true),
     ]
     .into_iter()
     .map(|(name, description, action, permission, side_effect, model_visible)| {
@@ -87,23 +87,23 @@ impl ToolExecutor for FirewallTool {
                     Backend::Firewalld => ("firewall-cmd", vec!["--list-all".into()]),
                     Backend::Nft => ("nft", vec!["list".into(), "ruleset".into()]),
                 };
-                self.run(program, command, "防火墙状态", cancel, false)
+                self.run(program, command, "Firewall status", cancel, false)
                     .await
             }
             FirewallAction::Port => {
                 let args: PortArgs = parse_args(invocation.tool_call.arguments)?;
                 self.policy.require_mutation()?;
                 if args.port == 0 {
-                    return Err(invalid("防火墙端口必须位于 1 到 65535 之间"));
+                    return Err(invalid("Firewall port must be between 1 and 65535"));
                 }
                 let protocol = args.protocol.unwrap_or_else(|| "tcp".into());
                 if !matches!(protocol.as_str(), "tcp" | "udp") {
-                    return Err(invalid("防火墙协议只能是 tcp 或 udp"));
+                    return Err(invalid("Firewall protocol must be tcp or udp"));
                 }
                 let allow = match args.action.as_str() {
                     "allow" => true,
                     "deny" => false,
-                    _ => return Err(invalid("防火墙动作只能是 allow 或 deny")),
+                    _ => return Err(invalid("Firewall action must be allow or deny")),
                 };
                 let (program, command) = match backend(&args.backend)? {
                     Backend::Ufw => {
@@ -129,7 +129,9 @@ impl ToolExecutor for FirewallTool {
                     }
                     Backend::Firewalld => {
                         if args.source.is_some() {
-                            return Err(invalid("firewalld 端口工具暂不支持 source 条件"));
+                            return Err(invalid(
+                                "The firewalld port tool does not support source conditions",
+                            ));
                         }
                         (
                             "firewall-cmd",
@@ -146,7 +148,7 @@ impl ToolExecutor for FirewallTool {
                     }
                     Backend::Nft => {
                         return Err(invalid(
-                            "firewall.port 暂不直接修改 nft 规则，请使用受控配置工具",
+                            "firewall.port does not modify nft rules directly; use a controlled configuration tool instead",
                         ));
                     }
                 };
@@ -155,19 +157,19 @@ impl ToolExecutor for FirewallTool {
                     let second = self
                         .run_raw("firewall-cmd", vec!["--reload".into()], cancel, true)
                         .await?;
-                    ensure_success("防火墙规则", &first)?;
-                    ensure_success("防火墙重载", &second)?;
+                    ensure_success("Firewall rule", &first)?;
+                    ensure_success("Firewall reload", &second)?;
                     Ok(ToolResult {
-                        summary: "防火墙端口规则已更新".into(),
+                        summary: "Firewall port rule updated".into(),
                         data: json!({
-                            "rule": command_result("防火墙规则", &first).data,
-                            "reload": command_result("防火墙重载", &second).data,
+                            "rule": command_result("Firewall rule", &first).data,
+                            "reload": command_result("Firewall reload", &second).data,
                         }),
                         truncated: first.truncated || second.truncated,
                     })
                 } else {
-                    ensure_success("防火墙规则", &first)?;
-                    Ok(command_result("防火墙规则", &first))
+                    ensure_success("Firewall rule", &first)?;
+                    Ok(command_result("Firewall rule", &first))
                 }
             }
             FirewallAction::Reload => {
@@ -176,9 +178,10 @@ impl ToolExecutor for FirewallTool {
                 let (program, command) = match backend(&args.backend)? {
                     Backend::Ufw => ("ufw", vec!["reload".into()]),
                     Backend::Firewalld => ("firewall-cmd", vec!["--reload".into()]),
-                    Backend::Nft => return Err(invalid("nft 没有通用 reload 操作")),
+                    Backend::Nft => return Err(invalid("nft has no generic reload operation")),
                 };
-                self.run(program, command, "防火墙重载", cancel, true).await
+                self.run(program, command, "Firewall reload", cancel, true)
+                    .await
             }
         }
     }
@@ -235,7 +238,7 @@ fn backend(value: &str) -> Result<Backend, ToolError> {
         "ufw" => Ok(Backend::Ufw),
         "firewalld" => Ok(Backend::Firewalld),
         "nft" => Ok(Backend::Nft),
-        _ => Err(invalid("防火墙 backend 只能是 ufw、firewalld 或 nft")),
+        _ => Err(invalid("Firewall backend must be ufw, firewalld, or nft")),
     }
 }
 
@@ -247,7 +250,7 @@ fn validate_source(source: &str) -> Result<(), ToolError> {
             .chars()
             .any(|character| character.is_whitespace() || character.is_control())
     {
-        return Err(invalid("防火墙 source 无效"));
+        return Err(invalid("Invalid firewall source"));
     }
     Ok(())
 }
