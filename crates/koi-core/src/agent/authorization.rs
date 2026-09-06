@@ -12,6 +12,7 @@ type EvidenceParts = (
     Option<crate::domain::Principal>,
     PermissionLevel,
     PermissionLevel,
+    PermissionLevel,
     Option<crate::domain::EventId>,
 );
 
@@ -74,33 +75,41 @@ fn evidence_from_event(event: EventEnvelope) -> Result<AuthorizationEvidence, Au
         AuthorizationEvidenceStatus::Active
     };
 
-    let (event_kind, principal, source_maximum_permission, permission, approval_request_event_id) =
-        match event.payload {
-            AgentEvent::Ingress(ingress) => ingress_evidence(
-                ingress.as_ref(),
-                &event.provenance.creator,
-                authority_parent_event_id,
-            )?,
-            AgentEvent::Control(_) => direct_evidence(
-                AuthorizationEvidenceEventKind::Control,
-                &event.provenance.creator,
-                event.provenance.direct_permission,
-            ),
-            AgentEvent::Model(_) => (
-                AuthorizationEvidenceEventKind::Model,
-                None,
-                PermissionLevel::None,
-                PermissionLevel::None,
-                None,
-            ),
-            AgentEvent::Tool(_) => (
-                AuthorizationEvidenceEventKind::Tool,
-                None,
-                PermissionLevel::None,
-                PermissionLevel::None,
-                None,
-            ),
-        };
+    let (
+        event_kind,
+        principal,
+        source_maximum_permission,
+        identity_maximum_permission,
+        permission,
+        approval_request_event_id,
+    ) = match event.payload {
+        AgentEvent::Ingress(ingress) => ingress_evidence(
+            ingress.as_ref(),
+            &event.provenance.creator,
+            authority_parent_event_id,
+        )?,
+        AgentEvent::Control(_) => direct_evidence(
+            AuthorizationEvidenceEventKind::Control,
+            &event.provenance.creator,
+            event.provenance.direct_permission,
+        ),
+        AgentEvent::Model(_) => (
+            AuthorizationEvidenceEventKind::Model,
+            None,
+            PermissionLevel::None,
+            PermissionLevel::None,
+            PermissionLevel::None,
+            None,
+        ),
+        AgentEvent::Tool(_) => (
+            AuthorizationEvidenceEventKind::Tool,
+            None,
+            PermissionLevel::None,
+            PermissionLevel::None,
+            PermissionLevel::None,
+            None,
+        ),
+    };
 
     Ok(AuthorizationEvidence {
         event_id: event.id,
@@ -108,6 +117,7 @@ fn evidence_from_event(event: EventEnvelope) -> Result<AuthorizationEvidence, Au
         event_kind,
         principal,
         source_maximum_permission,
+        identity_maximum_permission,
         permission,
         status,
         authority_parent_event_id,
@@ -133,6 +143,7 @@ fn ingress_evidence(
                 None,
                 PermissionLevel::None,
                 PermissionLevel::None,
+                PermissionLevel::None,
                 None,
             ))
         }
@@ -144,6 +155,7 @@ fn ingress_evidence(
                 AuthorizationEvidenceEventKind::Ingress,
                 context.actor.clone(),
                 assessment.source_maximum_permission,
+                assessment.identity_maximum_permission,
                 assessment.effective_permission,
                 None,
             )),
@@ -156,6 +168,7 @@ fn ingress_evidence(
             EventSource::System => Ok((
                 AuthorizationEvidenceEventKind::Ingress,
                 None,
+                PermissionLevel::System,
                 PermissionLevel::System,
                 PermissionLevel::System,
                 None,
@@ -172,6 +185,7 @@ fn ingress_evidence(
                 Ok((
                     AuthorizationEvidenceEventKind::Ingress,
                     None,
+                    PermissionLevel::None,
                     PermissionLevel::None,
                     PermissionLevel::None,
                     None,
@@ -191,6 +205,7 @@ fn ingress_evidence(
             AuthorizationEvidenceEventKind::Ingress,
             Some(principal.clone()),
             assessment.source_maximum_permission,
+            assessment.identity_maximum_permission,
             if *approved {
                 assessment.effective_permission
             } else {
@@ -210,6 +225,7 @@ fn ingress_evidence(
             AuthorizationEvidenceEventKind::Ingress,
             Some(principal.clone()),
             assessment.source_maximum_permission,
+            assessment.identity_maximum_permission,
             // 取消请求的语义是撤回或停止当前流程，不是对任何工具调用的授权。
             PermissionLevel::None,
             None,
@@ -230,5 +246,5 @@ fn direct_evidence(
         EventSource::External(_) => direct_permission.unwrap_or(PermissionLevel::None),
         EventSource::Model | EventSource::Tool => PermissionLevel::None,
     };
-    (event_kind, None, permission, permission, None)
+    (event_kind, None, permission, permission, permission, None)
 }

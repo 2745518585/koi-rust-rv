@@ -359,6 +359,8 @@ pub struct ApprovalDto {
     pub scope: ScopeDto,
     pub status: String,
     pub requester: String,
+    /// 发起原始 Web 输入的稳定用户名；用于只向该用户展示 Web 提权操作。
+    pub requester_subject: Option<String>,
 }
 
 /// A core-originated request for extra authorization, delivered to the Web source for display.
@@ -374,6 +376,8 @@ pub struct ElevationRequestDto {
     pub arguments_hash: String,
     pub required_permission: String,
     pub original_evidence_event_ids: Vec<String>,
+    /// 该 Web 提权请求应投递给的已认证用户名。
+    pub requester_subject: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

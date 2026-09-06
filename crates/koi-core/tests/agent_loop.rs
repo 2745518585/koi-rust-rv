@@ -175,6 +175,7 @@ impl AuthorizationEvidenceResolver for EvidenceResolver {
                 event_kind: koi_core::domain::AuthorizationEvidenceEventKind::Tool,
                 principal: None,
                 source_maximum_permission: PermissionLevel::None,
+                identity_maximum_permission: PermissionLevel::None,
                 permission: PermissionLevel::None,
                 status: AuthorizationEvidenceStatus::Active,
                 authority_parent_event_id: Some(self.ingress_event_id),
@@ -187,7 +188,9 @@ impl AuthorizationEvidenceResolver for EvidenceResolver {
             source: EventSource::External(SourceName::new("qq").unwrap()),
             event_kind: koi_core::domain::AuthorizationEvidenceEventKind::Ingress,
             principal: Some(Principal::new("qq", "10001")),
-            source_maximum_permission: PermissionLevel::User,
+            // 本次输入仅建议 User，但核心登记的来源和身份上限允许用户确认 Operator 操作。
+            source_maximum_permission: PermissionLevel::Operator,
+            identity_maximum_permission: PermissionLevel::Operator,
             permission: PermissionLevel::User,
             status: AuthorizationEvidenceStatus::Active,
             authority_parent_event_id: None,

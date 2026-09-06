@@ -91,6 +91,7 @@ export interface ApprovalRequest {
   scope: Scope;
   status: ApprovalStatus;
   requester: string;
+  requesterSubject?: string | null;
 }
 
 export interface AuthorizationNotification {
@@ -101,6 +102,7 @@ export interface AuthorizationNotification {
   argumentsHash: string;
   requiredPermission: PermissionLevel;
   originalEvidenceEventIds: string[];
+  requesterSubject?: string | null;
 }
 
 export interface ToolDefinition {

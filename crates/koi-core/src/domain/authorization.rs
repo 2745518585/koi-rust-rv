@@ -30,6 +30,8 @@ pub struct AuthorizationEvidence {
     pub principal: Option<Principal>,
     /// 当前来源注册配置或已核定直接来源权限所允许的最高等级。
     pub source_maximum_permission: PermissionLevel,
+    /// 核心按用户身份配置解析出的最高权限，不受来源建议权限影响。
+    pub identity_maximum_permission: PermissionLevel,
     pub permission: PermissionLevel,
     pub status: AuthorizationEvidenceStatus,
     pub authority_parent_event_id: Option<EventId>,
@@ -58,6 +60,22 @@ impl AuthorizationEvidence {
     pub fn is_expired(&self) -> bool {
         self.expires_at
             .is_some_and(|expires_at| expires_at <= Utc::now())
+    }
+
+    /// 此证据所属来源是否有资格收到所需等级的补充授权请求。
+    ///
+    /// 这里刻意不检查 `permission`：它是本次输入的有效权限，会受到外部来源建议
+    /// 等级影响。补充授权的目的正是让已登记为高权限的用户在该建议较低时，仍能
+    /// 明确确认高风险操作。来源注册上限与身份上限均由核心可信配置得出。
+    #[must_use]
+    pub fn can_request_authorization(&self, required_permission: PermissionLevel) -> bool {
+        self.status == AuthorizationEvidenceStatus::Active
+            && !self.is_expired()
+            && matches!(self.event_kind, AuthorizationEvidenceEventKind::Ingress)
+            && matches!(self.source, EventSource::External(_))
+            && self.principal.is_some()
+            && self.source_maximum_permission.allows(required_permission)
+            && self.identity_maximum_permission.allows(required_permission)
     }
 
     /// 该证据对应的事件能否作为其他事件的权限父节点（提权审查的上级）。

@@ -25,8 +25,8 @@ use koi_core::agent::{
 use koi_core::domain::{
     AgentEvent, ContextEnvelope, ContextKind, ContextOrigin, ContextPayload, ControlEvent,
     EventEnvelope, EventId, EventSource, IngressDraft, IngressEvent, ModelSelection,
-    PermissionLevel, Principal, Scope, SourceName, TaskId, TaskProjection, ToolDefinition,
-    ToolEvent,
+    PermissionLevel, PolicyDecision, Principal, Scope, SourceName, TaskId, TaskProjection,
+    ToolDefinition, ToolEvent,
 };
 use koi_core::domain::{AuthorizationRequest, AuthorizationRequestResult};
 use koi_core::ports::{
@@ -37,6 +37,36 @@ use koi_core::ports::{
 use tokio::sync::{Mutex, broadcast};
 
 const WEB_INSTANCE: &str = "http-api";
+
+/// 从事件流重建某次审批的最终决定。
+///
+/// 旧版本可能先写入 `ApprovalRequested`，随后才发现来源没有足够权限并写入
+/// `AuthorizationChecked(Deny)`；后者同样代表该审批已终止，不能再显示为待办。
+fn approval_decision(
+    events: &[EventEnvelope],
+    approval_request_event_id: EventId,
+    proposal_event_id: EventId,
+) -> Option<bool> {
+    events.iter().rev().find_map(|event| match &event.payload {
+        AgentEvent::Ingress(ingress) => match ingress.as_ref() {
+            IngressEvent::ApprovalSubmitted {
+                approval_request_event_id: submitted_request_event_id,
+                approved,
+                ..
+            } if *submitted_request_event_id == approval_request_event_id => Some(*approved),
+            _ => None,
+        },
+        AgentEvent::Tool(tool) => match tool.as_ref() {
+            ToolEvent::AuthorizationChecked {
+                proposal_event_id: checked_proposal_event_id,
+                decision: PolicyDecision::Deny,
+                ..
+            } if *checked_proposal_event_id == proposal_event_id => Some(false),
+            _ => None,
+        },
+        _ => None,
+    })
+}
 
 pub struct KoiWebSource {
     store: Arc<JsonlEventStore>,
@@ -179,6 +209,12 @@ impl KoiWebSource {
                 "提权请求未绑定当前任务中已持久化的审批事件",
             ));
         }
+        let requester_subject = self
+            .requester_for_evidence(&request.original_evidence_event_ids)
+            .await
+            .map_err(|error| AuthorizationError::new(error.to_string()))?
+            .filter(|principal| principal.source == WEB_SOURCE_NAME)
+            .map(|principal| principal.subject);
         let _ = self.events.send(WebStreamEvent::AuthorizationRequested {
             request: ElevationRequestDto {
                 task_id: request.task_id.to_string(),
@@ -192,6 +228,7 @@ impl KoiWebSource {
                     .into_iter()
                     .map(|event_id| event_id.to_string())
                     .collect(),
+                requester_subject,
             },
         });
         Ok(AuthorizationRequestResult::Pending)
@@ -375,7 +412,11 @@ impl KoiWebSource {
             .collect()
     }
 
-    fn approval_dtos(&self, records: &[TaskRecord]) -> Vec<ApprovalDto> {
+    async fn approval_dtos(
+        &self,
+        records: &[TaskRecord],
+        viewer: Option<&WebPrincipal>,
+    ) -> Result<Vec<ApprovalDto>, WebApiError> {
         let descriptions = self
             .tools
             .iter()
@@ -410,21 +451,24 @@ impl KoiWebSource {
                     continue;
                 };
 
-                let decision = record.events.iter().rev().find_map(|event| {
-                    let AgentEvent::Ingress(ingress) = &event.payload else {
-                        return None;
-                    };
-                    match ingress.as_ref() {
-                        IngressEvent::ApprovalSubmitted {
-                            approval_request_event_id,
-                            approved,
-                            ..
-                        } if *approval_request_event_id == request_event.id => Some(*approved),
-                        _ => None,
-                    }
-                });
+                let decision =
+                    approval_decision(&record.events, request_event.id, *proposal_event_id);
                 let arguments = serde_json::to_string(&tool_call.arguments)
                     .unwrap_or_else(|_| "<无法序列化参数>".into());
+                let requester = self.approval_requester(&tool_call).await?;
+                if requester.as_ref().is_some_and(|requester| {
+                    requester.source == WEB_SOURCE_NAME
+                        && viewer.is_some_and(|viewer| viewer.subject != requester.subject)
+                }) {
+                    continue;
+                }
+                let requester_subject = requester.as_ref().and_then(|requester| {
+                    (requester.source == WEB_SOURCE_NAME).then(|| requester.subject.clone())
+                });
+                let requester = requester.map_or_else(
+                    || request_event.provenance.creator.as_str().to_owned(),
+                    |requester| requester.display_name.unwrap_or(requester.subject),
+                );
                 approvals.push(ApprovalDto {
                     approval_request_event_id: request_event.id.to_string(),
                     task_id: record.task_id.to_string(),
@@ -451,12 +495,40 @@ impl KoiWebSource {
                         None => "Pending",
                     }
                     .into(),
-                    requester: request_event.provenance.creator.as_str().into(),
+                    requester,
+                    requester_subject,
                 });
             }
         }
         approvals.sort_by(|left, right| right.requested_at.cmp(&left.requested_at));
-        approvals
+        Ok(approvals)
+    }
+
+    async fn approval_requester(
+        &self,
+        tool_call: &koi_core::domain::ToolCall,
+    ) -> Result<Option<Principal>, WebApiError> {
+        let Some(event_id) = tool_call.authority_parent_event_id else {
+            return Ok(None);
+        };
+        self.requester_for_evidence(&[event_id]).await
+    }
+
+    async fn requester_for_evidence(
+        &self,
+        evidence_event_ids: &[EventId],
+    ) -> Result<Option<Principal>, WebApiError> {
+        for event_id in evidence_event_ids {
+            let event = self
+                .store
+                .load_event_any(*event_id)
+                .await
+                .map_err(|error| WebApiError::internal(error.to_string()))?;
+            if let Some(principal) = event.as_ref().and_then(event_principal) {
+                return Ok(Some(principal.clone()));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -502,7 +574,7 @@ impl WebQueryPort for KoiWebSource {
                 .iter()
                 .map(|record| record.summary.clone())
                 .collect(),
-            approvals: self.approval_dtos(&records),
+            approvals: self.approval_dtos(&records, Some(principal)).await?,
             recent_events,
             tools: self.tool_dtos(),
             models: self.models.iter().map(model_selection_dto).collect(),
@@ -716,10 +788,22 @@ impl WebCommandPort for KoiWebSource {
         if !is_approval_request {
             return Err(WebApiError::validation("该事件不是工具授权请求"));
         }
-        if self.approval_dtos(&records).iter().any(|approval| {
-            approval.approval_request_event_id == approval_request_event_id.to_string()
-                && approval.status != "Pending"
-        }) {
+        let approval = self
+            .approval_dtos(&records, None)
+            .await?
+            .into_iter()
+            .find(|approval| {
+                approval.approval_request_event_id == approval_request_event_id.to_string()
+            })
+            .ok_or_else(|| WebApiError::not_found("授权请求事件不存在"))?;
+        if approval
+            .requester_subject
+            .as_deref()
+            .is_some_and(|subject| subject != principal.subject)
+        {
+            return Err(WebApiError::Forbidden("该授权请求属于其他用户".into()));
+        }
+        if approval.status != "Pending" {
             return Err(WebApiError::conflict("该授权请求已经处理"));
         }
 
@@ -754,7 +838,8 @@ impl WebCommandPort for KoiWebSource {
             summary: task_dto(record.task_id, &updated_events, runtime.projection()),
             events: updated_events,
         };
-        self.approval_dtos(&records)
+        self.approval_dtos(&records, None)
+            .await?
             .into_iter()
             .find(|approval| {
                 approval.approval_request_event_id == approval_request_event_id.to_string()
@@ -1130,18 +1215,22 @@ fn event_dto(event: &EventEnvelope, events: &[EventEnvelope]) -> EventDto {
 /// 提取事件直接来源用户的显示名。输入、审批和取消事件本身携带已认证身份；其余
 /// 内部事件没有用户主体，不能根据权限来源或因果链猜测一个用户名。
 fn event_source_user(event: &EventEnvelope) -> Option<String> {
-    let principal = match &event.payload {
+    let principal = event_principal(event)?;
+    principal
+        .display_name
+        .clone()
+        .or_else(|| (!principal.subject.trim().is_empty()).then(|| principal.subject.clone()))
+}
+
+fn event_principal(event: &EventEnvelope) -> Option<&Principal> {
+    match &event.payload {
         AgentEvent::Ingress(ingress) => match ingress.as_ref() {
             IngressEvent::ContextReceived { context, .. } => context.actor.as_ref(),
             IngressEvent::ApprovalSubmitted { principal, .. }
             | IngressEvent::CancellationRequested { principal, .. } => Some(principal),
         },
         _ => None,
-    }?;
-    principal
-        .display_name
-        .clone()
-        .or_else(|| (!principal.subject.trim().is_empty()).then(|| principal.subject.clone()))
+    }
 }
 
 /// 为有用户可读正文的事件保留完整文本，供 Web 审计界面按需展开。

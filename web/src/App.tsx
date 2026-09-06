@@ -89,12 +89,18 @@ export default function App() {
   const [apiError, setApiError] = useState<string | null>(null);
   const [eventsRevision, setEventsRevision] = useState(0);
   const [elevationQueue, setElevationQueue] = useState<AuthorizationNotification[]>([]);
+  // 用户已作出点击决定的待审批项立即从所有待办入口隐藏。若提交成功，服务端返回的
+  // 终态记录仍会在历史区显示；若提交失败，刷新页面后可重新从权威快照看到该请求。
+  const [dismissedApprovalIds, setDismissedApprovalIds] = useState<Set<string>>(() => new Set());
 
   // 快照加载只在登录状态变化时触发；选中会话通过 ref 读取，避免切换会话时整页重载。
   const selectedTaskIdRef = useRef(selectedTaskId);
   selectedTaskIdRef.current = selectedTaskId;
 
-  const pendingApprovals = snapshot.approvals.filter((approval) =>
+  const displayedApprovals = snapshot.approvals.filter(
+    (approval) => approval.status !== "Pending" || !dismissedApprovalIds.has(approval.approvalRequestEventId),
+  );
+  const pendingApprovals = displayedApprovals.filter((approval) =>
     isActionableApproval(approval, snapshot.tasks),
   );
   const selectedTask =
@@ -163,7 +169,8 @@ export default function App() {
   }, [api, user, t]);
 
   useEffect(() => {
-    if (!isLive) return;
+    if (!isLive || !user) return;
+    const currentUsername = user.username;
     return api.openEventStream(
       undefined,
       (event) => {
@@ -174,6 +181,9 @@ export default function App() {
           setEventsRevision((current) => current + 1);
         }
         if (event.type === "authorization.requested") {
+          // Web 提权只能由发起原始 Web 输入的同一用户确认。SSE 是进程内广播，
+          // 因此前端还要按后端附带的稳定用户名过滤，不能把别人的确认窗口弹出来。
+          if (event.request.requesterSubject !== currentUsername) return;
           setElevationQueue((current) =>
             current.some((request) => request.approvalRequestEventId === event.request.approvalRequestEventId)
               ? current
@@ -191,7 +201,7 @@ export default function App() {
       },
       () => undefined,
     );
-  }, [api, isLive]);
+  }, [api, isLive, user]);
 
   async function refreshSnapshot() {
     setRefreshing(true);
@@ -210,6 +220,9 @@ export default function App() {
   }
 
   async function handleApproval(approval: ApprovalRequest, approved: boolean): Promise<boolean> {
+    // 审批动作一旦点击便不应继续占据待办列表或弹窗；这也覆盖离线和请求失败场景。
+    setDismissedApprovalIds((current) => new Set(current).add(approval.approvalRequestEventId));
+    deferElevation(approval.approvalRequestEventId);
     setApprovalBusy(approval.approvalRequestEventId);
     if (!isLive) {
       setApprovalBusy(null);
@@ -331,7 +344,7 @@ export default function App() {
             task={selectedTask}
             eventsRevision={eventsRevision}
             isLive={isLive}
-            approvals={snapshot.approvals}
+            approvals={displayedApprovals}
             models={snapshot.models}
             maximumPermission={user.permission}
             currentUsername={user.username}
@@ -349,7 +362,7 @@ export default function App() {
         ) : null}
         {view === "approvals" ? (
           <ApprovalsView
-            approvals={snapshot.approvals}
+            approvals={displayedApprovals}
             tasks={snapshot.tasks}
             onApproval={handleApproval}
             approvalBusy={approvalBusy}

@@ -35,12 +35,26 @@ fn evidence(
         event_kind: AuthorizationEvidenceEventKind::Ingress,
         principal: Some(Principal::new("qq", "10001")),
         source_maximum_permission: permission,
+        identity_maximum_permission: permission,
         permission,
         status,
         authority_parent_event_id: None,
         expires_at: None,
         approval_request_event_id: None,
     }
+}
+
+#[test]
+fn authorization_request_uses_trusted_maxima_not_input_permission() {
+    let mut administrator = evidence(PermissionLevel::Admin, AuthorizationEvidenceStatus::Active);
+    // 模拟 Web 页面把这次消息的建议权限设为 User：这不应阻止管理员确认 Operator 操作。
+    administrator.permission = PermissionLevel::User;
+    assert!(administrator.can_request_authorization(PermissionLevel::Operator));
+
+    let mut regular_user = administrator;
+    regular_user.identity_maximum_permission = PermissionLevel::User;
+    // 身份权限由核心配置核定，低于需求时不应向来源适配器创建必然失败的审批请求。
+    assert!(!regular_user.can_request_authorization(PermissionLevel::Operator));
 }
 
 #[test]

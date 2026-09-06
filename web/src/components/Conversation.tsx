@@ -79,6 +79,7 @@ export function Conversation({
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [dismissedApprovals, setDismissedApprovals] = useState<Set<string>>(() => new Set());
   const feedRef = useRef<HTMLDivElement>(null);
   const shouldStickToBottom = useRef(true);
   const previousView = useRef<string | null>(null);
@@ -275,6 +276,7 @@ export function Conversation({
     (approval) =>
       approval.taskId === task.taskId
       && approval.status === "Pending"
+      && !dismissedApprovals.has(approval.approvalRequestEventId)
       && !["Completed", "Cancelled", "Failed", "Expired"].includes(task.status),
   );
   const terminal = ["Completed", "Cancelled", "Failed", "Expired"].includes(task.status);
@@ -408,7 +410,12 @@ export function Conversation({
               key={approval.approvalRequestEventId}
               approval={approval}
               task={task}
-              onApproval={onApproval}
+              onApproval={(approval, approved) => {
+                // 无论请求是否成功送达都立即收起本地卡片，失败由全局 toast 提示；刷新
+                // 页面后仍会以服务端的权威审批状态重新判断是否展示。
+                setDismissedApprovals((current) => new Set(current).add(approval.approvalRequestEventId));
+                onApproval(approval, approved);
+              }}
               busy={approvalBusy === approval.approvalRequestEventId}
               compact
             />

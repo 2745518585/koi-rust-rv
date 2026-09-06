@@ -767,8 +767,8 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
         }
     }
 
-    /// 记录 `AuthorizationChecked(RequireApproval)` 与 `ApprovalRequested`，
-    /// 然后向来源适配器发起提权请求。
+    /// 确认存在可处理的来源后，记录 `AuthorizationChecked(RequireApproval)` 与
+    /// `ApprovalRequested`，再向来源适配器发起提权请求。
     #[allow(clippy::too_many_arguments)]
     async fn begin_approval_flow(
         &self,
@@ -781,6 +781,21 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
         required_permission: PermissionLevel,
         cancel: CancellationToken,
     ) -> Result<ToolHandlingOutcome, AgentLoopError> {
+        let authorization_sources = authorization_request_sources(&evidence, required_permission)
+            .into_iter()
+            .filter(|source| self.authorization_providers.get(source).is_some())
+            .collect::<Vec<_>>();
+        // `ApprovalRequested` 是对外可见的待办项，不能先写入再发现原始来源根本
+        // 无权确认。否则前端会显示一个永远无法完成的虚假审批申请。
+        if authorization_sources.is_empty() {
+            return self
+                .deny_tool(
+                    runtime,
+                    proposal_event_id,
+                    "原始来源的登记权限或身份权限不足，无法确认该工具调用",
+                )
+                .await;
+        }
         let checked = runtime
             .record(
                 AgentEvent::tool(ToolEvent::AuthorizationChecked {
@@ -807,6 +822,7 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                 tool_call,
                 required_permission,
                 original_evidence: evidence,
+                authorization_sources,
             },
             cancel,
         )
@@ -888,8 +904,10 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
     ) -> Result<ToolHandlingOutcome, AgentLoopError> {
         let task_id = runtime.projection().task_id;
         let mut pending = false;
-        for source in unique_sources(&flow.original_evidence) {
-            let Some(provider) = self.authorization_providers.get(&source) else {
+        for source in &flow.authorization_sources {
+            // 来源在创建 `ApprovalRequested` 前已检查过注册表；此处保留防御性判断，
+            // 避免运行时来源注册表被替换后造成循环失败。
+            let Some(provider) = self.authorization_providers.get(source) else {
                 continue;
             };
             let request = AuthorizationRequest {
@@ -1471,6 +1489,7 @@ struct AuthorizationFlow {
     tool_call: ToolCall,
     required_permission: PermissionLevel,
     original_evidence: Vec<crate::domain::AuthorizationEvidence>,
+    authorization_sources: Vec<String>,
 }
 
 struct ExecutionFlow {
@@ -1616,10 +1635,18 @@ fn proposed_tool_call(
         ))
 }
 
-fn unique_sources(evidence: &[crate::domain::AuthorizationEvidence]) -> Vec<String> {
+/// 收集有资格处理补充授权的外部来源。
+///
+/// 不能以事件当前有效权限作为筛选条件：该权限受外部建议等级限制，而补充授权正是
+/// 为了让实际具有足够身份权限的用户确认一次更高风险的操作。
+fn authorization_request_sources(
+    evidence: &[crate::domain::AuthorizationEvidence],
+    required_permission: PermissionLevel,
+) -> Vec<String> {
     let mut sources = HashSet::new();
     evidence
         .iter()
+        .filter(|item| item.can_request_authorization(required_permission))
         .map(|item| item.source.as_str())
         .filter(|source| sources.insert((*source).to_owned()))
         .map(str::to_owned)
