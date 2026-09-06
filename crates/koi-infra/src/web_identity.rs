@@ -265,8 +265,8 @@ fn normalize_username(raw: &str) -> Result<String, WebApiError> {
 }
 
 fn validate_password(password: &str) -> Result<(), WebApiError> {
-    if !(12..=256).contains(&password.chars().count()) {
-        return Err(WebApiError::validation("密码长度须为 12–256 个字符"));
+    if password.is_empty() || password.chars().count() > 256 {
+        return Err(WebApiError::validation("密码长度须为 1–256 个字符"));
     }
     Ok(())
 }
@@ -275,6 +275,12 @@ fn validate_password(password: &str) -> Result<(), WebApiError> {
 mod tests {
     use super::*;
     use koi_core::domain::PermissionLevel;
+
+    #[test]
+    fn password_has_no_minimum_length_beyond_non_empty() {
+        assert!(validate_password("a").is_ok());
+        assert!(validate_password("").is_err());
+    }
 
     #[test]
     fn registered_username_is_the_core_principal_subject() {

@@ -83,7 +83,6 @@ export function AuthScreen({
               type="password"
               value={password}
               onChange={(event) => setPassword(event.target.value)}
-              minLength={12}
               required
             />
           </label>
