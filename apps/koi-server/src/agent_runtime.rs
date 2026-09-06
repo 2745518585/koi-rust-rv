@@ -101,7 +101,9 @@ impl AgentSupervisor {
                 continue;
             }
 
-            if has_cancellation_request(&events) {
+            // 暂停与取消都会向活跃循环发出取消信号。二者的差别在于：取消最终写入
+            // `TaskCancelled`，暂停则等待循环真正退出后再确认 `TaskPaused`。
+            if has_cancellation_request(&events) || has_pause_request(&events) {
                 if let Some(token) = self.active_token(task_id) {
                     token.cancel();
                 }
@@ -116,7 +118,9 @@ impl AgentSupervisor {
                     let input_events = context_events(&events);
                     // Web/工具建任务会先写入生命周期事件，再写入首条输入；没有输入时不
                     // 应让模型凭空启动，也避免与仍在提交首条输入的请求竞争事件序号。
-                    if !input_events.is_empty() {
+                    // 恢复后的上下文已经在事件存储中，不需要再伪造一条输入；但仍需
+                    // 主动启动一次模型循环。普通新建任务则仍要求至少有一条输入。
+                    if !input_events.is_empty() || was_resumed(&events) {
                         if task_id.is_main() {
                             self.spawn_main(task_id, input_events, Vec::new());
                         } else {
@@ -147,6 +151,9 @@ impl AgentSupervisor {
                             self.spawn_resume(task_id, approval_event_id, context_events(&events));
                         }
                     }
+                }
+                TaskStatus::Pausing if !self.is_active(task_id) => {
+                    self.finish_pausing(task_id, &events).await;
                 }
                 TaskStatus::Cancelling if !self.is_active(task_id) => {
                     self.finish_cancelling(task_id).await;
@@ -418,11 +425,40 @@ impl AgentSupervisor {
         }
     }
 
+    /// 在活跃循环退出后确认暂停。此处而非控制入口写入 `TaskPaused`，保证前端看到
+    /// “已暂停”时不会再有本任务的模型循环占用执行槽位。
+    async fn finish_pausing(&self, task_id: TaskId, events: &[EventEnvelope]) {
+        let Some(reason) = pause_reason(events) else {
+            tracing::warn!(%task_id, "暂停中的任务缺少暂停请求事件");
+            return;
+        };
+        let Ok(mut runtime) = TaskRuntime::recover(Arc::clone(&self.store), task_id).await else {
+            return;
+        };
+        if runtime.projection().status != TaskStatus::Pausing {
+            return;
+        }
+        if let Err(error) = runtime
+            .record(
+                AgentEvent::control(ControlEvent::TaskPaused { reason }),
+                None,
+            )
+            .await
+        {
+            tracing::warn!(%task_id, %error, "写入任务暂停确认失败");
+        }
+    }
+
     async fn fail_task_if_needed(&self, task_id: TaskId, reason: String) {
         let Ok(mut runtime) = TaskRuntime::recover(Arc::clone(&self.store), task_id).await else {
             return;
         };
-        if runtime.projection().status.is_terminal() {
+        if runtime.projection().status.is_terminal()
+            || matches!(
+                runtime.projection().status,
+                TaskStatus::Pausing | TaskStatus::Paused
+            )
+        {
             return;
         }
         if let Err(error) = runtime
@@ -609,8 +645,50 @@ fn has_cancellation_request(events: &[EventEnvelope]) -> bool {
             event.payload,
             AgentEvent::Ingress(ref ingress)
                 if matches!(ingress.as_ref(), IngressEvent::CancellationRequested { .. })
+        ) || matches!(
+            event.payload,
+            AgentEvent::Control(ref control)
+                if matches!(control.as_ref(), ControlEvent::TaskCancelled { .. })
         )
     })
+}
+
+/// 当前执行周期是否已提出暂停请求。
+fn has_pause_request(events: &[EventEnvelope]) -> bool {
+    current_cycle_events(events).iter().any(|event| {
+        matches!(
+            event.payload,
+            AgentEvent::Control(ref control)
+                if matches!(control.as_ref(), ControlEvent::PauseRequested { .. })
+        )
+    })
+}
+
+/// 读取当前暂停请求的说明，用于运行器写入最终的暂停确认事件。
+fn pause_reason(events: &[EventEnvelope]) -> Option<String> {
+    current_cycle_events(events).iter().rev().find_map(|event| {
+        let AgentEvent::Control(control) = &event.payload else {
+            return None;
+        };
+        match control.as_ref() {
+            ControlEvent::PauseRequested { reason } => Some(reason.clone()),
+            _ => None,
+        }
+    })
+}
+
+/// 判断当前排队状态是否由恢复请求产生，而非仅由新建或普通入队产生。
+fn was_resumed(events: &[EventEnvelope]) -> bool {
+    events.iter().rev().find_map(|event| {
+        let AgentEvent::Control(control) = &event.payload else {
+            return None;
+        };
+        match control.as_ref() {
+            ControlEvent::ResumeRequested => Some(true),
+            ControlEvent::TaskQueued => Some(false),
+            _ => None,
+        }
+    }) == Some(true)
 }
 
 fn completed_approval(events: &[EventEnvelope]) -> Option<koi_core::domain::EventId> {
@@ -642,8 +720,8 @@ fn completed_approval(events: &[EventEnvelope]) -> Option<koi_core::domain::Even
     })
 }
 
-/// 最近一次入队事件界定当前工作周期。主会话在重启后重新入队时，旧周期的输入、
-/// 取消和审批都只能保留为审计历史，不能再影响新的对话。
+/// 最近一次入队或恢复请求界定当前工作周期。主会话在重启后重新入队时，旧周期的输入、
+/// 取消和暂停都只能保留为审计历史，不能再影响新的对话。
 fn current_cycle_events(events: &[EventEnvelope]) -> &[EventEnvelope] {
     let start = events
         .iter()
@@ -651,7 +729,10 @@ fn current_cycle_events(events: &[EventEnvelope]) -> &[EventEnvelope] {
             matches!(
                 event.payload,
                 AgentEvent::Control(ref control)
-                    if matches!(control.as_ref(), ControlEvent::TaskQueued)
+                    if matches!(
+                        control.as_ref(),
+                        ControlEvent::TaskQueued | ControlEvent::ResumeRequested
+                    )
             )
         })
         .map_or(0, |index| index.saturating_add(1));
@@ -740,5 +821,42 @@ mod tests {
         let second_call = model_call_started(6, vec![already_injected.id, arrived_during_call.id]);
         let events = [events, vec![second_call]].concat();
         assert!(pending_tool_results(&events).is_empty());
+    }
+
+    #[test]
+    fn resume_starts_a_new_cycle_without_reusing_old_pause_request() {
+        let queued = EventEnvelope::new(
+            TaskId::MAIN,
+            1,
+            None,
+            AgentEvent::control(ControlEvent::TaskQueued),
+        );
+        let pause = EventEnvelope::new(
+            TaskId::MAIN,
+            2,
+            None,
+            AgentEvent::control(ControlEvent::PauseRequested {
+                reason: "暂停".into(),
+            }),
+        );
+        let paused = EventEnvelope::new(
+            TaskId::MAIN,
+            3,
+            Some(pause.id),
+            AgentEvent::control(ControlEvent::TaskPaused {
+                reason: "暂停".into(),
+            }),
+        );
+        let resume = EventEnvelope::new(
+            TaskId::MAIN,
+            4,
+            None,
+            AgentEvent::control(ControlEvent::ResumeRequested),
+        );
+        let events = vec![queued, pause, paused, resume];
+
+        assert!(was_resumed(&events));
+        assert!(!has_pause_request(&events));
+        assert!(current_cycle_events(&events).is_empty());
     }
 }

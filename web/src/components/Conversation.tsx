@@ -335,7 +335,7 @@ export function Conversation({
             <button
               className="icon-button"
               onClick={() => void control("pause")}
-              disabled={submitting || terminal}
+              disabled={submitting || terminal || task.status === "Pausing"}
               title={t("pause")}
             >
               <Pause size={15} />

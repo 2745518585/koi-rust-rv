@@ -356,10 +356,10 @@ pub fn parse_task_control(value: &Value) -> Result<TaskControlArguments, TaskToo
         Ok(reason.to_owned())
     };
     let control = match action {
-        "pause" => ControlEvent::TaskPaused {
+        "pause" => ControlEvent::PauseRequested {
             reason: reason("由主会话发起暂停")?,
         },
-        "resume" => ControlEvent::TaskResumed,
+        "resume" => ControlEvent::ResumeRequested,
         "cancel" => ControlEvent::TaskCancelled {
             reason: reason("由主会话发起取消")?,
         },

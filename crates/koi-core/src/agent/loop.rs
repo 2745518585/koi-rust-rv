@@ -15,9 +15,10 @@ use crate::agent::{
 use crate::domain::{
     AgentEvent, AuthorizationRequest, AuthorizationRequestResult, AuthorizedToolInvocation,
     ControlEvent, EventId, MemoryContextBuilder, MemoryQuery, ModelContextItem, ModelError,
-    ModelEvent, ModelGenerationOptions, ModelInputRole, ModelOutput, ModelOutputContract,
-    ModelRequest, ModelStreamEvent, PermissionCheckResult, PermissionChecker, PermissionLevel,
-    PolicyDecision, TaskId, TaskStatus, ToolCall, ToolDefinition, ToolEvent, ToolResult,
+    ModelErrorKind, ModelEvent, ModelGenerationOptions, ModelInputRole, ModelOutput,
+    ModelOutputContract, ModelRequest, ModelStreamEvent, PermissionCheckResult, PermissionChecker,
+    PermissionLevel, PolicyDecision, TaskId, TaskStatus, ToolCall, ToolDefinition, ToolEvent,
+    ToolResult,
 };
 use crate::ports::{
     AuthorizationEvidenceResolver, EventStore, MemoryError, MemoryStore, ModelProvider,
@@ -604,6 +605,12 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
             .await?;
         let stream = match self.model.start(model_request, cancel.clone()).await {
             Ok(stream) => stream,
+            Err(error) if error.kind == ModelErrorKind::Cancelled => {
+                // `Cancelled` 是预期控制流，不是模型供应商故障。暂停中的调用尤其不能
+                // 写成失败或终止任务，运行器会在循环退出后确认 `TaskPaused`。
+                self.record_cancelled(runtime, "模型调用已取消").await?;
+                return Err(AgentLoopError::Cancelled);
+            }
             Err(error) => {
                 runtime
                     .record_with_provenance(
@@ -648,12 +655,18 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                 self.record_cancelled(runtime, "模型调用已取消").await?;
                 return Err(AgentLoopError::Cancelled);
             }
-            match item? {
-                // Delta 仅是供应商传输层的临时片段。当前版本不将其写入事件存储，
-                // 避免历史会话被 token 级事件淹没；`Completed` 会持久化本次调用的
-                // 完整输出，作为重放和展示的权威记录。
-                ModelStreamEvent::Delta { .. } => {}
-                ModelStreamEvent::Completed(turn) => return Ok(turn),
+            match item {
+                Err(error) if error.kind == ModelErrorKind::Cancelled => {
+                    self.record_cancelled(runtime, "模型调用已取消").await?;
+                    return Err(AgentLoopError::Cancelled);
+                }
+                Err(error) => return Err(AgentLoopError::Model(error)),
+                Ok(ModelStreamEvent::Delta { .. }) => {
+                    // Delta 仅是供应商传输层的临时片段。当前版本不将其写入事件存储，
+                    // 避免历史会话被 token 级事件淹没；`Completed` 会持久化本次调用的
+                    // 完整输出，作为重放和展示的权威记录。
+                }
+                Ok(ModelStreamEvent::Completed(turn)) => return Ok(turn),
             }
         }
 
@@ -1402,7 +1415,12 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
         runtime: &mut TaskRuntime<S>,
         reason: &str,
     ) -> Result<(), AgentLoopError> {
-        if !runtime.projection().status.is_terminal() {
+        // 取消令牌没有区分“暂停”与“显式取消”的信息；外部控制可能在当前模型调用
+        // 开始后才写入事件流，因此必须以持久化投影为准，不能相信旧内存状态。
+        runtime.refresh_projection().await?;
+        if !runtime.projection().status.is_terminal()
+            && runtime.projection().status != TaskStatus::Pausing
+        {
             runtime
                 .record(
                     AgentEvent::control(ControlEvent::TaskCancelled {
@@ -1420,7 +1438,10 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
         runtime: &mut TaskRuntime<S>,
         reason: impl Into<String>,
     ) -> Result<(), AgentLoopError> {
-        if !runtime.projection().status.is_terminal() {
+        runtime.refresh_projection().await?;
+        if !runtime.projection().status.is_terminal()
+            && runtime.projection().status != TaskStatus::Pausing
+        {
             runtime
                 .record(
                     AgentEvent::control(ControlEvent::TaskFailed {

@@ -11,11 +11,11 @@ use koi_core::agent::{
 };
 use koi_core::domain::{
     AgentEvent, AuthorizationEvidence, AuthorizationEvidenceStatus, AuthorizedToolInvocation,
-    EventEnvelope, EventId, EventSource, ModelCapabilities, ModelContextItem, ModelDeltaKind,
-    ModelError, ModelGenerationOptions, ModelInputRole, ModelOutput, ModelOutputContract,
-    ModelProtocol, ModelProviderDescriptor, ModelRequest, ModelStreamEvent, PermissionLevel,
-    Principal, SourceName, TaskId, ToolCall, ToolDefinition, ToolError, ToolResult, ToolSideEffect,
-    Usage,
+    ControlEvent, EventEnvelope, EventId, EventSource, ModelCapabilities, ModelContextItem,
+    ModelDeltaKind, ModelError, ModelErrorKind, ModelGenerationOptions, ModelInputRole,
+    ModelOutput, ModelOutputContract, ModelProtocol, ModelProviderDescriptor, ModelRequest,
+    ModelStreamEvent, PermissionLevel, Principal, SourceName, TaskId, ToolCall, ToolDefinition,
+    ToolError, ToolResult, ToolSideEffect, Usage,
 };
 use koi_core::ports::{
     AuthorizationError, AuthorizationEvidenceResolver, EventStore, EventStoreError,
@@ -67,6 +67,32 @@ impl EventStore for MemoryEventStore {
 struct TwoTurnModel {
     evidence_event_id: EventId,
     calls: AtomicUsize,
+}
+
+struct CancelledStartModel;
+
+#[async_trait]
+impl ModelProvider for CancelledStartModel {
+    fn descriptor(&self) -> ModelProviderDescriptor {
+        ModelProviderDescriptor {
+            provider: "test".into(),
+            model_id: "cancelled-model".into(),
+            protocol: ModelProtocol::Responses,
+            capabilities: ModelCapabilities::default(),
+        }
+    }
+
+    async fn start(
+        &self,
+        _request: ModelRequest,
+        _cancel: CancellationToken,
+    ) -> Result<ModelEventStream, ModelError> {
+        Err(ModelError::new(
+            ModelErrorKind::Cancelled,
+            "测试模型调用已取消",
+            false,
+        ))
+    }
 }
 
 #[async_trait]
@@ -330,6 +356,95 @@ async fn main_loop_records_model_tool_and_final_response() {
         AgentEvent::Control(ref control)
             if matches!(control.as_ref(), koi_core::domain::ControlEvent::TaskCompleted { .. })
     )));
+}
+
+#[tokio::test]
+async fn cancelled_model_call_during_pause_is_not_recorded_as_failure() {
+    let model = CancelledStartModel;
+    let tools = ToolRegistry::default();
+    let store = Arc::new(InMemoryEventStore::default());
+    let mut setup = TaskRuntime::new(Arc::clone(&store), TaskId::MAIN);
+    let resolver = EvidenceResolver {
+        ingress_event_id: EventId::new(),
+    };
+    let providers = SourceAuthorizationRegistry::default();
+    let prompts = TestPromptProvider;
+    let agent = AgentLoop::new(&model, &tools, &resolver, &providers, None, &prompts);
+
+    for control in [
+        ControlEvent::TaskCreated {
+            trigger_event_id: None,
+        },
+        ControlEvent::TaskQueued,
+        ControlEvent::TaskResumed,
+    ] {
+        setup
+            .record(AgentEvent::control(control), None)
+            .await
+            .unwrap();
+    }
+
+    // 模拟真实竞态：循环在暂停请求前已恢复出 `Running` 投影，暂停控制随后由另一个
+    // 写入者追加。取消处理必须刷新持久化投影，不能按旧状态写入 `TaskCancelled`。
+    let mut runtime = TaskRuntime::recover(Arc::clone(&store), TaskId::MAIN)
+        .await
+        .unwrap();
+    let mut controller = TaskRuntime::recover(Arc::clone(&store), TaskId::MAIN)
+        .await
+        .unwrap();
+    controller
+        .record(
+            AgentEvent::control(ControlEvent::PauseRequested {
+                reason: "暂停测试".into(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let outcome = agent
+        .run_main(
+            &mut runtime,
+            AgentRunRequest {
+                trigger_event_id: None,
+                context: vec![],
+                input_events: vec![],
+                memory_query: None,
+                output_contract: ModelOutputContract::Text,
+                model_options: ModelGenerationOptions::default(),
+                max_model_turns: 1,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, AgentRunOutcome::Cancelled);
+    assert_eq!(
+        runtime.projection().status,
+        koi_core::domain::TaskStatus::Pausing
+    );
+    assert!(
+        !store
+            .load_task(TaskId::MAIN)
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| {
+                matches!(
+                    event.payload,
+                    AgentEvent::Model(ref model)
+                        if matches!(model.as_ref(), koi_core::domain::ModelEvent::Failed { .. })
+                ) || matches!(
+                    event.payload,
+                    AgentEvent::Control(ref control)
+                        if matches!(
+                            control.as_ref(),
+                            ControlEvent::TaskFailed { .. } | ControlEvent::TaskCancelled { .. }
+                        )
+                )
+            })
+    );
 }
 
 #[tokio::test]

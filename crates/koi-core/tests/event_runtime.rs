@@ -98,6 +98,58 @@ async fn task_runtime_records_a_replayable_approval_flow() {
 }
 
 #[tokio::test]
+async fn pause_is_confirmed_only_after_a_pause_request() {
+    let task_id = TaskId::new();
+    let mut runtime = TaskRuntime::new(MemoryEventStore::default(), task_id);
+
+    runtime
+        .record(
+            AgentEvent::control(ControlEvent::TaskCreated {
+                trigger_event_id: None,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    runtime
+        .record(AgentEvent::control(ControlEvent::TaskQueued), None)
+        .await
+        .unwrap();
+    runtime
+        .record(AgentEvent::control(ControlEvent::TaskResumed), None)
+        .await
+        .unwrap();
+
+    runtime
+        .record(
+            AgentEvent::control(ControlEvent::PauseRequested {
+                reason: "等待当前调用退出".into(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(runtime.projection().status, TaskStatus::Pausing);
+
+    runtime
+        .record(
+            AgentEvent::control(ControlEvent::TaskPaused {
+                reason: "等待当前调用退出".into(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(runtime.projection().status, TaskStatus::Paused);
+
+    runtime
+        .record(AgentEvent::control(ControlEvent::ResumeRequested), None)
+        .await
+        .unwrap();
+    assert_eq!(runtime.projection().status, TaskStatus::Queued);
+}
+
+#[tokio::test]
 async fn model_usage_is_accumulated_in_the_projection() {
     let task_id = TaskId::new();
     let mut runtime = TaskRuntime::new(MemoryEventStore::default(), task_id);

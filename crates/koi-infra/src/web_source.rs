@@ -778,9 +778,9 @@ impl WebCommandPort for KoiWebSource {
             TaskControlAction::Pause => {
                 let reason = command.reason.unwrap_or_else(|| "由 Web 控制台发起".into());
                 validate_reason(&reason, "控制原因")?;
-                ControlEvent::TaskPaused { reason }
+                ControlEvent::PauseRequested { reason }
             }
-            TaskControlAction::Resume => ControlEvent::TaskResumed,
+            TaskControlAction::Resume => ControlEvent::ResumeRequested,
             TaskControlAction::Cancel => {
                 let reason = command.reason.unwrap_or_else(|| "由 Web 控制台发起".into());
                 validate_reason(&reason, "控制原因")?;
@@ -1140,7 +1140,8 @@ fn event_detail(event: &AgentEvent) -> Option<String> {
             IngressEvent::ApprovalSubmitted { .. } => None,
         },
         AgentEvent::Control(control) => match control.as_ref() {
-            ControlEvent::TaskPaused { reason }
+            ControlEvent::PauseRequested { reason }
+            | ControlEvent::TaskPaused { reason }
             | ControlEvent::TaskNamed { name: reason }
             | ControlEvent::TaskCancelled { reason }
             | ControlEvent::TaskFailed { reason }
@@ -1302,9 +1303,17 @@ fn event_description(event: &AgentEvent) -> (&'static str, String, String) {
                 "任务已进入队列".into(),
                 "等待 Agent 运行器接管".into(),
             ),
+            ControlEvent::PauseRequested { reason } => {
+                ("control", "任务正在暂停".into(), truncate(reason, 180))
+            }
             ControlEvent::TaskPaused { reason } => {
                 ("control", "任务已暂停".into(), truncate(reason, 180))
             }
+            ControlEvent::ResumeRequested => (
+                "control",
+                "任务已重新排队".into(),
+                "等待 Agent 运行器重新接管".into(),
+            ),
             ControlEvent::TaskResumed => (
                 "control",
                 "任务已恢复".into(),

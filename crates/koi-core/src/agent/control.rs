@@ -146,8 +146,8 @@ impl ControlExecutor {
 fn is_external_control(event: &ControlEvent) -> bool {
     matches!(
         event,
-        ControlEvent::TaskPaused { .. }
-            | ControlEvent::TaskResumed
+        ControlEvent::PauseRequested { .. }
+            | ControlEvent::ResumeRequested
             | ControlEvent::TaskCancelled { .. }
             | ControlEvent::ModelSelected { .. }
             | ControlEvent::MinimumControlPermissionChanged { .. }

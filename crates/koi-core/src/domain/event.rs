@@ -559,9 +559,16 @@ pub enum ControlEvent {
         trigger_event_id: Option<EventId>,
     },
     TaskQueued,
+    /// 外部来源请求暂停。运行器先取消活跃执行，确认停止后才写入 `TaskPaused`。
+    PauseRequested {
+        reason: String,
+    },
     TaskPaused {
         reason: String,
     },
+    /// 外部来源请求恢复；投影回到 `Queued`，由统一调度器重新领取。
+    ResumeRequested,
+    /// 兼容历史事件；新代码使用 `ResumeRequested` 重新排队。
     TaskResumed,
     /// 为任务设置稳定显示名称；只能由任务管理操作写入。
     TaskNamed {

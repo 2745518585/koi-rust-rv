@@ -4,6 +4,7 @@ export type TaskStatus =
   | "Queued"
   | "Running"
   | "WaitingApproval"
+  | "Pausing"
   | "Paused"
   | "Cancelling"
   | "Completed"

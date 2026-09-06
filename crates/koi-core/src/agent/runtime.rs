@@ -159,7 +159,15 @@ where
         Ok(event)
     }
 
-    async fn refresh_projection(&mut self) -> Result<(), RuntimeError> {
+    /// 从持久化事件流重新构建内存投影。
+    ///
+    /// 外部控制可在模型调用期间追加事件。长时间运行的 `AgentLoop` 在处理取消、失败等
+    /// 终结性结果前应刷新投影，避免把刚收到的暂停误写成取消或失败。
+    ///
+    /// # Errors
+    ///
+    /// 当事件存储读取失败，或持久化事件流不能重建合法投影时返回错误。
+    pub async fn refresh_projection(&mut self) -> Result<(), RuntimeError> {
         let events = self.store.load_task(self.projection.task_id).await?;
         let mut projection = TaskProjection::new(self.projection.task_id);
         for event in &events {

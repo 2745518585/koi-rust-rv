@@ -902,8 +902,8 @@ pub struct DeliveredChildResult {
 fn is_manageable_control(control: &ControlEvent) -> bool {
     matches!(
         control,
-        ControlEvent::TaskPaused { .. }
-            | ControlEvent::TaskResumed
+        ControlEvent::PauseRequested { .. }
+            | ControlEvent::ResumeRequested
             | ControlEvent::TaskCancelled { .. }
             | ControlEvent::ModelSelected { .. }
             | ControlEvent::MinimumControlPermissionChanged { .. }

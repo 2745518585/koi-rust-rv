@@ -525,12 +525,13 @@ async fn name_control_and_delete_children_through_main_stream() {
         Err(TaskManagerError::OperationRejected(_))
     ));
 
-    // 控制：暂停子任务（System 权限，经 ControlExecutor 写入子任务流）。
+    // 控制：请求暂停子任务（System 权限，经 ControlExecutor 写入子任务流）。实际
+    // 暂停确认由运行器在活跃循环退出后追加。
     manager
         .request_control_child(
             &mut main,
             child_id,
-            ControlEvent::TaskPaused {
+            ControlEvent::PauseRequested {
                 reason: "等待维护窗口".into(),
             },
             None,
@@ -540,7 +541,7 @@ async fn name_control_and_delete_children_through_main_stream() {
     let child_runtime = TaskRuntime::recover(Arc::new(Arc::clone(&shared)), child_id)
         .await
         .unwrap();
-    assert_eq!(child_runtime.projection().status, TaskStatus::Paused);
+    assert_eq!(child_runtime.projection().status, TaskStatus::Pausing);
 
     // 删除未终止的子任务必须先取消。
     assert!(matches!(

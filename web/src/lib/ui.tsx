@@ -45,6 +45,7 @@ export const statusMeta: Record<
   Queued: { label: { zh: "排队中", en: "Queued" }, className: "status-info", dot: "dot-info", icon: Clock3 },
   Running: { label: { zh: "运行中", en: "Running" }, className: "status-running", dot: "dot-running", icon: LoaderCircle },
   WaitingApproval: { label: { zh: "待审批", en: "Waiting approval" }, className: "status-warning", dot: "dot-warning", icon: ShieldAlert },
+  Pausing: { label: { zh: "暂停中", en: "Pausing" }, className: "status-warning", dot: "dot-warning", icon: Pause },
   Paused: { label: { zh: "已暂停", en: "Paused" }, className: "status-paused", dot: "dot-paused", icon: Pause },
   Cancelling: { label: { zh: "取消中", en: "Cancelling" }, className: "status-warning", dot: "dot-warning", icon: CircleStop },
   Completed: { label: { zh: "已完成", en: "Completed" }, className: "status-success", dot: "dot-success", icon: CheckCircle2 },

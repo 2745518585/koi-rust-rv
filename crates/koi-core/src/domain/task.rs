@@ -12,6 +12,7 @@ pub enum TaskStatus {
     Queued,
     Running,
     WaitingApproval,
+    Pausing,
     Paused,
     Cancelling,
     Completed,
@@ -141,9 +142,22 @@ impl TaskProjection {
 
     fn apply_payload(&mut self, payload: &AgentEvent) -> Result<(), TaskProjectionError> {
         match payload {
+            AgentEvent::Control(control)
+                // 暂停请求可能与模型或工具的收尾事件并发抵达。暂停优先于本轮完成，
+                // 因此保留 `Pausing`，由运行器确认停止后写入 `TaskPaused`。
+                if self.status == TaskStatus::Pausing
+                    && matches!(
+                        control.as_ref(),
+                        ControlEvent::TaskCompleted { .. }
+                            | ControlEvent::TaskFailed { .. }
+                            | ControlEvent::BudgetExceeded { .. }
+                    ) => {}
             AgentEvent::Control(control) => match control.as_ref() {
                 ControlEvent::TaskCreated { .. } => self.transition(TaskStatus::Created)?,
-                ControlEvent::TaskQueued => self.transition(TaskStatus::Queued)?,
+                ControlEvent::TaskQueued | ControlEvent::ResumeRequested => {
+                    self.transition(TaskStatus::Queued)?;
+                }
+                ControlEvent::PauseRequested { .. } => self.transition(TaskStatus::Pausing)?,
                 ControlEvent::TaskPaused { .. } => self.transition(TaskStatus::Paused)?,
                 ControlEvent::TaskResumed => self.transition(TaskStatus::Running)?,
                 ControlEvent::TaskNamed { name } => {
@@ -163,7 +177,9 @@ impl TaskProjection {
                 | ControlEvent::TaskOperationAccepted { .. }
                 | ControlEvent::TaskOperationRejected { .. }
                 | ControlEvent::ContextCompacted { .. } => {}
-                ControlEvent::TaskCompleted { .. } => self.transition(TaskStatus::Completed)?,
+                ControlEvent::TaskCompleted { .. } => {
+                    self.transition(TaskStatus::Completed)?;
+                }
                 ControlEvent::TaskFailed { .. } | ControlEvent::BudgetExceeded { .. } => {
                     self.transition(TaskStatus::Failed)?;
                 }
@@ -183,13 +199,31 @@ impl TaskProjection {
                 }
                 super::IngressEvent::ApprovalSubmitted { .. } => {}
             },
+            AgentEvent::Model(model)
+                if self.status == TaskStatus::Pausing
+                    && matches!(model.as_ref(), super::ModelEvent::CallStarted { .. }) => {}
             AgentEvent::Model(model) => match model.as_ref() {
-                super::ModelEvent::CallStarted { .. } => self.transition(TaskStatus::Running)?,
+                super::ModelEvent::CallStarted { .. } => {
+                    self.transition(TaskStatus::Running)?;
+                }
                 super::ModelEvent::Completed { usage, .. } => self.usage.add(usage),
                 super::ModelEvent::Delta { .. } | super::ModelEvent::Failed { .. } => {}
             },
+            AgentEvent::Tool(tool)
+                if self.status == TaskStatus::Pausing
+                    && matches!(
+                        tool.as_ref(),
+                        ToolEvent::Started { .. }
+                            | ToolEvent::AuthorizationChecked {
+                                decision: PolicyDecision::RequireApproval,
+                                ..
+                            }
+                            | ToolEvent::ApprovalRequested { .. }
+                    ) => {}
             AgentEvent::Tool(tool) => match tool.as_ref() {
-                ToolEvent::Started { .. } => self.transition(TaskStatus::Running)?,
+                ToolEvent::Started { .. } => {
+                    self.transition(TaskStatus::Running)?;
+                }
                 ToolEvent::AuthorizationChecked {
                     decision: PolicyDecision::RequireApproval,
                     ..
@@ -219,7 +253,9 @@ impl TaskProjection {
                     )
                     | (
                         TaskStatus::Queued | TaskStatus::Paused,
-                        TaskStatus::Running
+                        TaskStatus::Queued
+                            | TaskStatus::Running
+                            | TaskStatus::Pausing
                             | TaskStatus::Cancelling
                             | TaskStatus::Cancelled
                             | TaskStatus::Expired
@@ -227,6 +263,7 @@ impl TaskProjection {
                     | (
                         TaskStatus::Running,
                         TaskStatus::WaitingApproval
+                            | TaskStatus::Pausing
                             | TaskStatus::Paused
                             | TaskStatus::Cancelling
                             | TaskStatus::Completed
@@ -237,10 +274,15 @@ impl TaskProjection {
                     | (
                         TaskStatus::WaitingApproval,
                         TaskStatus::Running
+                            | TaskStatus::Pausing
                             | TaskStatus::Paused
                             | TaskStatus::Cancelling
                             | TaskStatus::Cancelled
                             | TaskStatus::Expired
+                    )
+                    | (
+                        TaskStatus::Pausing,
+                        TaskStatus::Paused | TaskStatus::Cancelled | TaskStatus::Expired
                     )
                     | (
                         TaskStatus::Cancelling,

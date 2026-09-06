@@ -63,7 +63,7 @@ async fn controls_enforce_minimum_permission_and_persist_direct_source() {
     let paused = ControlExecutor::execute(
         &mut runtime,
         ControlExecutionRequest {
-            event: ControlEvent::TaskPaused {
+            event: ControlEvent::PauseRequested {
                 reason: "人工检查".into(),
             },
             authority: authority(PermissionLevel::User),
@@ -73,6 +73,17 @@ async fn controls_enforce_minimum_permission_and_persist_direct_source() {
     .await
     .unwrap();
     assert_eq!(paused.provenance.creator.as_str(), "qq");
+
+    // 外部暂停请求只表达意图；运行器结束活跃循环后才会写入暂停确认。
+    runtime
+        .record(
+            AgentEvent::control(ControlEvent::TaskPaused {
+                reason: "人工检查".into(),
+            }),
+            Some(paused.id),
+        )
+        .await
+        .unwrap();
 
     ControlExecutor::execute(
         &mut runtime,
@@ -94,7 +105,7 @@ async fn controls_enforce_minimum_permission_and_persist_direct_source() {
     let error = ControlExecutor::execute(
         &mut runtime,
         ControlExecutionRequest {
-            event: ControlEvent::TaskResumed,
+            event: ControlEvent::ResumeRequested,
             authority: authority(PermissionLevel::User),
             causation_id: None,
         },
@@ -112,7 +123,7 @@ async fn controls_enforce_minimum_permission_and_persist_direct_source() {
     ControlExecutor::execute(
         &mut runtime,
         ControlExecutionRequest {
-            event: ControlEvent::TaskResumed,
+            event: ControlEvent::ResumeRequested,
             authority: authority(PermissionLevel::Operator),
             causation_id: None,
         },

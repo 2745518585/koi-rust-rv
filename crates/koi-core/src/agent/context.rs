@@ -445,8 +445,14 @@ fn historical_control_item(event_id: EventId, control: &ControlEvent) -> Option<
         ControlEvent::BudgetExceeded { budget, consumed } => {
             format!("历史任务超出预算：预算 {budget}，已消耗 {consumed}")
         }
+        // 恢复不是用户输入，不能成为工具授权证据；但它必须进入本轮上下文，明确告知
+        // 模型本次调用是一次无新输入的续跑，而非要求等待下一条用户消息。
+        ControlEvent::ResumeRequested => {
+            "系统运行状态：任务已从暂停状态恢复。请依据现有对话、工具结果和未完成目标继续执行；无需等待新的用户输入。该状态事件不提供任何工具授权。".to_owned()
+        }
         ControlEvent::TaskCreated { .. }
         | ControlEvent::TaskQueued
+        | ControlEvent::PauseRequested { .. }
         | ControlEvent::TaskPaused { .. }
         | ControlEvent::TaskResumed
         | ControlEvent::TaskNamed { .. }
@@ -753,6 +759,30 @@ mod tests {
         assert_eq!(context.len(), 1);
         assert_eq!(context[0].role, ModelInputRole::Memory);
         assert_eq!(context[0].permission, PermissionLevel::None);
+    }
+
+    #[test]
+    fn resume_request_is_visible_without_authorization_permission() {
+        let resumed = EventEnvelope::new(
+            TaskId::MAIN,
+            1,
+            None,
+            AgentEvent::control(ControlEvent::ResumeRequested),
+        );
+
+        let context = ContextAssembler::from_events(
+            TaskId::MAIN,
+            std::slice::from_ref(&resumed),
+            &HashSet::new(),
+            PermissionLevel::User,
+        )
+        .unwrap();
+
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[0].event_id, resumed.id);
+        assert_eq!(context[0].role, ModelInputRole::Memory);
+        assert_eq!(context[0].permission, PermissionLevel::None);
+        assert!(context[0].content.contains("无需等待新的用户输入"));
     }
 
     #[test]
