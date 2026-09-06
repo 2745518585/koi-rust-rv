@@ -35,6 +35,8 @@ export interface ConversationProps {
   models: ModelSelection[];
   /** 当前身份权限，作为建议授权选择器的上限。 */
   maximumPermission: PermissionLevel;
+  /** 当前 Web 用户名，用于区分自己的输入与其他来源的输入。 */
+  currentUsername: string;
   suggestedPermission: PermissionLevel;
   onPermissionChange: (permission: PermissionLevel) => void;
   onApproval: (approval: ApprovalRequest, approved: boolean) => void;
@@ -59,6 +61,7 @@ export function Conversation({
   approvals,
   models,
   maximumPermission,
+  currentUsername,
   suggestedPermission,
   onPermissionChange,
   onApproval,
@@ -390,7 +393,9 @@ export function Conversation({
             <EmptyState icon={FileClock} title={t("allEvents")} description={t("noMessages")} />
           )
         ) : conversationEvents.length ? (
-          conversationItems.map((item) => <ConversationFeedMessage key={feedItemKey(item)} item={item} />)
+          conversationItems.map((item) => (
+            <ConversationFeedMessage key={feedItemKey(item)} item={item} currentUsername={currentUsername} />
+          ))
         ) : (
           <EmptyState icon={MessageSquare} title={t("noMessages")} description={t("typePlaceholder")} />
         )}
@@ -446,11 +451,17 @@ function feedItemKey(item: ConversationFeedItem): string {
   return item.type === "tool-group" ? `tool:${item.proposalEventId}` : item.event.id;
 }
 
-function ConversationFeedMessage({ item }: { item: ConversationFeedItem }) {
+function ConversationFeedMessage({
+  item,
+  currentUsername,
+}: {
+  item: ConversationFeedItem;
+  currentUsername: string;
+}) {
   return item.type === "tool-group" ? (
     <ToolEventGroupMessage events={item.events} />
   ) : (
-    <ConversationMessage event={item.event} />
+    <ConversationMessage event={item.event} currentUsername={currentUsername} />
   );
 }
 
@@ -529,11 +540,14 @@ function ToolEventGroupLine({ events }: { events: TaskEvent[] }) {
   );
 }
 
-function ConversationMessage({ event }: { event: TaskEvent }) {
+function ConversationMessage({ event, currentUsername }: { event: TaskEvent; currentUsername: string }) {
   const { locale } = useI18n();
   if (event.kind === "ingress") {
+    const ownInput = event.source === "web" && event.sourceUser === currentUsername;
+    const sourceLabel = event.sourceUser ? `${event.source} · ${event.sourceUser}` : event.source;
     return (
-      <article className="msg msg-user">
+      <article className={ownInput ? "msg msg-user" : "msg msg-external-input"}>
+        {!ownInput ? <strong className="msg-source">{sourceLabel}</strong> : null}
         <p>{event.summary}</p>
         <time>{formatRelative(event.occurredAt, locale)}</time>
       </article>

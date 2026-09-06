@@ -151,7 +151,7 @@ export function EventLine({
         <EventSummary event={event} />
       </div>
       <span className="event-line-meta">
-        {event.source} · {event.permission}
+        {event.source}{event.sourceUser ? ` · ${event.sourceUser}` : ""} · {event.permission}
       </span>
     </>
   );

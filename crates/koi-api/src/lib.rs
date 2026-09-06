@@ -330,6 +330,8 @@ pub struct EventDto {
     pub sequence: u64,
     pub occurred_at: String,
     pub source: String,
+    /// 事件直接来源用户的显示名；无用户身份的系统、模型和工具事件为 `null`。
+    pub source_user: Option<String>,
     pub kind: String,
     pub title: String,
     pub summary: String,

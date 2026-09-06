@@ -334,6 +334,7 @@ export default function App() {
             approvals={snapshot.approvals}
             models={snapshot.models}
             maximumPermission={user.permission}
+            currentUsername={user.username}
             suggestedPermission={suggestedPermission}
             onPermissionChange={setSuggestedPermission}
             onApproval={handleApproval}

@@ -66,6 +66,8 @@ export interface TaskEvent {
   sequence: number;
   occurredAt: string;
   source: EventSource;
+  /** 直接来源用户的显示名；无用户身份的内部事件为 null。 */
+  sourceUser?: string | null;
   kind: EventKind;
   title: string;
   summary: string;

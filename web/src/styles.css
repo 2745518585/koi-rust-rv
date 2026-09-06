@@ -390,9 +390,45 @@ textarea { resize: none; }
 .msg-user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
 .msg-user time { color: rgba(255, 255, 255, 0.72); text-align: right; }
 
-.msg-agent { align-self: flex-start; background: var(--panel); border: 1px solid var(--line); border-bottom-left-radius: 4px; }
+/* 非当前 Web 用户的输入保留消息气泡和来源署名，避免被误认成自己发送的指令。 */
+.msg-external-input {
+  align-self: flex-start;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-bottom-left-radius: 4px;
+}
+.msg-external-input time { color: var(--faint); }
+.msg-source {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--accent-strong);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.msg-agent {
+  align-self: stretch;
+  width: 100%;
+  max-width: none;
+  padding: 2px 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
 .msg-agent time { color: var(--faint); }
-.msg-agent-error { border-color: #eccfcc; background: #fff7f6; }
+.msg-agent-error {
+  align-self: flex-start;
+  width: auto;
+  max-width: min(680px, 82%);
+  padding: 9px 13px;
+  border: 1px solid #eccfcc;
+  border-radius: 12px;
+  border-bottom-left-radius: 4px;
+  background: #fff7f6;
+  box-shadow: var(--shadow-sm);
+}
 .msg-agent-error strong { display: block; margin-bottom: 4px; color: var(--danger); font-size: 12px; }
 
 .msg-tool {

@@ -1114,6 +1114,7 @@ fn event_dto(event: &EventEnvelope, events: &[EventEnvelope]) -> EventDto {
         sequence: event.sequence,
         occurred_at: event.occurred_at.to_rfc3339(),
         source: event.provenance.creator.as_str().into(),
+        source_user: event_source_user(event),
         kind: kind.into(),
         title,
         summary,
@@ -1124,6 +1125,23 @@ fn event_dto(event: &EventEnvelope, events: &[EventEnvelope]) -> EventDto {
             .map_or_else(|| "None".into(), permission_name),
         tool_proposal_event_id: tool_proposal_event_id(event, events),
     }
+}
+
+/// 提取事件直接来源用户的显示名。输入、审批和取消事件本身携带已认证身份；其余
+/// 内部事件没有用户主体，不能根据权限来源或因果链猜测一个用户名。
+fn event_source_user(event: &EventEnvelope) -> Option<String> {
+    let principal = match &event.payload {
+        AgentEvent::Ingress(ingress) => match ingress.as_ref() {
+            IngressEvent::ContextReceived { context, .. } => context.actor.as_ref(),
+            IngressEvent::ApprovalSubmitted { principal, .. }
+            | IngressEvent::CancellationRequested { principal, .. } => Some(principal),
+        },
+        _ => None,
+    }?;
+    principal
+        .display_name
+        .clone()
+        .or_else(|| (!principal.subject.trim().is_empty()).then(|| principal.subject.clone()))
 }
 
 /// 为有用户可读正文的事件保留完整文本，供 Web 审计界面按需展开。
