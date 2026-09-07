@@ -9,7 +9,21 @@ Koi Rust Remastered Version，即 koi Rust 重置版，原 koi 实现见 [Pond-I
 
 > 注：本节内容由 AI 生成。
 
-前置依赖：Rust stable 工具链（见 `rust-toolchain.toml`，edition 2024）。如要修改 Web 前端（`web/`，Vite + TypeScript），需 Node.js 并重新构建到 `web/dist`（由 `[server].web_dist_dir` 指向，服务启动时托管）。
+前置依赖：Rust stable 工具链（见 `rust-toolchain.toml`，edition 2024）。Web 前端（`web/`，Vite + TypeScript + React）需要 Node.js/npm 构建；仓库已附带构建产物 `web/dist`，不改前端可跳过下面“构建 Web 前端”小节。
+
+### 构建 Web 前端
+
+```bash
+cd web
+npm install          # 首次或 package-lock.json 变更后执行
+npm run build        # 等价于 tsc --noEmit && vite build，产物输出到 web/dist
+```
+
+- 产物位置：`npm run build` 输出到 `web/dist`，由后端 `[server].web_dist_dir` 指向并在启动时托管（若该目录不存在，服务会提示并只提供 API）。
+- 开发模式：`npm run dev` 启动 Vite 开发服务器（默认 `http://127.0.0.1:5173`，`/api` 已代理到 `http://127.0.0.1:8080`），修改前端代码即时生效、无需重新构建；联调前先启动后端 `cargo run -p koi-server`。
+- 预览产物：`npm run preview`（默认 `http://127.0.0.1:4173`）。
+
+然后按以下步骤配置并启动：
 
 1. 复制 `config/agent.example.toml` 为 `config/agent.toml`（本地运行时文件，已被 Git 忽略），填写：
    - `[server]`：监听地址、Web 构建目录、JSONL 事件目录（`data/events`）、Web 用户库路径（`data/users.json`）、Cookie 是否要求 `Secure`；
