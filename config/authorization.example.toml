@@ -6,6 +6,10 @@ source = "web"
 permission = "User"
 
 [[source_defaults]]
+source = "qq"
+permission = "User"
+
+[[source_defaults]]
 source = "alertmanager"
 permission = "User"
 

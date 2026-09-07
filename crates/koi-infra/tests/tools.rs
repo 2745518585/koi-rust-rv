@@ -1,8 +1,14 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use koi_core::agent::TaskManager;
 use koi_core::domain::{
     AuthorizedToolInvocation, EventId, PermissionLevel, TaskId, ToolCall, ToolSideEffect,
 };
-use koi_core::ports::ToolRegistry;
-use koi_infra::tools::register_builtin_tools;
+use koi_core::ports::{StaticPermissionDirectory, ToolRegistry};
+use koi_infra::event_store::JsonlEventStore;
+use koi_infra::qq_source::{QqConfig, QqSource};
+use koi_infra::tools::{register_builtin_tools, register_qq_tools};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -114,4 +120,164 @@ async fn admin_command_uses_structured_arguments() {
         .unwrap();
     assert_eq!(result.data["exit_code"], 0);
     assert!(result.data["stdout"].as_str().unwrap().contains("rustc"));
+}
+
+fn test_qq_source() -> (Arc<QqSource>, PathBuf) {
+    let directory = std::env::temp_dir().join(format!("koi-qq-tool-{}", EventId::new()));
+    let store = Arc::new(JsonlEventStore::open(&directory).unwrap());
+    let permissions = Arc::new(StaticPermissionDirectory::new(
+        [("qq".to_owned(), PermissionLevel::User)],
+        std::iter::empty(),
+    ));
+    let task_manager = Arc::new(TaskManager::new(Arc::new(Arc::clone(&store))));
+    let source = Arc::new(
+        QqSource::new(
+            QqConfig {
+                app_id: Some("app-id".into()),
+                app_secret: Some("app-secret".into()),
+                ..QqConfig::default()
+            },
+            store,
+            permissions,
+            task_manager,
+        )
+        .unwrap(),
+    );
+    (source, directory)
+}
+
+fn test_qq_source_with_report_group() -> (Arc<QqSource>, PathBuf) {
+    let directory = std::env::temp_dir().join(format!("koi-qq-report-tool-{}", EventId::new()));
+    let store = Arc::new(JsonlEventStore::open(&directory).unwrap());
+    let permissions = Arc::new(StaticPermissionDirectory::new(
+        [("qq".to_owned(), PermissionLevel::User)],
+        std::iter::empty(),
+    ));
+    let task_manager = Arc::new(TaskManager::new(Arc::new(Arc::clone(&store))));
+    let source = Arc::new(
+        QqSource::new(
+            QqConfig {
+                app_id: Some("app-id".into()),
+                app_secret: Some("app-secret".into()),
+                report_group_openid: Some("report-group".into()),
+                ..QqConfig::default()
+            },
+            store,
+            permissions,
+            task_manager,
+        )
+        .unwrap(),
+    );
+    (source, directory)
+}
+
+#[test]
+fn registers_qq_group_delivery_tool_with_notification_metadata() {
+    let (source, directory) = test_qq_source();
+    let mut registry = ToolRegistry::default();
+    assert_eq!(register_qq_tools(&mut registry, source).unwrap(), 2);
+
+    let definition = registry.get_definition("qq.group_send").unwrap();
+    assert_eq!(definition.required_permission, PermissionLevel::Operator);
+    assert_eq!(definition.side_effect, ToolSideEffect::Notification);
+    assert!(definition.model_visible);
+    assert_eq!(
+        definition.input_schema["required"],
+        json!(["group_openid", "content"])
+    );
+
+    let reply = registry.get_definition("qq.reply").unwrap();
+    assert_eq!(reply.required_permission, PermissionLevel::User);
+    assert_eq!(reply.side_effect, ToolSideEffect::Notification);
+    assert!(reply.model_visible);
+    assert_eq!(reply.input_schema["required"], json!(["content"]));
+    assert!(
+        reply.input_schema["properties"]
+            .get("group_openid")
+            .is_none()
+    );
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn registers_primary_qq_report_tool_only_when_configured() {
+    let (source, directory) = test_qq_source_with_report_group();
+    let mut registry = ToolRegistry::default();
+    assert_eq!(register_qq_tools(&mut registry, source).unwrap(), 3);
+
+    let report = registry.get_definition("qq.report").unwrap();
+    assert_eq!(report.required_permission, PermissionLevel::Operator);
+    assert_eq!(report.side_effect, ToolSideEffect::Notification);
+    assert!(report.model_visible);
+    assert_eq!(report.input_schema["required"], json!(["content"]));
+    assert!(
+        report.input_schema["properties"]
+            .get("group_openid")
+            .is_none()
+    );
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn qq_group_delivery_rejects_invalid_arguments_before_network() {
+    let (source, directory) = test_qq_source();
+    let mut registry = ToolRegistry::default();
+    register_qq_tools(&mut registry, source).unwrap();
+
+    let error = registry
+        .invoke(
+            invocation(
+                "qq.group_send",
+                json!({"group_openid": "", "content": "hello"}),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("group_openid"));
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn qq_group_delivery_honors_cancellation_before_network() {
+    let (source, directory) = test_qq_source();
+    let mut registry = ToolRegistry::default();
+    register_qq_tools(&mut registry, source).unwrap();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let error = registry
+        .invoke(
+            invocation(
+                "qq.group_send",
+                json!({"group_openid": "group-1", "content": "hello"}),
+            ),
+            cancel,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("cancelled"));
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn qq_reply_requires_a_context_authority_parent_event() {
+    let (source, directory) = test_qq_source();
+    let mut registry = ToolRegistry::default();
+    register_qq_tools(&mut registry, source).unwrap();
+
+    let error = registry
+        .invoke(
+            invocation("qq.reply", json!({"content": "hello"})),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("authority-parent"));
+
+    std::fs::remove_dir_all(directory).unwrap();
 }

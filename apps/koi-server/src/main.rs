@@ -15,6 +15,7 @@ use koi_infra::llm::{
     ModelProviderEntry, ModelProviderRegistry, OpenAiCompatibleModelConfig,
     OpenAiCompatibleModelProvider,
 };
+use koi_infra::qq_source::{QqConfig, QqSource};
 use koi_infra::web_identity::WebUserStore;
 use koi_infra::web_source::KoiWebSource;
 use serde::Deserialize;
@@ -34,6 +35,8 @@ struct RuntimeConfig {
     agent: AgentConfig,
     #[serde(default)]
     usage: UsageConfig,
+    #[serde(default)]
+    qq: QqConfig,
 }
 
 /// 独立于 Agent 与工具配置的静态权限目录文件。
@@ -141,12 +144,10 @@ async fn run() -> Result<(), ServerError> {
     let model_registry = build_model_registry(&config)?;
 
     let mut registry = ToolRegistry::default();
-    let registered = koi_infra::tools::register_builtin_tools(&mut registry)
+    let mut registered = koi_infra::tools::register_builtin_tools(&mut registry)
         .map_err(|error| ServerError::ToolRegistry(error.to_string()))?;
     let task_tools = koi_core::agent::task_tools::register_task_management_tools(&mut registry)
         .map_err(|error| ServerError::ToolRegistry(error.to_string()))?;
-    let tools = Arc::new(registry);
-    let tool_definitions = tools.list_definitions();
 
     let store = Arc::new(
         JsonlEventStore::open(&config.server.event_store_dir)
@@ -164,6 +165,29 @@ async fn run() -> Result<(), ServerError> {
         WebUserStore::open(&config.server.user_store_path, Arc::clone(&permissions))
             .map_err(ServerError::WebApi)?,
     );
+    let qq_config = config.qq.clone().with_environment_credentials();
+    let qq_source = if qq_config.has_any_credentials() {
+        let qq_source = Arc::new(
+            QqSource::new(
+                qq_config,
+                Arc::clone(&store),
+                Arc::clone(&permissions),
+                Arc::clone(&task_manager),
+            )
+            .map_err(|error| ServerError::QqSource(error.to_string()))?,
+        );
+        tracing::info!("已启用 QQ 来源");
+        Some(qq_source)
+    } else {
+        tracing::info!("未配置 QQ 凭证，跳过 QQ 来源");
+        None
+    };
+    if let Some(qq_source) = qq_source.as_ref() {
+        registered += koi_infra::tools::register_qq_tools(&mut registry, Arc::clone(qq_source))
+            .map_err(|error| ServerError::ToolRegistry(error.to_string()))?;
+    }
+    let tools = Arc::new(registry);
+    let tool_definitions = tools.list_definitions();
     let source = Arc::new(
         KoiWebSource::new(
             Arc::clone(&store),
@@ -183,6 +207,11 @@ async fn run() -> Result<(), ServerError> {
     authorization_providers
         .register(source.authorization_provider())
         .map_err(|error| ServerError::AuthorizationProvider(error.to_string()))?;
+    if let Some(qq_source) = qq_source.as_ref() {
+        authorization_providers
+            .register(qq_source.authorization_provider())
+            .map_err(|error| ServerError::AuthorizationProvider(error.to_string()))?;
+    }
     let authorization_providers = Arc::new(authorization_providers);
 
     // Web 命令会直接发布自己的输入事件；后台 Agent 产生的模型、工具和系统事件通过
@@ -213,6 +242,7 @@ async fn run() -> Result<(), ServerError> {
     );
     let shutdown = CancellationToken::new();
     let supervisor_task = tokio::spawn(Arc::clone(&supervisor).run(shutdown.clone()));
+    let qq_task = qq_source.map(|qq_source| tokio::spawn(qq_source.run(shutdown.clone())));
 
     let api: Arc<dyn WebApi> = source;
     let api_router = koi_api::router(api, auth).layer(TraceLayer::new_for_http());
@@ -244,6 +274,9 @@ async fn run() -> Result<(), ServerError> {
     };
     shutdown.cancel();
     let _ = supervisor_task.await;
+    if let Some(qq_task) = qq_task {
+        let _ = qq_task.await;
+    }
     result
 }
 
@@ -417,6 +450,8 @@ enum ServerError {
     EventStore(String),
     #[error(transparent)]
     WebApi(#[from] koi_api::WebApiError),
+    #[error("QQ 来源初始化失败：{0}")]
+    QqSource(String),
     #[error("来源授权 Provider 注册失败：{0}")]
     AuthorizationProvider(String),
     #[error("模型 Provider 初始化失败：{0}")]

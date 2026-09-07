@@ -16,6 +16,7 @@ mod network;
 mod package;
 mod policy;
 mod process;
+mod qq;
 mod runner;
 mod schedule;
 mod service;
@@ -23,6 +24,7 @@ mod system;
 
 use std::sync::Arc;
 
+use crate::qq_source::QqSource;
 use koi_core::domain::{PermissionLevel, ToolDefinition, ToolError, ToolErrorKind, ToolSideEffect};
 use koi_core::ports::{ToolExecutor, ToolRegistrationError, ToolRegistry};
 
@@ -54,6 +56,26 @@ pub fn register_builtin_tools(registry: &mut ToolRegistry) -> Result<usize, Tool
     tools.extend(firewall::tools(&policy, &runner));
     tools.push(Arc::new(command::CommandTool::new(policy)));
 
+    let count = tools.len();
+    for tool in tools {
+        registry.register(tool)?;
+    }
+    Ok(count)
+}
+
+/// Register delivery tools that require a live QQ source.
+///
+/// QQ tools are kept separate from the always-available operational catalog so a deployment
+/// without QQ credentials does not expose a tool that cannot reach its target.
+///
+/// # Errors
+///
+/// Returns an error if a QQ tool definition is invalid or its name is already registered.
+pub fn register_qq_tools(
+    registry: &mut ToolRegistry,
+    source: Arc<QqSource>,
+) -> Result<usize, ToolRegistrationError> {
+    let tools = qq::tools(source);
     let count = tools.len();
     for tool in tools {
         registry.register(tool)?;

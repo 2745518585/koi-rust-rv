@@ -28,9 +28,10 @@ npm run build        # 等价于 tsc --noEmit && vite build，产物输出到 we
 1. 复制 `config/agent.example.toml` 为 `config/agent.toml`（本地运行时文件，已被 Git 忽略），填写：
    - `[server]`：监听地址、Web 构建目录、JSONL 事件目录（`data/events`）、Web 用户库路径（`data/users.json`）、Cookie 是否要求 `Secure`；
    - `[models]`：`default_provider`/`default_model_id` 与至少一条可用模型条目（供应商、`base_url`、`model_id`、`api_key`、协议、超时与上下文窗口）；支持 OpenAI Responses 与 Chat Completions 两类协议；
+   - `[qq]`：QQ 开放平台 AppID/AppSecret（或设置 `QQ_BOT_APP_ID`、`QQ_BOT_APP_SECRET` 环境变量）；不填写凭证时 QQ 来源自动跳过；
    - `[usage]`：可选月度预算（当前仅用于展示）。
 2. 复制 `config/authorization.example.toml` 为 `config/authorization.toml`，声明核心身份权限目录：`[source_defaults]` 给出来源的默认身份权限，`[[principals]]` 给出 `(来源, 用户)` 精确身份权限；精确身份优先于来源默认值，未配置的身份按 `None` 失败关闭。该目录是核心权限裁决的依据，外部来源只能提交建议权限、不能改写它。
-3. 运行 `cargo run -p koi-server`（启动时读取 `config/agent.toml` 与 `config/authorization.toml`）。模型系统提示词内嵌于 `koi-server`（`apps/koi-server/prompts/main.md`、`child.md`），无需额外配置。
+3. 运行 `cargo run -p koi-server`（启动时读取 `config/agent.toml` 与 `config/authorization.toml`）。模型系统提示词内嵌于 `koi-server`（`apps/koi-server/prompts/main.md`、`qq.md`、`child.md`；QQ 片段会组装到主会话提示词），无需额外配置。
 4. 打开浏览器访问 `[server].bind_addr`：先注册 Web 账号，随后把该账号写入 `authorization.toml`（`[[principals]] source="web" subject="<用户名>" permission="Admin"`）并重启服务以管理员身份使用——权限目录仅在启动时加载。
 
 ## 核心用法
@@ -97,7 +98,7 @@ npm run build        # 等价于 tsc --noEmit && vite build，产物输出到 we
 
 > 注：本节内容由 AI 生成。
 
-投送工具指模型向外部渠道（群聊、私聊、Web 通知等）主动发送消息的出站通道。**当前仓库未注册任何投送工具**：模型的最终文本只作为模型输出事件写入会话，由宿主与来源方界面负责展示。出站通知属于来源方的职责——审批/提权流程由核心调用来源的 `SourceAuthorizationProvider` 送达（Web 来源通过 SSE 事件流与审批界面呈现）。
+投送工具指模型向外部渠道（群聊、私聊、Web 通知等）主动发送消息的出站通道。QQ 凭证配置完整时注册 `qq.reply` 与 `qq.group_send`：前者要求 `User` 权限，只接收正文并回复当前工具调用授权父事件所选中的 QQ 入站消息；后者要求 `Operator` 权限，接收指定 `group_openid`、`content` 以及可选的 `reply_to_message_id`。如果配置了 `[qq].report_group_openid`，还会注册只接收正文、目标固定为该群的 `qq.report`（`Operator`）。三者副作用类别均为 `Notification`，工具调用仍先由核心完成权限审查，QQ API 返回的消息 ID 会作为工具结果写回事件流；未配置 QQ 时不会暴露这些工具。QQ 模型最终文本不会自动转发，是否回复必须由模型显式调用工具决定；审批/提权流程仍由核心调用来源的 `SourceAuthorizationProvider` 送达原群。
 
 #### 记忆工具
 
@@ -121,6 +122,17 @@ Web 是仓库内置并默认启用的外部来源（`koi-infra::web_source::KoiW
 - **实时推送**：`koi-api` 提供 REST 路由与 SSE 事件流（模型、工具与系统事件经事件存储订阅转发，Web 自身命令事件由 Web 来源直接发布）。
 - **接入方式**：`koi-server` 启动时装配 `ModelProviderRegistry`（[models] 条目）、`TaskManager` 与 `AgentSupervisor`，事件存储为 JSONL 文件（`JsonlEventStore`），单一进程部署。
 
+#### qq
+
+QQ 来源对接 QQ 开放平台 Bot API v2：启动后使用 AppID/AppSecret 获取 App Access Token，再通过 Gateway 接收事件，并使用官方 HTTP API 回复消息。默认订阅群聊@与 C2C 事件；如需频道@消息，在 `intents` 中加入 `PUBLIC_GUILD_MESSAGES`（`1 << 30`），如需频道私信则加入 `DIRECT_MESSAGE`（`1 << 12`）。
+
+- **支持的输入**：C2C 私聊、群聊@、频道@与频道私信；普通 `GROUP_MESSAGE_CREATE` 在 `mention_only = true` 时会被过滤。
+- **会话与审计**：所有 QQ C2C/群/频道消息统一注入 Koi 主会话（`TaskId::MAIN`），消息统一写入主会话事件存储，再由 Agent Supervisor 调度；每条模型可见正文前都会标记 QQ 来源类型、会话标识、发言人、消息 ID 及是否明确 `@bot`，避免跨群汇总时混淆；结构化 `scope`、`actor` 与 `origin` 仍作为权限和回复路由的事实依据；重启后从事件流恢复消息去重状态。
+- **可靠性**：Gateway 实现 Hello/Identify、Heartbeat、Resume、Reconnect 与断线退避；HTTP 请求带超时、有限重试和 Token 缓存。
+- **权限与审批**：QQ 来源的权限建议固定为两级：普通发言建议 `User`，明确 @bot 的发言建议 `Operator`；来源注册最高为 `Operator`，不会从 QQ 输入建议 `Admin`。工具需要提权时，QQ 会在群里描述操作并给出 token；有权限成员必须 @bot 回复 `/confirm <token>` 确认当前操作，或回复 `/confirm all` 确认当前群全部待处理操作。最终权限仍由 `authorization.toml` 按来源和具体 `subject` 截断，未配置身份继续失败关闭。
+- **模型控制出站**：QQ 模型最终文本不会自动发送回 QQ。模型需要回复当前 QQ 消息时调用 `qq.reply`（目标从授权父事件恢复，参数只有正文）；需要向指定群主动通知时调用 `qq.group_send`；配置 `[qq].report_group_openid` 后，可调用 `qq.report` 向固定的主要汇报群发送事故或运维报告。三类投送都会按 QQ 来源的单条消息长度配置拆分。
+- **主要汇报群**：在 `[qq]` 中设置 `report_group_openid = "<group_openid>"` 即可启用 `qq.report`。该工具不接受目标群参数，模型不能改写汇报目的地；提权审批通知仍发送到发起操作的原群。
+
 ### 预实现工具
 
 #### 运维工具
@@ -140,7 +152,7 @@ Web 是仓库内置并默认启用的外部来源（`koi-infra::web_source::KoiW
 
 > 注：本节内容由 AI 生成。
 
-（无）模型无主动投送通道；出站通知与审批请求由来源方送达，Web 来源通过 SSE 与审批界面完成。
+- QQ：`qq.reply`（QQ 凭证完整时注册，`User`，`Notification`）、`qq.group_send`（`Operator`，`Notification`）、`qq.report`（配置主要汇报群后注册，`Operator`，`Notification`）
 
 ## 卸载
 

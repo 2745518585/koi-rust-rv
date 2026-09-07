@@ -9,11 +9,22 @@ user_store_path = "./data/users.json"
 # Set true whenever the Web console is served over HTTPS.
 web_cookie_secure = false
 [qq]
-api_base_url = "https://api.bot.qq.com"
+# QQ 开放平台机器人凭证；也可以使用 QQ_BOT_APP_ID / QQ_BOT_APP_SECRET 环境变量。
+app_id = ""
+app_secret = ""
+api_base_url = "https://api.sgroup.qq.com"
 # GROUP_AND_C2C_EVENT (1 << 25)。启用全量群消息权限后，机器人可旁听群聊。
 intents = 33554432
 request_timeout_secs = 10
 max_retries = 2
+reconnect_base_delay_ms = 1000
+reconnect_max_delay_ms = 30000
+# 群消息只接收明确 @ 机器人的内容；GROUP_AT_MESSAGE_CREATE 始终接收。
+mention_only = true
+# 可选：主要汇报群的 group_openid；配置后模型可使用 qq.report 向该群汇报。
+# report_group_openid = ""
+default_permission = "User"
+max_reply_chars = 1500
 
 [models]
 # 会话未显式选择模型时使用这组供应商和供应商模型 ID。

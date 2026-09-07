@@ -13,7 +13,7 @@ use crate::ports::EventStore;
 
 /// 来源在核心中的权限注册信息。
 ///
-/// 例如 QQ 可建议至 `Admin`，监控告警最多为 `User`；只有核心内部来源可登记为
+/// 例如 QQ 可建议至 `Operator`，监控告警最多为 `User`；只有核心内部来源可登记为
 /// `System`。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IngressSourceDefinition {
