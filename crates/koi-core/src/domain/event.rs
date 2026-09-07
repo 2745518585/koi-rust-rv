@@ -332,6 +332,10 @@ pub enum IngressEvent {
         scope: Scope,
         assessment: PermissionAssessment,
         approved: bool,
+        /// 批准时可携带的授权范围。旧事件没有该字段，不能被重新用作模型后续调用的
+        /// 权限父事件；但仍可按原有恢复流程执行它所绑定的那次操作。
+        #[serde(default)]
+        grant: Option<ApprovalGrant>,
     },
     CancellationRequested {
         principal: Principal,
@@ -339,6 +343,18 @@ pub enum IngressEvent {
         assessment: PermissionAssessment,
         reason: String,
     },
+}
+
+/// 用户对一次提权请求给出的授权范围。
+///
+/// `CurrentOperation` 严格绑定某条原始工具提议事件的负载；模型在后续调用中即使改用
+/// 此授权事件作为权限父节点，也只能提交相同的工具名和参数。`AnyOperation` 则允许该
+/// 审批事件在其有效期内授权其它操作，仍会经过每次工具调用的权限检查。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalGrant {
+    CurrentOperation { original_event_payload_id: EventId },
+    AnyOperation,
 }
 
 impl IngressEvent {
@@ -582,6 +598,12 @@ pub enum ControlEvent {
     /// 修改任务后续控制指令所需的最低权限。
     MinimumControlPermissionChanged {
         minimum_permission: PermissionLevel,
+    },
+    /// 兼容历史事件：输入未满足会话最低控制权限时记录其被拒绝的原因。
+    /// 新版本的输入流程不再写入该事件，但必须能重放已有事件流。
+    InputRejected {
+        input_event_id: EventId,
+        reason: String,
     },
     /// 仅主会话可发起的跨任务管理请求。
     TaskOperationRequested {

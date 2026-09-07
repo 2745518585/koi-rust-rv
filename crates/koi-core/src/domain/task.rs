@@ -176,6 +176,7 @@ impl TaskProjection {
                 ControlEvent::TaskOperationRequested { .. }
                 | ControlEvent::TaskOperationAccepted { .. }
                 | ControlEvent::TaskOperationRejected { .. }
+                | ControlEvent::InputRejected { .. }
                 | ControlEvent::ContextCompacted { .. } => {}
                 ControlEvent::TaskCompleted { .. } => {
                     self.transition(TaskStatus::Completed)?;

@@ -17,7 +17,7 @@ import {
   Trash2,
 } from "lucide-react";
 import type { KoiApiClient } from "../api/client";
-import type { ApprovalRequest, ModelSelection, PermissionLevel, TaskEvent, TaskSummary } from "../api/types";
+import type { ApprovalGrant, ApprovalRequest, ModelSelection, PermissionLevel, TaskEvent, TaskSummary } from "../api/types";
 import { useI18n } from "../i18n";
 import { groupConversationEvents, type ConversationFeedItem } from "../lib/events";
 import { formatRelative, scopeLabel } from "../lib/format";
@@ -39,7 +39,7 @@ export interface ConversationProps {
   currentUsername: string;
   suggestedPermission: PermissionLevel;
   onPermissionChange: (permission: PermissionLevel) => void;
-  onApproval: (approval: ApprovalRequest, approved: boolean) => void;
+  onApproval: (approval: ApprovalRequest, approved: boolean, grant?: ApprovalGrant) => void;
   approvalBusy: string | null;
   onTaskUpdated: (task: TaskSummary) => void;
   onTaskDeleted: (taskId: string) => void;
@@ -410,11 +410,11 @@ export function Conversation({
               key={approval.approvalRequestEventId}
               approval={approval}
               task={task}
-              onApproval={(approval, approved) => {
+              onApproval={(approval, approved, grant) => {
                 // 无论请求是否成功送达都立即收起本地卡片，失败由全局 toast 提示；刷新
                 // 页面后仍会以服务端的权威审批状态重新判断是否展示。
                 setDismissedApprovals((current) => new Set(current).add(approval.approvalRequestEventId));
-                onApproval(approval, approved);
+                onApproval(approval, approved, grant);
               }}
               busy={approvalBusy === approval.approvalRequestEventId}
               compact

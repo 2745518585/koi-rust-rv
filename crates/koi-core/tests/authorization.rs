@@ -41,6 +41,7 @@ fn evidence(
         authority_parent_event_id: None,
         expires_at: None,
         approval_request_event_id: None,
+        approval_grant: None,
     }
 }
 

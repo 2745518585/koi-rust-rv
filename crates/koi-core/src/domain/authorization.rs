@@ -4,7 +4,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::{EventId, EventSource, PermissionLevel, Principal, TaskId, ToolDefinition};
+use super::{
+    ApprovalGrant, EventId, EventSource, PermissionLevel, Principal, TaskId, ToolDefinition,
+};
 
 /// 授权证据对应事件的顶级类别。
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -38,6 +40,8 @@ pub struct AuthorizationEvidence {
     pub expires_at: Option<DateTime<Utc>>,
     /// 若此证据来自一次补充授权，必须绑定对应的授权请求事件。
     pub approval_request_event_id: Option<EventId>,
+    /// 补充授权的可用范围。缺失表示历史审批，不能作为新的模型调用授权。
+    pub approval_grant: Option<ApprovalGrant>,
 }
 
 /// 来源方对指令有效性的判定结果。

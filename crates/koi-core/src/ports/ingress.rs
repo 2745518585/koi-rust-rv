@@ -168,6 +168,7 @@ impl<'a> IngressRegistrar<'a> {
             .get(draft.source())
             .ok_or_else(|| IngressRegistrationError::UnregisteredSource(draft.source().into()))?;
         let assessment = self.assess(&draft, source).await?;
+        let effective_permission = assessment.effective_permission;
         let (event, causation_id) = into_ingress_event(draft, assessment);
         if is_cycle_input(&event) {
             // 输入代表同一会话的新一轮对话。终态会话先追加一个核心控制事件作为周期
@@ -177,7 +178,7 @@ impl<'a> IngressRegistrar<'a> {
                 .await
                 .map_err(IngressRegistrationError::Runtime)?;
         }
-        runtime
+        let recorded = runtime
             .record_with_provenance(
                 AgentEvent::ingress(event),
                 causation_id,
@@ -189,7 +190,31 @@ impl<'a> IngressRegistrar<'a> {
                 },
             )
             .await
-            .map_err(Into::into)
+            .map_err(IngressRegistrationError::from)?;
+
+        // 用户消息、告警和系统事件是能够启动或驱动 Agent 的指令型输入。若它们低于
+        // 会话当前的最低控制权限，仍须保留原始输入以便审计，但同时写入拒绝结果；
+        // 调度器会据此不启动模型循环。工具结果不属于指令通道，不受此限制。
+        if is_cycle_input_event(&recorded)
+            && !effective_permission.allows(runtime.projection().minimum_control_permission)
+        {
+            let reason = format!(
+                "输入权限 {:?} 低于会话最低控制权限 {:?}",
+                effective_permission,
+                runtime.projection().minimum_control_permission,
+            );
+            runtime
+                .record(
+                    AgentEvent::control(crate::domain::ControlEvent::InputRejected {
+                        input_event_id: recorded.id,
+                        reason,
+                    }),
+                    Some(recorded.id),
+                )
+                .await
+                .map_err(IngressRegistrationError::from)?;
+        }
+        Ok(recorded)
     }
 
     async fn assess(
@@ -228,6 +253,10 @@ fn is_cycle_input(event: &IngressEvent) -> bool {
     )
 }
 
+fn is_cycle_input_event(event: &EventEnvelope) -> bool {
+    matches!(&event.payload, AgentEvent::Ingress(ingress) if is_cycle_input(ingress.as_ref()))
+}
+
 fn into_ingress_event(
     draft: IngressDraft,
     assessment: PermissionAssessment,
@@ -249,6 +278,7 @@ fn into_ingress_event(
             principal,
             scope,
             approved,
+            grant,
             ..
         } => (
             IngressEvent::ApprovalSubmitted {
@@ -257,6 +287,7 @@ fn into_ingress_event(
                 scope,
                 assessment,
                 approved,
+                grant,
             },
             Some(approval_request_event_id),
         ),

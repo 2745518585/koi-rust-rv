@@ -1,5 +1,5 @@
 import { Check, RefreshCw, ShieldCheck, X } from "lucide-react";
-import type { ApprovalRequest, TaskSummary } from "../api/types";
+import type { ApprovalGrant, ApprovalRequest, TaskSummary } from "../api/types";
 import { useI18n } from "../i18n";
 import { formatRelative, scopeLabel } from "../lib/format";
 import { EmptyState, PanelHeader } from "../lib/ui";
@@ -16,7 +16,7 @@ export function ApprovalsView({
 }: {
   approvals: ApprovalRequest[];
   tasks: TaskSummary[];
-  onApproval: (approval: ApprovalRequest, approved: boolean) => void;
+  onApproval: (approval: ApprovalRequest, approved: boolean, grant?: ApprovalGrant) => void;
   approvalBusy: string | null;
   onRefresh: () => void;
   refreshing: boolean;

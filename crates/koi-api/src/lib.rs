@@ -16,7 +16,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::stream;
-use koi_core::domain::{EventId, PermissionLevel, TaskId};
+use koi_core::domain::{ApprovalGrant, EventId, PermissionLevel, TaskId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::broadcast;
@@ -157,6 +157,9 @@ pub struct CancellationRequestCommand {
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalCommand {
     pub approved: bool,
+    /// 批准时由来源方明确选择授权范围。当前操作授权必须同时附带原始工具提议事件 ID。
+    #[serde(default)]
+    pub grant: Option<ApprovalGrant>,
     /// 审批输入的建议权限；缺省时使用当前身份权限。
     #[serde(default)]
     pub suggested_permission: Option<PermissionLevel>,
@@ -349,6 +352,8 @@ pub struct EventDto {
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalDto {
     pub approval_request_event_id: String,
+    /// 此授权请求所绑定的原始工具提议事件，可用于构造“仅允许当前操作”授权。
+    pub tool_proposal_event_id: String,
     pub task_id: String,
     pub tool_name: String,
     pub tool_description: String,

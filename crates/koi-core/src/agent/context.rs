@@ -458,6 +458,7 @@ fn historical_control_item(event_id: EventId, control: &ControlEvent) -> Option<
         | ControlEvent::TaskNamed { .. }
         | ControlEvent::ModelSelected { .. }
         | ControlEvent::MinimumControlPermissionChanged { .. }
+        | ControlEvent::InputRejected { .. }
         | ControlEvent::TaskOperationRequested { .. }
         | ControlEvent::TaskOperationAccepted { .. }
         | ControlEvent::TaskOperationRejected { .. }
@@ -498,6 +499,7 @@ fn ingress_context_item(
             scope,
             assessment,
             approved,
+            grant,
         } => {
             // 审批不是普通 ContextEnvelope，不能交给 InputInjector；它仍是模型恢复
             // 授权流程时必须看见的、已持久化的输入事件。
@@ -509,6 +511,7 @@ fn ingress_context_item(
                 scope,
                 *assessment,
                 *approved,
+                grant.as_ref(),
             )))
         }
         IngressEvent::CancellationRequested {
@@ -533,6 +536,7 @@ fn approval_item(
     scope: &crate::domain::Scope,
     assessment: crate::domain::PermissionAssessment,
     approved: bool,
+    grant: Option<&crate::domain::ApprovalGrant>,
 ) -> ModelContextItem {
     let status = if approved { "已批准" } else { "已拒绝" };
     ModelContextItem {
@@ -543,18 +547,29 @@ fn approval_item(
             ModelInputRole::Memory
         },
         content: format!(
-            "授权决定：{status}工具操作。\n授权请求事件 ID：{approval_request_event_id}\n审批身份：{}:{}\n作用域：{}:{}\n核心核定授权等级：{:?}",
+            "授权决定：{status}工具操作。\n授权请求事件 ID：{approval_request_event_id}\n审批身份：{}:{}\n作用域：{}:{}\n核心核定授权等级：{:?}\n授权范围：{}",
             principal.source,
             principal.subject,
             scope.kind,
             scope.id,
             assessment.effective_permission,
+            approval_grant_description(grant),
         ),
         permission: if approved {
             assessment.effective_permission
         } else {
             PermissionLevel::None
         },
+    }
+}
+
+fn approval_grant_description(grant: Option<&crate::domain::ApprovalGrant>) -> String {
+    match grant {
+        Some(crate::domain::ApprovalGrant::CurrentOperation {
+            original_event_payload_id,
+        }) => format!("仅允许原始操作（负载事件 ID：{original_event_payload_id}）"),
+        Some(crate::domain::ApprovalGrant::AnyOperation) => "允许任意后续操作".into(),
+        None => "历史审批：仅可用于其已绑定的原始恢复流程".into(),
     }
 }
 
@@ -700,6 +715,7 @@ mod tests {
                 scope: Scope::new("service", "order-api"),
                 assessment,
                 approved: true,
+                grant: None,
             }),
         );
         approval.provenance = EventProvenance {
@@ -744,6 +760,7 @@ mod tests {
                     PermissionLevel::Admin,
                 ),
                 approved: false,
+                grant: None,
             }),
         );
         denial.provenance.creator = EventSource::External(SourceName::new("web").unwrap());

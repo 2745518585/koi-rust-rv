@@ -1,5 +1,5 @@
 import { Check, LoaderCircle, ShieldAlert, X } from "lucide-react";
-import type { ApprovalRequest, TaskSummary } from "../api/types";
+import type { ApprovalGrant, ApprovalRequest, TaskSummary } from "../api/types";
 import { useI18n } from "../i18n";
 import { formatRelative, scopeLabel } from "../lib/format";
 import { PermissionBadge } from "../lib/ui";
@@ -16,7 +16,7 @@ export function ApprovalCard({
 }: {
   approval: ApprovalRequest;
   task?: TaskSummary;
-  onApproval: (approval: ApprovalRequest, approved: boolean) => void;
+  onApproval: (approval: ApprovalRequest, approved: boolean, grant?: ApprovalGrant) => void;
   busy: boolean;
   compact?: boolean;
 }) {
@@ -47,9 +47,19 @@ export function ApprovalCard({
           <X size={14} />
           {locale === "en" ? "Deny" : "拒绝"}
         </button>
-        <button className="button button-approve" onClick={() => onApproval(approval, true)} disabled={busy}>
+        <button
+          className="button button-approve"
+          onClick={() => onApproval(approval, true, {
+            current_operation: { original_event_payload_id: approval.toolProposalEventId },
+          })}
+          disabled={busy}
+        >
           {busy ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}
-          {locale === "en" ? "Approve" : "批准操作"}
+          {locale === "en" ? "Approve once" : "仅允许当前操作"}
+        </button>
+        <button className="button button-quiet" onClick={() => onApproval(approval, true, "any_operation")} disabled={busy}>
+          <Check size={14} />
+          {locale === "en" ? "Approve any" : "允许任意操作"}
         </button>
       </div>
       {compact && task ? <span className="approval-card-task">{task.title}</span> : null}

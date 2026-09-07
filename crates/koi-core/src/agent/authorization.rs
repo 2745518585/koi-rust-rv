@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 
 use crate::domain::{
-    AgentEvent, AuthorizationEvidence, AuthorizationEvidenceEventKind, AuthorizationEvidenceStatus,
-    EventEnvelope, EventSource, IngressEvent, PermissionLevel, TaskId,
+    AgentEvent, ApprovalGrant, AuthorizationEvidence, AuthorizationEvidenceEventKind,
+    AuthorizationEvidenceStatus, EventEnvelope, EventSource, IngressEvent, PermissionLevel, TaskId,
 };
 use crate::ports::{AuthorizationError, AuthorizationEvidenceResolver, EventStore};
 
@@ -14,6 +14,7 @@ type EvidenceParts = (
     PermissionLevel,
     PermissionLevel,
     Option<crate::domain::EventId>,
+    Option<ApprovalGrant>,
 );
 
 /// 从事件存储中重建权限证据的解析器。
@@ -82,6 +83,7 @@ fn evidence_from_event(event: EventEnvelope) -> Result<AuthorizationEvidence, Au
         identity_maximum_permission,
         permission,
         approval_request_event_id,
+        approval_grant,
     ) = match event.payload {
         AgentEvent::Ingress(ingress) => ingress_evidence(
             ingress.as_ref(),
@@ -100,6 +102,7 @@ fn evidence_from_event(event: EventEnvelope) -> Result<AuthorizationEvidence, Au
             PermissionLevel::None,
             PermissionLevel::None,
             None,
+            None,
         ),
         AgentEvent::Tool(_) => (
             AuthorizationEvidenceEventKind::Tool,
@@ -107,6 +110,7 @@ fn evidence_from_event(event: EventEnvelope) -> Result<AuthorizationEvidence, Au
             PermissionLevel::None,
             PermissionLevel::None,
             PermissionLevel::None,
+            None,
             None,
         ),
     };
@@ -123,6 +127,7 @@ fn evidence_from_event(event: EventEnvelope) -> Result<AuthorizationEvidence, Au
         authority_parent_event_id,
         expires_at: event.provenance.expires_at,
         approval_request_event_id,
+        approval_grant,
     })
 }
 
@@ -145,6 +150,7 @@ fn ingress_evidence(
                 PermissionLevel::None,
                 PermissionLevel::None,
                 None,
+                None,
             ))
         }
         IngressEvent::ContextReceived {
@@ -157,6 +163,7 @@ fn ingress_evidence(
                 assessment.source_maximum_permission,
                 assessment.identity_maximum_permission,
                 assessment.effective_permission,
+                None,
                 None,
             )),
             // 工具结果回传必须保持无权限，仅供模型分析；即使评估结论被伪造为高权限，
@@ -171,6 +178,7 @@ fn ingress_evidence(
                 PermissionLevel::System,
                 PermissionLevel::System,
                 PermissionLevel::System,
+                None,
                 None,
             )),
             EventSource::Model | EventSource::Tool
@@ -189,6 +197,7 @@ fn ingress_evidence(
                     PermissionLevel::None,
                     PermissionLevel::None,
                     None,
+                    None,
                 ))
             }
             EventSource::Model | EventSource::Tool => {
@@ -200,6 +209,7 @@ fn ingress_evidence(
             principal,
             assessment,
             approved,
+            grant,
             ..
         } if matches!(creator, EventSource::External(_)) => Ok((
             AuthorizationEvidenceEventKind::Ingress,
@@ -213,6 +223,7 @@ fn ingress_evidence(
                 PermissionLevel::None
             },
             Some(*approval_request_event_id),
+            grant.clone(),
         )),
         IngressEvent::ApprovalSubmitted { .. } => {
             Err(AuthorizationError::new("审批输入必须由外部来源创建"))
@@ -228,6 +239,7 @@ fn ingress_evidence(
             assessment.identity_maximum_permission,
             // 取消请求的语义是撤回或停止当前流程，不是对任何工具调用的授权。
             PermissionLevel::None,
+            None,
             None,
         )),
         IngressEvent::CancellationRequested { .. } => {
@@ -246,5 +258,7 @@ fn direct_evidence(
         EventSource::External(_) => direct_permission.unwrap_or(PermissionLevel::None),
         EventSource::Model | EventSource::Tool => PermissionLevel::None,
     };
-    (event_kind, None, permission, permission, permission, None)
+    (
+        event_kind, None, permission, permission, permission, None, None,
+    )
 }

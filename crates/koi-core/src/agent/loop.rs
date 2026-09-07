@@ -13,12 +13,12 @@ use crate::agent::{
     parse_task_inspect, parse_task_list, parse_task_name, parse_task_start,
 };
 use crate::domain::{
-    AgentEvent, AuthorizationRequest, AuthorizationRequestResult, AuthorizedToolInvocation,
-    ControlEvent, EventId, MemoryContextBuilder, MemoryQuery, ModelContextItem, ModelError,
-    ModelErrorKind, ModelEvent, ModelGenerationOptions, ModelInputRole, ModelOutput,
-    ModelOutputContract, ModelRequest, ModelStreamEvent, PermissionCheckResult, PermissionChecker,
-    PermissionLevel, PolicyDecision, TaskId, TaskStatus, ToolCall, ToolDefinition, ToolEvent,
-    ToolResult,
+    AgentEvent, ApprovalGrant, AuthorizationRequest, AuthorizationRequestResult,
+    AuthorizedToolInvocation, ControlEvent, EventId, MemoryContextBuilder, MemoryQuery,
+    ModelContextItem, ModelError, ModelErrorKind, ModelEvent, ModelGenerationOptions,
+    ModelInputRole, ModelOutput, ModelOutputContract, ModelRequest, ModelStreamEvent,
+    PermissionCheckResult, PermissionChecker, PermissionLevel, PolicyDecision, TaskId, TaskStatus,
+    ToolCall, ToolDefinition, ToolEvent, ToolResult,
 };
 use crate::ports::{
     AuthorizationEvidenceResolver, EventStore, MemoryError, MemoryStore, ModelProvider,
@@ -266,30 +266,42 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                     evidence.approval_request_event_id == Some(binding.approval_request_event_id)
                 });
             let mut all_evidence = original_evidence;
-            if let Some(authorization) = authorization {
-                all_evidence.push(authorization);
-            }
-            match PermissionChecker::check(&definition, &all_evidence) {
-                PermissionCheckResult::Allowed {
-                    effective_permission,
-                    evidence_event_ids,
-                } => {
-                    self.execute_tool(
-                        runtime,
-                        ExecutionFlow {
-                            proposal_event_id: binding.proposal_event_id,
-                            causation_id: binding.approval_submission_event_id,
-                            tool_call: binding.tool_call,
-                            effective_permission,
-                            evidence_event_ids,
-                        },
-                        cancel.clone(),
-                    )
-                    .await?
+            let grant_matches = authorization.as_ref().map_or(Ok(true), |authorization| {
+                approval_grant_matches_tool_call(&events, authorization, &binding.tool_call, true)
+            })?;
+            if !grant_matches {
+                self.deny_tool(
+                    runtime,
+                    binding.proposal_event_id,
+                    "当前操作授权与原始工具负载不一致",
+                )
+                .await?
+            } else {
+                if let Some(authorization) = authorization {
+                    all_evidence.push(authorization);
                 }
-                PermissionCheckResult::Insufficient { .. } => {
-                    self.deny_tool(runtime, binding.proposal_event_id, "审批事件未提供足够权限")
+                match PermissionChecker::check(&definition, &all_evidence) {
+                    PermissionCheckResult::Allowed {
+                        effective_permission,
+                        evidence_event_ids,
+                    } => {
+                        self.execute_tool(
+                            runtime,
+                            ExecutionFlow {
+                                proposal_event_id: binding.proposal_event_id,
+                                causation_id: binding.approval_submission_event_id,
+                                tool_call: binding.tool_call,
+                                effective_permission,
+                                evidence_event_ids,
+                            },
+                            cancel.clone(),
+                        )
                         .await?
+                    }
+                    PermissionCheckResult::Insufficient { .. } => {
+                        self.deny_tool(runtime, binding.proposal_event_id, "审批事件未提供足够权限")
+                            .await?
+                    }
                 }
             }
         } else {
@@ -718,6 +730,20 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
         let evidence = self
             .resolve_evidence(runtime.projection().task_id, proposed.id)
             .await;
+        let events = runtime.load_events().await?;
+        let grant_matches = evidence.iter().try_fold(true, |matches, item| {
+            approval_grant_matches_tool_call(&events, item, &tool_call, false)
+                .map(|item_matches| matches && item_matches)
+        })?;
+        if !grant_matches {
+            return self
+                .deny_tool(
+                    runtime,
+                    proposed.id,
+                    "仅允许当前操作的授权不能用于不同的工具或参数",
+                )
+                .await;
+        }
         let check = PermissionChecker::check(&definition, &evidence);
         match check {
             PermissionCheckResult::Allowed {
@@ -1651,6 +1677,32 @@ fn authorization_request_sources(
         .filter(|source| sources.insert((*source).to_owned()))
         .map(str::to_owned)
         .collect()
+}
+
+/// 检查补充授权是否允许当前模型提交的工具负载。
+///
+/// 旧版审批事件没有 `approval_grant`，只兼容其绑定审批的即时恢复路径；它们不能
+/// 被模型作为新的权限父事件使用，避免历史数据意外变成长期通用授权。
+fn approval_grant_matches_tool_call(
+    events: &[crate::domain::EventEnvelope],
+    authorization: &crate::domain::AuthorizationEvidence,
+    tool_call: &ToolCall,
+    allow_legacy_bound_operation: bool,
+) -> Result<bool, AgentLoopError> {
+    let Some(grant) = &authorization.approval_grant else {
+        return Ok(
+            authorization.approval_request_event_id.is_none() || allow_legacy_bound_operation
+        );
+    };
+    match grant {
+        ApprovalGrant::AnyOperation => Ok(true),
+        ApprovalGrant::CurrentOperation {
+            original_event_payload_id,
+        } => {
+            let original = proposed_tool_call(events, *original_event_payload_id)?;
+            Ok(original.name == tool_call.name && original.arguments == tool_call.arguments)
+        }
+    }
 }
 
 fn tool_result_context(event_id: EventId, result: &ToolResult) -> ModelContextItem {

@@ -81,6 +81,7 @@ export interface TaskEvent {
 
 export interface ApprovalRequest {
   approvalRequestEventId: string;
+  toolProposalEventId: string;
   taskId: string;
   toolName: string;
   toolDescription: string;
@@ -149,9 +150,14 @@ export interface CreateTaskRequest {
 
 export interface ApprovalSubmission {
   approved: boolean;
+  grant?: ApprovalGrant;
   reason?: string;
   suggestedPermission?: PermissionLevel;
 }
+
+export type ApprovalGrant =
+  | { current_operation: { original_event_payload_id: string } }
+  | "any_operation";
 
 export type TaskControlRequest =
   | { action: "pause"; reason?: string }

@@ -5,6 +5,7 @@ import type { AuthUser } from "./api/client";
 import { createEmptySnapshot, MAIN_TASK_ID } from "./api/snapshot";
 import type {
   ApprovalRequest,
+  ApprovalGrant,
   AuthorizationNotification,
   PermissionLevel,
   StreamEvent,
@@ -219,7 +220,11 @@ export default function App() {
     }
   }
 
-  async function handleApproval(approval: ApprovalRequest, approved: boolean): Promise<boolean> {
+  async function handleApproval(
+    approval: ApprovalRequest,
+    approved: boolean,
+    grant?: ApprovalGrant,
+  ): Promise<boolean> {
     // 审批动作一旦点击便不应继续占据待办列表或弹窗；这也覆盖离线和请求失败场景。
     setDismissedApprovalIds((current) => new Set(current).add(approval.approvalRequestEventId));
     deferElevation(approval.approvalRequestEventId);
@@ -234,6 +239,7 @@ export default function App() {
       // 使用该请求的目标权限，不能被会话输入区的全局建议等级降级。
       const updated = await api.submitApproval(approval.approvalRequestEventId, {
         approved,
+        grant,
         suggestedPermission: approval.requiredPermission,
       });
       setSnapshot((current) => applyStreamEvent(current, { type: "approval.updated", approval: updated }));
@@ -402,11 +408,20 @@ export default function App() {
           task={snapshot.tasks.find((task) => task.taskId === elevationRequest.taskId)}
           queueSize={elevationQueue.length}
           busy={approvalBusy === elevationRequest.approvalRequestEventId}
-          onApprove={() => {
+          onApproveCurrent={() => {
             if (!elevationApproval) return;
             // 点击后立即关闭：网络失败会通过 toast 告知，但不把用户困在失效请求里。
             deferElevation(elevationApproval.approvalRequestEventId);
-            void handleApproval(elevationApproval, true);
+            void handleApproval(elevationApproval, true, {
+              current_operation: {
+                original_event_payload_id: elevationApproval.toolProposalEventId,
+              },
+            });
+          }}
+          onApproveAny={() => {
+            if (!elevationApproval) return;
+            deferElevation(elevationApproval.approvalRequestEventId);
+            void handleApproval(elevationApproval, true, "any_operation");
           }}
           onDeny={() => {
             if (!elevationApproval) return;

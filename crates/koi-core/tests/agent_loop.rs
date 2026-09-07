@@ -181,6 +181,7 @@ impl AuthorizationEvidenceResolver for EvidenceResolver {
                 authority_parent_event_id: Some(self.ingress_event_id),
                 expires_at: None,
                 approval_request_event_id: None,
+                approval_grant: None,
             });
         }
         Ok(AuthorizationEvidence {
@@ -196,6 +197,7 @@ impl AuthorizationEvidenceResolver for EvidenceResolver {
             authority_parent_event_id: None,
             expires_at: None,
             approval_request_event_id: None,
+            approval_grant: None,
         })
     }
 }

@@ -558,7 +558,18 @@ fn model_selection_error(error: ModelRegistryError) -> koi_core::agent::AgentLoo
 }
 
 fn context_events(events: &[EventEnvelope]) -> Vec<EventEnvelope> {
-    current_cycle_events(events)
+    let events = current_cycle_events(events);
+    let rejected_input_event_ids = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            AgentEvent::Control(control) => match control.as_ref() {
+                ControlEvent::InputRejected { input_event_id, .. } => Some(*input_event_id),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    events
         .iter()
         .filter(|event| {
             matches!(
@@ -567,6 +578,7 @@ fn context_events(events: &[EventEnvelope]) -> Vec<EventEnvelope> {
                     if matches!(ingress.as_ref(), IngressEvent::ContextReceived { .. })
             )
         })
+        .filter(|event| !rejected_input_event_ids.contains(&event.id))
         .cloned()
         .collect()
 }

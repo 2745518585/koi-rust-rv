@@ -181,6 +181,7 @@ async fn denied_approval_never_provides_authorization() {
             scope: Scope::new("service", "order-api"),
             assessment,
             approved: false,
+            grant: None,
         }),
     );
     event.provenance = EventProvenance {

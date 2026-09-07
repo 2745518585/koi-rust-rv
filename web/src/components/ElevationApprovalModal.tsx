@@ -11,7 +11,8 @@ export function ElevationApprovalModal({
   task,
   queueSize,
   busy,
-  onApprove,
+  onApproveCurrent,
+  onApproveAny,
   onDeny,
   onDefer,
 }: {
@@ -20,7 +21,8 @@ export function ElevationApprovalModal({
   task?: TaskSummary;
   queueSize: number;
   busy: boolean;
-  onApprove: () => void;
+  onApproveCurrent: () => void;
+  onApproveAny: () => void;
   onDeny: () => void;
   onDefer: () => void;
 }) {
@@ -75,7 +77,8 @@ export function ElevationApprovalModal({
           <button className="button button-quiet" onClick={onDefer} disabled={busy}>{t("elevationDefer")}</button>
           <div className="elevation-actions">
             <button className="button button-danger-ghost" onClick={onDeny} disabled={busy || !approval}><X size={14} />{t("elevationDeny")}</button>
-            <button className="button button-approve" onClick={onApprove} disabled={busy || !approval}>{busy ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}{t("elevationApprove")}</button>
+            <button className="button button-approve" onClick={onApproveCurrent} disabled={busy || !approval}>{busy ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}{locale === "en" ? "Approve once" : "仅允许当前操作"}</button>
+            <button className="button button-quiet" onClick={onApproveAny} disabled={busy || !approval}><Check size={14} />{locale === "en" ? "Approve any" : "允许任意操作"}</button>
           </div>
         </div>
         {queueSize > 1 ? <p className="elevation-queue">{t("elevationQueue", { count: queueSize - 1 })}</p> : null}

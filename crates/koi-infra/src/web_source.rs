@@ -23,8 +23,8 @@ use koi_core::agent::{
     TaskManagerError, TaskRuntime,
 };
 use koi_core::domain::{
-    AgentEvent, ContextEnvelope, ContextKind, ContextOrigin, ContextPayload, ControlEvent,
-    EventEnvelope, EventId, EventSource, IngressDraft, IngressEvent, ModelSelection,
+    AgentEvent, ApprovalGrant, ContextEnvelope, ContextKind, ContextOrigin, ContextPayload,
+    ControlEvent, EventEnvelope, EventId, EventSource, IngressDraft, IngressEvent, ModelSelection,
     PermissionLevel, PolicyDecision, Principal, Scope, SourceName, TaskId, TaskProjection,
     ToolDefinition, ToolEvent,
 };
@@ -471,6 +471,7 @@ impl KoiWebSource {
                 );
                 approvals.push(ApprovalDto {
                     approval_request_event_id: request_event.id.to_string(),
+                    tool_proposal_event_id: proposal_event_id.to_string(),
                     task_id: record.task_id.to_string(),
                     tool_name: tool_call.name.clone(),
                     tool_description: descriptions.get(tool_call.name.as_str()).map_or_else(
@@ -806,6 +807,29 @@ impl WebCommandPort for KoiWebSource {
         if approval.status != "Pending" {
             return Err(WebApiError::conflict("该授权请求已经处理"));
         }
+        let expected_payload_event_id = approval
+            .tool_proposal_event_id
+            .parse::<uuid::Uuid>()
+            .map(EventId)
+            .map_err(|_| WebApiError::internal("授权请求缺少有效的原始工具提议事件"))?;
+        let grant = if command.approved {
+            let grant = command.grant.ok_or_else(|| {
+                WebApiError::validation("批准操作时必须选择“仅允许当前操作”或“允许任意操作”")
+            })?;
+            if matches!(
+                grant,
+                ApprovalGrant::CurrentOperation {
+                    original_event_payload_id
+                } if original_event_payload_id != expected_payload_event_id
+            ) {
+                return Err(WebApiError::validation(
+                    "当前操作授权必须绑定此授权请求对应的原始工具提议事件",
+                ));
+            }
+            Some(grant)
+        } else {
+            None
+        };
 
         let mut runtime = TaskRuntime::recover(Arc::clone(&self.store), record.task_id)
             .await
@@ -824,6 +848,7 @@ impl WebCommandPort for KoiWebSource {
                     ),
                     suggested_permission,
                     approved: command.approved,
+                    grant,
                 },
             )
             .await
@@ -1386,11 +1411,19 @@ fn event_description(event: &AgentEvent) -> (&'static str, String, String) {
                 };
                 ("ingress", "收到外部上下文".into(), summary)
             }
-            IngressEvent::ApprovalSubmitted { approved, .. } => (
+            IngressEvent::ApprovalSubmitted {
+                approved, grant, ..
+            } => (
                 "ingress",
                 "Web 已提交授权决定".into(),
                 if *approved {
-                    "已批准工具操作".into()
+                    match grant {
+                        Some(ApprovalGrant::CurrentOperation { .. }) => {
+                            "已批准本次原始工具操作".into()
+                        }
+                        Some(ApprovalGrant::AnyOperation) => "已批准任意后续工具操作".into(),
+                        None => "已批准工具操作（历史范围）".into(),
+                    }
                 } else {
                     "已拒绝工具操作".into()
                 },
@@ -1455,6 +1488,9 @@ fn event_description(event: &AgentEvent) -> (&'static str, String, String) {
                 "最低控制权限已修改".into(),
                 permission_name(*minimum_permission),
             ),
+            ControlEvent::InputRejected { reason, .. } => {
+                ("control", "输入被拒绝".into(), truncate(reason, 180))
+            }
             ControlEvent::TaskOperationRequested { .. } => (
                 "control",
                 "请求跨任务操作".into(),
@@ -1740,6 +1776,7 @@ mod tests {
                     PermissionLevel::Operator,
                 ),
                 approved: true,
+                grant: None,
             }),
         );
         let control = EventEnvelope::new(

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::{ContextEnvelope, EventId, PermissionLevel, Principal, Scope};
+use super::{ApprovalGrant, ContextEnvelope, EventId, PermissionLevel, Principal, Scope};
 
 /// 外部来源提交给核心的输入草稿。
 ///
@@ -18,6 +18,8 @@ pub enum IngressDraft {
         scope: Scope,
         suggested_permission: PermissionLevel,
         approved: bool,
+        /// 来源方明确给出的授权范围；拒绝时应为 `None`。
+        grant: Option<ApprovalGrant>,
     },
     Cancellation {
         principal: Principal,
