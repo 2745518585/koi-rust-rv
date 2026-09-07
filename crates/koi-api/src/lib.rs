@@ -110,15 +110,13 @@ pub trait WebIdentityProvider: Send + Sync {
     fn logout(&self, token: &str) -> Result<(), WebApiError>;
 }
 
-/// Request body for a Web-originated diagnostic task.
+/// Request body for creating an empty Web task session.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateTaskCommand {
-    pub message: String,
-    pub scope: ScopeDto,
-    /// 用户希望本次输入最多使用的权限；缺省时由来源适配器使用当前身份权限。
+    /// 新会话的最低控制权限；不提供时使用核心默认的 `User`。
     #[serde(default)]
-    pub suggested_permission: Option<PermissionLevel>,
+    pub minimum_permission: Option<PermissionLevel>,
 }
 
 /// A follow-up Web context event for an existing task. The transport can choose only a bounded

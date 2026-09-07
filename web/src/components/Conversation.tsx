@@ -21,7 +21,10 @@ import type { ApprovalGrant, ApprovalRequest, ModelSelection, PermissionLevel, T
 import { useI18n } from "../i18n";
 import { groupConversationEvents, type ConversationFeedItem } from "../lib/events";
 import { formatRelative, scopeLabel } from "../lib/format";
-import { EmptyState, EventIcon, EventLine, EventSummary, PermissionSelector, StatusBadge } from "../lib/ui";
+import {
+  EmptyState, EventIcon, EventLine, EventSummary, PermissionSelector, StatusBadge,
+  suggestedPermissionOptions,
+} from "../lib/ui";
 import { ApprovalCard } from "./ApprovalCard";
 
 type FeedMode = "conversation" | "events";
@@ -251,6 +254,22 @@ export function Conversation({
     }
   }
 
+  async function changeMinimumPermission(minimumPermission: PermissionLevel) {
+    if (!task || submitting || minimumPermission === task.minimumControlPermission) return;
+    setSubmitting(true);
+    try {
+      onTaskUpdated(await api.controlTask(task.taskId, {
+        action: "set_minimum_permission",
+        minimumPermission,
+      }));
+      await refreshSession();
+    } catch {
+      onToast(t("controlFailed"));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
   if (!task) {
     return (
       <section className="conv conv-empty-wrap">
@@ -295,6 +314,18 @@ export function Conversation({
           <StatusBadge status={task.status} />
           <span className="conv-scope">{scopeLabel(task)}</span>
         </div>
+        <select
+          className="model-select hide-narrow"
+          aria-label={locale === "en" ? "Minimum control permission" : "最低控制权限"}
+          value={task.minimumControlPermission}
+          onChange={(event) => void changeMinimumPermission(event.target.value as PermissionLevel)}
+          disabled={submitting}
+          title={locale === "en" ? "Minimum control permission" : "最低控制权限"}
+        >
+          {suggestedPermissionOptions(maximumPermission).map((level) => (
+            <option value={level} key={level}>{level}</option>
+          ))}
+        </select>
         {models.length ? (
           <select
             className="model-select hide-narrow"

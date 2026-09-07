@@ -4,15 +4,15 @@ import { LoaderCircle, Plus, X } from "lucide-react";
 import type { KoiApiClient } from "../api/client";
 import type { PermissionLevel, TaskSummary } from "../api/types";
 import { useI18n } from "../i18n";
+import { suggestedPermissionOptions } from "../lib/ui";
 
 /**
- * 新建会话弹窗：描述现象并绑定作用域；建议授权沿用全局选择器当前值。
+ * 新建会话弹窗：只创建隔离会话与其最低控制权限，首条消息在会话创建后再提交。
  */
 export function TaskComposerModal({
   api,
   isLive,
   permission,
-  suggestedPermission,
   onClose,
   onCreated,
   onToast,
@@ -20,30 +20,24 @@ export function TaskComposerModal({
   api: KoiApiClient;
   isLive: boolean;
   permission: PermissionLevel;
-  suggestedPermission: PermissionLevel;
   onClose: () => void;
   onCreated: (task: TaskSummary) => void;
   onToast: (message: string) => void;
 }) {
   const { t, locale } = useI18n();
-  const [message, setMessage] = useState("");
-  const [scope, setScope] = useState("service:order-api");
+  const [minimumPermission, setMinimumPermission] = useState<PermissionLevel>("User");
   const [busy, setBusy] = useState(false);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!message.trim()) return;
     if (!isLive) {
       onToast(t("backendOffline"));
       return;
     }
-    const [kind = "service", id = "order-api"] = scope.split(":");
     setBusy(true);
     try {
       const created = await api.createTask({
-        message: message.trim(),
-        scope: { kind, id },
-        suggestedPermission,
+        minimumPermission,
       });
       onCreated(created);
     } catch (error) {
@@ -66,41 +60,30 @@ export function TaskComposerModal({
         </header>
         <p className="modal-copy">
           {locale === "en"
-            ? "Describe what you observed; the agent enters an auditable task flow with the scope below."
-            : "描述你观察到的现象，Agent 会携带来源与作用域进入可审计的任务流。"}
+            ? "Create an empty, isolated session. Send the first message after it opens."
+            : "创建一个空的隔离会话；打开后再发送第一条消息。"}
         </p>
-        <label className="field-label" htmlFor="task-message">
-          {locale === "en" ? "Problem description" : "问题描述"}
+        <label className="field-label" htmlFor="task-minimum-permission">
+          {locale === "en" ? "Minimum control permission" : "最低控制权限"}
         </label>
-        <textarea
-          id="task-message"
-          autoFocus
-          value={message}
-          onChange={(event) => setMessage(event.target.value)}
-          placeholder={
-            locale === "en"
-              ? "e.g. check order-api 5xx rate and connection pool for the last 10 minutes"
-              : "例如：检查 order-api 最近 10 分钟的 5xx 与连接池状态"
-          }
-          rows={4}
-        />
-        <label className="field-label" htmlFor="task-scope">
-          {locale === "en" ? "Scope" : "作用域"}
-        </label>
-        <div className="scope-input">
-          <span>scope</span>
-          <input id="task-scope" value={scope} onChange={(event) => setScope(event.target.value)} />
-        </div>
+        <select
+          id="task-minimum-permission"
+          value={minimumPermission}
+          onChange={(event) => setMinimumPermission(event.target.value as PermissionLevel)}
+        >
+          {suggestedPermissionOptions(permission).map((level) => (
+            <option value={level} key={level}>{level}</option>
+          ))}
+        </select>
         <footer className="modal-foot">
           <span className="modal-identity">
-            {locale === "en" ? "Identity" : "当前身份"}：{permission} ·{" "}
-            {locale === "en" ? "suggested" : "建议授权"}：{suggestedPermission}
+            {locale === "en" ? "Identity" : "当前身份"}：{permission}
           </span>
           <div className="modal-foot-actions">
             <button type="button" className="button button-secondary" onClick={onClose}>
               {locale === "en" ? "Cancel" : "取消"}
             </button>
-            <button className="button button-primary" type="submit" disabled={busy || !message.trim()}>
+            <button className="button button-primary" type="submit" disabled={busy}>
               {busy ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />}
               {locale === "en" ? "Create" : "创建会话"}
             </button>

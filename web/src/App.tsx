@@ -394,7 +394,6 @@ export default function App() {
           api={api}
           isLive={isLive}
           permission={user.permission}
-          suggestedPermission={suggestedPermission}
           onClose={() => setComposerOpen(false)}
           onCreated={handleNewTask}
           onToast={setToast}

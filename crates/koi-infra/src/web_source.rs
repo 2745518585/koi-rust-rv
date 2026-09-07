@@ -304,53 +304,6 @@ impl KoiWebSource {
             .map_err(|_| WebApiError::unavailable("主会话尚未初始化，无法执行任务管理操作"))
     }
 
-    async fn record_task_input<RT>(
-        &self,
-        runtime: &mut TaskRuntime<RT>,
-        principal: &WebPrincipal,
-        command: &CreateTaskCommand,
-    ) -> Result<EventEnvelope, WebApiError>
-    where
-        RT: EventStore,
-    {
-        let suggested_permission =
-            resolve_suggested_permission(principal, command.suggested_permission)?;
-        let now = Utc::now();
-        let actor = Self::domain_principal(principal);
-        let context = ContextEnvelope {
-            schema_version: 1,
-            kind: ContextKind::UserMessage,
-            origin: ContextOrigin {
-                source: WEB_SOURCE_NAME.into(),
-                source_instance: WEB_INSTANCE.into(),
-                native_event_id: EventId::new().to_string(),
-            },
-            actor: Some(actor),
-            scope: Scope::new(command.scope.kind.clone(), command.scope.id.clone()),
-            occurred_at: now,
-            received_at: now,
-            position: None,
-            permission: PermissionLevel::None,
-            payload: ContextPayload::Text {
-                text: command.message.clone(),
-                mentions: Vec::new(),
-            },
-            causation_id: None,
-            content_hash: fingerprint(&command.message),
-        };
-        let registrar = IngressRegistrar::new(&self.sources, self.permissions.as_ref());
-        registrar
-            .register(
-                runtime,
-                IngressDraft::Context {
-                    context: Box::new(context),
-                    suggested_permission,
-                },
-            )
-            .await
-            .map_err(map_ingress_error)
-    }
-
     async fn record_context<RT>(
         &self,
         runtime: &mut TaskRuntime<RT>,
@@ -637,9 +590,13 @@ impl WebCommandPort for KoiWebSource {
         command: CreateTaskCommand,
     ) -> Result<TaskDto, WebApiError> {
         self.validate_principal(&principal)?;
-        validate_create_command(&command)?;
-        // 在创建子任务前先校验建议权限，避免恶意请求留下没有首条输入的孤儿任务。
-        resolve_suggested_permission(&principal, command.suggested_permission)?;
+        let minimum_permission = command.minimum_permission.unwrap_or(PermissionLevel::User);
+        if !minimum_permission.allows(PermissionLevel::User) {
+            return Err(WebApiError::validation("最低控制权限必须为 User 或更高"));
+        }
+        if !principal.permission.allows(minimum_permission) {
+            return Err(WebApiError::Forbidden("不能创建高于自身权限的会话".into()));
+        }
         let _guard = self.write_lock.lock().await;
 
         let mut main = self.recover_main_runtime().await?;
@@ -659,14 +616,31 @@ impl WebCommandPort for KoiWebSource {
             )
             .await
             .map_err(|error| WebApiError::conflict(error.to_string()))?;
+        if minimum_permission != PermissionLevel::User {
+            let authority = DirectControlAuthority::external(
+                SourceName::new(WEB_SOURCE_NAME)
+                    .map_err(|error| WebApiError::internal(error.to_string()))?,
+                Self::domain_principal(&principal),
+                principal.permission,
+                None,
+            )
+            .map_err(|error| WebApiError::conflict(error.to_string()))?;
+            ControlExecutor::execute(
+                &mut created.runtime,
+                ControlExecutionRequest {
+                    event: ControlEvent::MinimumControlPermissionChanged { minimum_permission },
+                    authority,
+                    causation_id: Some(created.accepted_event_id),
+                },
+            )
+            .await
+            .map_err(|error| WebApiError::conflict(error.to_string()))?;
+        }
         created
             .runtime
             .record(AgentEvent::control(ControlEvent::TaskQueued), None)
             .await
             .map_err(|error| WebApiError::conflict(error.to_string()))?;
-        let _ingress = self
-            .record_task_input(&mut created.runtime, &principal, &command)
-            .await?;
 
         let events = self
             .store
@@ -1039,22 +1013,6 @@ struct TaskRecord {
     minimum_control_permission: PermissionLevel,
     summary: TaskDto,
     events: Vec<EventEnvelope>,
-}
-
-fn validate_create_command(command: &CreateTaskCommand) -> Result<(), WebApiError> {
-    if command.message.trim().is_empty() || command.message.chars().count() > 8_000 {
-        return Err(WebApiError::validation("任务描述必须为 1 到 8000 个字符"));
-    }
-    if command.scope.kind.trim().is_empty()
-        || command.scope.id.trim().is_empty()
-        || command.scope.kind.chars().count() > 128
-        || command.scope.id.chars().count() > 256
-    {
-        return Err(WebApiError::validation(
-            "scope.kind 与 scope.id 必须在允许长度内",
-        ));
-    }
-    Ok(())
 }
 
 /// 校验 Web 请求中携带的建议授权等级。
@@ -1817,12 +1775,7 @@ mod tests {
             .create_task(
                 test_admin(),
                 CreateTaskCommand {
-                    message: "检查 order-api 的连接池状态".into(),
-                    scope: ScopeDto {
-                        kind: "service".into(),
-                        id: "order-api".into(),
-                    },
-                    suggested_permission: Some(PermissionLevel::User),
+                    minimum_permission: Some(PermissionLevel::User),
                 },
             )
             .await
@@ -1830,7 +1783,7 @@ mod tests {
 
         let task_id = uuid::Uuid::parse_str(&task.task_id).map(TaskId).unwrap();
         let events = store.load_task(task_id).await.unwrap();
-        assert_eq!(events.len(), 3);
+        assert_eq!(events.len(), 2);
         let AgentEvent::Control(ref created) = events[0].payload else {
             panic!("首事件必须是 TaskCreated");
         };
@@ -1852,17 +1805,6 @@ mod tests {
         }));
         assert!(
             matches!(events[1].payload, AgentEvent::Control(ref event) if matches!(event.as_ref(), ControlEvent::TaskQueued))
-        );
-        assert!(
-            matches!(events[2].payload, AgentEvent::Ingress(ref event) if matches!(event.as_ref(), IngressEvent::ContextReceived { .. }))
-        );
-        assert_eq!(
-            events[2].provenance.creator,
-            EventSource::External(SourceName::new(WEB_SOURCE_NAME).unwrap())
-        );
-        assert_eq!(
-            events[2].provenance.direct_permission,
-            Some(PermissionLevel::User)
         );
 
         std::fs::remove_dir_all(directory).unwrap();
@@ -1888,12 +1830,7 @@ mod tests {
             .create_task(
                 test_admin(),
                 CreateTaskCommand {
-                    message: "检查 order-api".into(),
-                    scope: ScopeDto {
-                        kind: "service".into(),
-                        id: "order-api".into(),
-                    },
-                    suggested_permission: None,
+                    minimum_permission: None,
                 },
             )
             .await
@@ -1989,12 +1926,7 @@ mod tests {
             .create_task(
                 alice.clone(),
                 CreateTaskCommand {
-                    message: "检查订单服务".into(),
-                    scope: ScopeDto {
-                        kind: "service".into(),
-                        id: "orders".into(),
-                    },
-                    suggested_permission: None,
+                    minimum_permission: None,
                 },
             )
             .await
@@ -2060,17 +1992,13 @@ mod tests {
             .await
             .unwrap();
         let ingress = source
-            .record_task_input(
+            .record_context(
                 &mut main,
                 &alice,
-                &CreateTaskCommand {
-                    message: "请启动一个只读检查子任务".into(),
-                    scope: ScopeDto {
-                        kind: "service".into(),
-                        id: "orders".into(),
-                    },
-                    suggested_permission: None,
-                },
+                Scope::new("service", "orders"),
+                ContextKind::UserMessage,
+                "请启动一个只读检查子任务".into(),
+                PermissionLevel::User,
             )
             .await
             .unwrap();
@@ -2179,12 +2107,7 @@ mod tests {
             .create_task(
                 admin.clone(),
                 CreateTaskCommand {
-                    message: "检查 order-api".into(),
-                    scope: ScopeDto {
-                        kind: "service".into(),
-                        id: "order-api".into(),
-                    },
-                    suggested_permission: None,
+                    minimum_permission: None,
                 },
             )
             .await

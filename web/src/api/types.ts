@@ -143,9 +143,7 @@ export interface SystemSnapshot {
 }
 
 export interface CreateTaskRequest {
-  message: string;
-  scope: Scope;
-  suggestedPermission: PermissionLevel;
+  minimumPermission: PermissionLevel;
 }
 
 export interface ApprovalSubmission {
