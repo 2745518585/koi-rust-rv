@@ -41,6 +41,53 @@ npm run build        # 等价于 tsc --noEmit && vite build，产物输出到 we
 
 服务同时向控制台和 `[logging].directory` 写入日志。文件按天滚动，默认文件名为 `koi.log.YYYY-MM-DD`，每行是独立 JSON；事件持久化、权限审查、模型请求与响应、工具生命周期和任务调度都会记录。`debug` 级别还会记录供应商原始响应与流式中间输出（包括接口实际返回的 reasoning summary 或 `reasoning_content`）。模型供应商未返回的隐藏思维链无法由 Agent 获取；日志只记录实际收到的数据。
 
+### 本地交互控制台
+
+从交互式终端启动 `koi-server` 时，本地控制台会自动启用；它与实时日志共用终端。也可用
+`--console` 强制开启，或在脚本和服务管理器中使用 `--no-console` 禁用。
+
+控制台命令由本机进程操作者执行，并以 `System` 来源记录适用的控制事件，不需要 Web 或 QQ
+身份。输入 `help` 查看完整说明；常用命令包括：
+
+```text
+tasks
+status main
+pause <task_id> "等待人工确认"
+resume <task_id>
+cancel <task_id> "终止本次执行"
+model <task_id> <provider> <model_id>
+minimum <task_id> <User|Operator|Admin>
+context clear <task_id|all>
+model reset <task_id|all>
+shutdown
+```
+
+`context clear` 不删除 JSONL 审计事件；它写入一个上下文压缩检查点，使此前历史不再进入模型
+上下文，并重置该任务的模型供应商续接状态。为避免影响进行中的模型调用，任务活跃时该命令会
+要求先暂停或取消并等待其停止。
+
+### 服务模式管理终端
+
+systemd 服务没有可附加的标准输入。部署单元会创建仅本机可访问的 Unix 管理套接字
+`/run/koi-rust-rv/koi-admin.sock`；服务端不开放额外 TCP 管理端口。管理员登录服务器后，使用独立
+客户端连接正在运行的实例：
+
+```bash
+# 构建并安装或直接运行客户端
+cargo run -p koi-console -- attach
+
+# 单次执行，不进入交互模式
+cargo run -p koi-console -- "status main"
+
+# 非默认套接字路径
+koi-console --socket /path/to/koi-admin.sock attach
+```
+
+`attach` 会显示连接后新增的任务事件，并允许输入与本地控制台相同的命令。套接字权限为 `0660`，
+所在运行目录为 `0750`；默认只有运行服务的 `ai` 用户和具备相应本机文件权限的管理员可连接。若以
+其他用户 SSH 登录，可通过受控的 `sudo -u ai koi-console attach` 使用，或在部署时为运行目录配置专用
+管理员组。也可在 `[server]` 配置 `admin_socket_path`，或用 `KOI_ADMIN_SOCKET_PATH` 覆盖路径。
+
 ## 核心用法
 
 以下说明均基于设计中的理想情况，实际实现可能存在偏差。

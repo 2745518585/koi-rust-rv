@@ -27,7 +27,9 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
+mod admin_socket;
 mod agent_runtime;
+mod console;
 mod prompts;
 
 #[derive(Debug, Deserialize)]
@@ -144,6 +146,8 @@ struct ServerConfig {
     event_store_dir: PathBuf,
     user_store_path: PathBuf,
     web_cookie_secure: bool,
+    #[serde(default)]
+    admin_socket_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -183,7 +187,14 @@ impl Default for UsageConfig {
 async fn main() {
     let logging = load_logging_config();
     let _logging_guard = init_logging(&logging);
-    if let Err(error) = run().await {
+    let console_enabled = match console::console_enabled_from_args(std::env::args().skip(1)) {
+        Ok(enabled) => enabled,
+        Err(message) => {
+            eprintln!("{message}");
+            return;
+        }
+    };
+    if let Err(error) = run(console_enabled).await {
         tracing::error!(%error, "koi-server 启动失败");
         std::process::exit(1);
     }
@@ -253,7 +264,7 @@ fn load_logging_config() -> LoggingConfig {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run() -> Result<(), ServerError> {
+async fn run(console_enabled: bool) -> Result<(), ServerError> {
     let config = load_runtime_config()?;
     tracing::debug!(
         target: "koi.lifecycle",
@@ -377,6 +388,23 @@ async fn run() -> Result<(), ServerError> {
     let supervisor_task = tokio::spawn(Arc::clone(&supervisor).run(shutdown.clone()));
     let qq_task = qq_source.map(|qq_source| tokio::spawn(qq_source.run(shutdown.clone())));
     let monitor_task = monitor.map(|monitor| tokio::spawn(monitor.run(shutdown.clone())));
+    let admin_socket_task = admin_socket_path(&config.server).map(|path| {
+        admin_socket::spawn(
+            path,
+            Arc::clone(&store),
+            Arc::clone(&model_registry),
+            Arc::clone(&supervisor),
+            shutdown.clone(),
+        )
+    });
+    let console_task = console_enabled.then(|| {
+        console::spawn(
+            Arc::clone(&store),
+            Arc::clone(&model_registry),
+            Arc::clone(&supervisor),
+            shutdown.clone(),
+        )
+    });
 
     let alert_webhook: Arc<dyn AlertWebhookPort> = source.clone();
     let api: Arc<dyn WebApi> = source;
@@ -421,7 +449,7 @@ async fn run() -> Result<(), ServerError> {
         "koi-server 已启动"
     );
     let result = tokio::select! {
-        result = axum::serve(listener, app) => result.map_err(ServerError::Serve),
+        result = axum::serve(listener, app).with_graceful_shutdown(shutdown.clone().cancelled_owned()) => result.map_err(ServerError::Serve),
         result = tokio::signal::ctrl_c() => result.map_err(ServerError::Signal),
     };
     shutdown.cancel();
@@ -432,7 +460,19 @@ async fn run() -> Result<(), ServerError> {
     if let Some(monitor_task) = monitor_task {
         let _ = monitor_task.await;
     }
+    if let Some(console_task) = console_task {
+        let _ = console_task.await;
+    }
+    if let Some(admin_socket_task) = admin_socket_task {
+        let _ = admin_socket_task.await;
+    }
     result
+}
+
+fn admin_socket_path(server: &ServerConfig) -> Option<PathBuf> {
+    std::env::var_os("KOI_ADMIN_SOCKET_PATH")
+        .map(PathBuf::from)
+        .or_else(|| server.admin_socket_path.clone())
 }
 
 fn validate_alert_webhook_source(source: &str) -> Result<(), ServerError> {

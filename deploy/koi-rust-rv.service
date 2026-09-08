@@ -13,6 +13,9 @@ RestartSec=5s
 KillSignal=SIGINT
 TimeoutStopSec=30s
 UMask=0027
+RuntimeDirectory=koi-rust-rv
+RuntimeDirectoryMode=0750
+Environment=KOI_ADMIN_SOCKET_PATH=/run/koi-rust-rv/koi-admin.sock
 
 # 项目数据目录目前通过 ubuntu 组共享给 ai 用户。
 SupplementaryGroups=ubuntu

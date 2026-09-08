@@ -8,6 +8,9 @@ event_store_dir = "./data/events"
 user_store_path = "./data/users.json"
 # Set true whenever the Web console is served over HTTPS.
 web_cookie_secure = false
+# Optional Unix-domain socket for the separate `koi-console` management client.
+# The systemd unit sets KOI_ADMIN_SOCKET_PATH=/run/koi-rust-rv/koi-admin.sock instead.
+# admin_socket_path = "./data/koi-admin.sock"
 
 [logging]
 # 按天滚动的结构化日志目录；相对路径相对于 koi-server 工作目录。

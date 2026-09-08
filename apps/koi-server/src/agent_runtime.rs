@@ -101,6 +101,20 @@ impl AgentSupervisor {
         }
     }
 
+    /// Reports whether a task currently owns an active model execution slot.
+    #[must_use]
+    pub fn is_task_active(&self, task_id: TaskId) -> bool {
+        self.is_active(task_id)
+    }
+
+    /// Drops provider-specific continuation state for one task.
+    ///
+    /// Local maintenance uses this after an explicit context clear so the next model call cannot
+    /// resume a provider-side conversation that no longer matches the persisted context.
+    pub fn reset_model_state(&self, task_id: TaskId) {
+        self.models.reset_task(task_id);
+    }
+
     async fn tick(self: &Arc<Self>) {
         let task_ids = match JsonlEventStore::list_task_ids(self.store.as_ref()) {
             Ok(task_ids) => task_ids,
