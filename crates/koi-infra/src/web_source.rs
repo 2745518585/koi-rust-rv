@@ -7,15 +7,20 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
+use crate::alerts::{
+    ALERTMANAGER_SOURCE_NAME, AlertInput, MONITOR_SOURCE_NAME, WEBHOOK_SOURCE_NAME,
+    parse_webhook_alerts,
+};
 use crate::event_store::JsonlEventStore;
+use crate::service_monitor::MonitorAlertSink;
 use crate::web_identity::WebUserStore;
 use async_trait::async_trait;
 use chrono::Utc;
 use koi_api::{
-    AppendContextCommand, ApprovalCommand, ApprovalDto, CancellationRequestCommand,
-    ContextUsageDto, CreateTaskCommand, DailyUsageDto, DashboardDto, DeletedTaskDto,
-    ElevationRequestDto, EventDto, HealthDto, ModelSelectionDto, NameTaskCommand, ScopeDto,
-    TaskControlAction, TaskControlCommand, TaskDto, ToolDto, UsageDto, UsageSummaryDto,
+    AlertWebhookPort, AlertWebhookResponse, AppendContextCommand, ApprovalCommand, ApprovalDto,
+    CancellationRequestCommand, ContextUsageDto, CreateTaskCommand, DailyUsageDto, DashboardDto,
+    DeletedTaskDto, ElevationRequestDto, EventDto, HealthDto, ModelSelectionDto, NameTaskCommand,
+    ScopeDto, TaskControlAction, TaskControlCommand, TaskDto, ToolDto, UsageDto, UsageSummaryDto,
     WEB_SOURCE_NAME, WebApiError, WebCommandPort, WebContextKind, WebEventPort, WebPrincipal,
     WebQueryPort, WebStreamEvent,
 };
@@ -35,6 +40,7 @@ use koi_core::ports::{
     IngressSourceDefinition, IngressSourceRegistry, SourceAuthorizationProvider,
     StaticPermissionDirectory,
 };
+use serde_json::Value;
 use tokio::sync::{Mutex, broadcast};
 
 const WEB_INSTANCE: &str = "http-api";
@@ -112,6 +118,19 @@ impl KoiWebSource {
                 maximum_permission: PermissionLevel::Admin,
             })
             .map_err(|error| WebApiError::internal(error.to_string()))?;
+        for source_name in [
+            ALERTMANAGER_SOURCE_NAME,
+            MONITOR_SOURCE_NAME,
+            WEBHOOK_SOURCE_NAME,
+        ] {
+            sources
+                .register(IngressSourceDefinition {
+                    source: SourceName::new(source_name)
+                        .map_err(|error| WebApiError::internal(error.to_string()))?,
+                    maximum_permission: PermissionLevel::User,
+                })
+                .map_err(|error| WebApiError::internal(error.to_string()))?;
+        }
 
         let (events, _) = broadcast::channel(256);
 
@@ -378,6 +397,64 @@ impl KoiWebSource {
             )
             .await
             .map_err(map_ingress_error)
+    }
+
+    async fn ingest_alerts(
+        &self,
+        alerts: Vec<AlertInput>,
+    ) -> Result<AlertIngestResult, WebApiError> {
+        if alerts.is_empty() {
+            return Err(WebApiError::validation("至少需要一条告警"));
+        }
+        let result = {
+            let _guard = self.write_lock.lock().await;
+            let mut runtime = self.recover_main_runtime().await?;
+            let mut existing = self
+                .store
+                .load_task(TaskId::MAIN)
+                .await
+                .map_err(|error| WebApiError::internal(error.to_string()))?;
+            let mut recorded_events = Vec::new();
+            let mut duplicates = 0;
+
+            for alert in alerts {
+                if existing
+                    .iter()
+                    .any(|event| is_duplicate_alert(event, &alert))
+                {
+                    duplicates += 1;
+                    continue;
+                }
+                let context = alert_context(alert)?;
+                let recorded = IngressRegistrar::new(&self.sources, self.permissions.as_ref())
+                    .register(
+                        &mut runtime,
+                        IngressDraft::Context {
+                            context: Box::new(context),
+                            suggested_permission: PermissionLevel::User,
+                        },
+                    )
+                    .await
+                    .map_err(map_ingress_error)?;
+                existing.push(recorded.clone());
+                recorded_events.push(recorded);
+            }
+
+            AlertIngestResult {
+                accepted: recorded_events.len(),
+                duplicates,
+                event_ids: recorded_events
+                    .iter()
+                    .map(|event| event.id.to_string())
+                    .collect(),
+                recorded_events,
+            }
+        };
+
+        for event in &result.recorded_events {
+            self.publish(event).await;
+        }
+        Ok(result.without_events())
     }
 
     fn tool_dtos(&self) -> Vec<ToolDto> {
@@ -1019,6 +1096,35 @@ impl WebEventPort for KoiWebSource {
     }
 }
 
+#[async_trait]
+impl AlertWebhookPort for KoiWebSource {
+    async fn ingest_alert_webhook(
+        &self,
+        source: &str,
+        payload: Value,
+    ) -> Result<AlertWebhookResponse, WebApiError> {
+        let alerts = parse_webhook_alerts(&payload, source)
+            .map_err(|error| WebApiError::validation(error.to_string()))?;
+        let result = self.ingest_alerts(alerts).await?;
+        Ok(AlertWebhookResponse {
+            task_id: TaskId::MAIN.to_string(),
+            accepted: result.accepted,
+            duplicates: result.duplicates,
+            event_ids: result.event_ids,
+        })
+    }
+}
+
+#[async_trait]
+impl MonitorAlertSink for KoiWebSource {
+    async fn ingest_monitor_alert(&self, alert: AlertInput) -> Result<(), String> {
+        self.ingest_alerts(vec![alert])
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
 struct WebAuthorizationProvider {
     source: Arc<KoiWebSource>,
 }
@@ -1043,6 +1149,76 @@ struct TaskRecord {
     minimum_control_permission: PermissionLevel,
     summary: TaskDto,
     events: Vec<EventEnvelope>,
+}
+
+struct AlertIngestResult {
+    accepted: usize,
+    duplicates: usize,
+    event_ids: Vec<String>,
+    recorded_events: Vec<EventEnvelope>,
+}
+
+impl AlertIngestResult {
+    fn without_events(self) -> Self {
+        Self {
+            accepted: self.accepted,
+            duplicates: self.duplicates,
+            event_ids: self.event_ids,
+            recorded_events: Vec::new(),
+        }
+    }
+}
+
+fn alert_context(alert: AlertInput) -> Result<ContextEnvelope, WebApiError> {
+    let content_hash = fingerprint(&format!(
+        "{}|{}|{}|{}|{}|{}",
+        alert.source,
+        alert.source_instance,
+        alert.native_event_id,
+        alert.name,
+        alert.severity,
+        serde_json::to_string(&alert.labels)
+            .map_err(|error| WebApiError::internal(error.to_string()))?,
+    ));
+    let source = alert.source.clone();
+    let source_instance = alert.source_instance.clone();
+    Ok(ContextEnvelope {
+        schema_version: 1,
+        kind: ContextKind::Alert,
+        origin: ContextOrigin {
+            source: source.clone(),
+            source_instance: source_instance.clone(),
+            native_event_id: alert.native_event_id,
+        },
+        actor: Some(Principal::new(source, source_instance)),
+        scope: alert.scope,
+        occurred_at: alert.occurred_at,
+        received_at: Utc::now(),
+        position: None,
+        permission: PermissionLevel::None,
+        payload: ContextPayload::Alert {
+            name: alert.name,
+            severity: alert.severity,
+            summary: alert.summary,
+            labels: alert.labels,
+        },
+        causation_id: None,
+        content_hash,
+    })
+}
+
+fn is_duplicate_alert(event: &EventEnvelope, alert: &AlertInput) -> bool {
+    matches!(
+        &event.payload,
+        AgentEvent::Ingress(ingress)
+            if matches!(
+                ingress.as_ref(),
+                IngressEvent::ContextReceived { context, .. }
+                    if context.kind == ContextKind::Alert
+                        && context.origin.source == alert.source
+                        && context.origin.native_event_id == alert.native_event_id
+            )
+    )
 }
 
 /// 校验 Web 请求中携带的建议授权等级。
@@ -1644,7 +1820,12 @@ mod tests {
             WebUserStore::open(
                 path,
                 Arc::new(StaticPermissionDirectory::new(
-                    [("web".into(), PermissionLevel::User)],
+                    [
+                        ("web".into(), PermissionLevel::User),
+                        ("alertmanager".into(), PermissionLevel::User),
+                        ("monitor".into(), PermissionLevel::User),
+                        ("webhook".into(), PermissionLevel::User),
+                    ],
                     [("web".into(), "admin_ops".into(), PermissionLevel::Admin)],
                 )),
             )
@@ -2238,6 +2419,66 @@ mod tests {
         assert!(deleted.deleted);
         assert!(store.load_task(task_id).await.unwrap().is_empty());
 
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn alert_webhook_ingests_and_deduplicates_alertmanager_alerts() {
+        let directory = std::env::temp_dir().join(format!("koi-alert-webhook-{}", EventId::new()));
+        let store = Arc::new(JsonlEventStore::open(&directory).unwrap());
+        bootstrap_main_session(&store).await;
+        let source = KoiWebSource::new(
+            Arc::clone(&store),
+            test_identities(directory.join("users.json")),
+            test_task_manager(&store),
+            Vec::new(),
+            10.0,
+        )
+        .unwrap();
+        let payload = serde_json::json!({
+            "status": "firing",
+            "receiver": "ops",
+            "alerts": [{
+                "status": "firing",
+                "labels": {
+                    "alertname": "ApiDown",
+                    "severity": "critical",
+                    "service": "api"
+                },
+                "annotations": {"summary": "API 不可用"},
+                "fingerprint": "alert-1"
+            }]
+        });
+
+        let first = source
+            .ingest_alert_webhook(ALERTMANAGER_SOURCE_NAME, payload.clone())
+            .await
+            .unwrap();
+        assert_eq!(first.accepted, 1);
+        assert_eq!(first.duplicates, 0);
+        assert_eq!(first.event_ids.len(), 1);
+
+        let second = source
+            .ingest_alert_webhook(ALERTMANAGER_SOURCE_NAME, payload)
+            .await
+            .unwrap();
+        assert_eq!(second.accepted, 0);
+        assert_eq!(second.duplicates, 1);
+        assert_eq!(second.event_ids, Vec::<String>::new());
+
+        let events = store.load_task(TaskId::MAIN).await.unwrap();
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                AgentEvent::Ingress(ingress)
+                    if matches!(
+                        ingress.as_ref(),
+                        IngressEvent::ContextReceived { context, .. }
+                            if context.kind == ContextKind::Alert
+                                && context.origin.native_event_id == "alert-1:firing"
+                    )
+            )
+        }));
         std::fs::remove_dir_all(directory).unwrap();
     }
 

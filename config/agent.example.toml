@@ -63,6 +63,28 @@ max_tasks_per_server = 2
 task_timeout_secs = 180
 token_budget_per_task = 12000
 
+# 内置基础服务监测。监测器只在状态变化时向主会话写入 firing/resolved 告警。
+[monitor]
+enabled = false
+instance = "local"
+interval_secs = 30
+timeout_secs = 5
+failure_threshold = 3
+recovery_threshold = 2
+
+[[monitor.checks]]
+id = "koi-api"
+kind = "http"
+target = "http://127.0.0.1:8080/healthz"
+name = "Koi API"
+severity = "critical"
+expected_status = 200
+
+# 外部 Alertmanager 或其他监控系统使用该入口；密钥也可通过 KOI_ALERT_WEBHOOK_TOKEN 提供。
+[alerts]
+webhook_source = "alertmanager"
+# webhook_token = "change-me"
+
 [context]
 recent_group_messages = 32
 intervention_cooldown_secs = 300

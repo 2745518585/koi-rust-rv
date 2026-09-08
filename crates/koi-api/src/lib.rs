@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -18,6 +18,7 @@ use axum::{Json, Router};
 use futures_util::stream;
 use koi_core::domain::{ApprovalGrant, EventId, PermissionLevel, TaskId};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -270,6 +271,26 @@ pub trait WebCommandPort: Send + Sync {
         principal: WebPrincipal,
         task_id: TaskId,
     ) -> Result<DeletedTaskDto, WebApiError>;
+}
+
+/// A machine-to-machine alert ingress. Unlike Web commands, this port is authenticated by a
+/// dedicated webhook secret and always targets the main coordination session.
+#[async_trait]
+pub trait AlertWebhookPort: Send + Sync {
+    async fn ingest_alert_webhook(
+        &self,
+        source: &str,
+        payload: Value,
+    ) -> Result<AlertWebhookResponse, WebApiError>;
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlertWebhookResponse {
+    pub task_id: String,
+    pub accepted: usize,
+    pub duplicates: usize,
+    pub event_ids: Vec<String>,
 }
 
 /// Event delivery responsibility. Events are immutable projections of core event envelopes.
@@ -576,10 +597,27 @@ fn session_cookie(headers: &HeaderMap) -> Option<&str> {
 struct HttpState {
     api: Arc<dyn WebApi>,
     auth: WebAuth,
+    alert_webhook: Option<Arc<dyn AlertWebhookPort>>,
+    alert_webhook_token: Option<String>,
+    alert_webhook_source: String,
 }
 
 /// Builds the versioned Axum API router. Static file hosting remains the application's concern.
 pub fn router(api: Arc<dyn WebApi>, auth: WebAuth) -> Router {
+    router_with_alert_webhook(api, auth, None, None, "alertmanager")
+}
+
+/// Builds the API router with an optional machine-to-machine alert webhook.
+///
+/// The two-argument [`router`] function remains available for embedded callers; it simply leaves
+/// the alert webhook disabled. A deployed server should use this function and provide a secret.
+pub fn router_with_alert_webhook(
+    api: Arc<dyn WebApi>,
+    auth: WebAuth,
+    alert_webhook_port: Option<Arc<dyn AlertWebhookPort>>,
+    alert_webhook_token: Option<String>,
+    alert_webhook_source: impl Into<String>,
+) -> Router {
     Router::new()
         .route("/healthz", get(health))
         .route("/api/v1/auth/register", post(register))
@@ -592,6 +630,9 @@ pub fn router(api: Arc<dyn WebApi>, auth: WebAuth) -> Router {
             "/api/v1/tasks/{task_id}/events",
             get(task_events).post(append_context),
         )
+        .route("/api/v1/alerts/webhook", post(alert_webhook))
+        // Keep a plural webhook alias for existing integrations and hand-written clients.
+        .route("/api/v1/webhooks/alerts", post(alert_webhook))
         .route(
             "/api/v1/tasks/{task_id}/cancellation-requests",
             post(request_cancellation),
@@ -608,7 +649,14 @@ pub fn router(api: Arc<dyn WebApi>, auth: WebAuth) -> Router {
             post(submit_approval),
         )
         .route("/api/v1/events/stream", get(event_stream))
-        .with_state(HttpState { api, auth })
+        .layer(DefaultBodyLimit::max(1024 * 1024))
+        .with_state(HttpState {
+            api,
+            auth,
+            alert_webhook: alert_webhook_port,
+            alert_webhook_token: alert_webhook_token.filter(|token| !token.trim().is_empty()),
+            alert_webhook_source: alert_webhook_source.into(),
+        })
 }
 
 #[derive(Serialize)]
@@ -767,6 +815,61 @@ async fn append_context(
             .await
             .map_err(ApiError::from)?,
     }))
+}
+
+async fn alert_webhook(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<ApiEnvelope<AlertWebhookResponse>>, ApiError> {
+    authenticate_alert_webhook(&headers, state.alert_webhook_token.as_deref())?;
+    let Some(alert_webhook) = state.alert_webhook.as_ref() else {
+        return Err(ApiError::from(WebApiError::unavailable(
+            "告警 Webhook 尚未启用",
+        )));
+    };
+    let response = alert_webhook
+        .ingest_alert_webhook(&state.alert_webhook_source, payload)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiEnvelope { data: response }))
+}
+
+fn authenticate_alert_webhook(
+    headers: &HeaderMap,
+    expected_token: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(expected_token) = expected_token else {
+        return Err(ApiError::from(WebApiError::unavailable(
+            "告警 Webhook 尚未配置密钥",
+        )));
+    };
+    let token = headers
+        .get("x-koi-webhook-token")
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+        });
+    if token.is_none_or(|token| !constant_time_secret_eq(expected_token, token)) {
+        return Err(ApiError::unauthorized("告警 Webhook 密钥无效"));
+    }
+    Ok(())
+}
+
+fn constant_time_secret_eq(expected: &str, actual: &str) -> bool {
+    let expected = expected.as_bytes();
+    let actual = actual.as_bytes();
+    let max_len = expected.len().max(actual.len());
+    let mut difference = expected.len() ^ actual.len();
+    for index in 0..max_len {
+        let left = expected.get(index).copied().unwrap_or_default();
+        let right = actual.get(index).copied().unwrap_or_default();
+        difference |= usize::from(left ^ right);
+    }
+    difference == 0
 }
 
 async fn request_cancellation(

@@ -13,6 +13,14 @@ permission = "User"
 source = "alertmanager"
 permission = "User"
 
+[[source_defaults]]
+source = "monitor"
+permission = "User"
+
+[[source_defaults]]
+source = "webhook"
+permission = "User"
+
 # 精确身份记录优先于来源默认值。
 [[principals]]
 source = "web"

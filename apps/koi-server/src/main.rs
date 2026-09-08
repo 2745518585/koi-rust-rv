@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use koi_api::{WebApi, WebAuth};
+use koi_api::{AlertWebhookPort, WebApi, WebAuth};
 use koi_core::agent::DEFAULT_CONTEXT_WINDOW_TOKENS;
 use koi_core::domain::{
     EventSource, ModelGenerationOptions, ModelProtocol, ModelSelection, PermissionLevel,
@@ -16,6 +16,7 @@ use koi_infra::llm::{
     OpenAiCompatibleModelProvider,
 };
 use koi_infra::qq_source::{QqConfig, QqSource};
+use koi_infra::service_monitor::{ServiceMonitor, ServiceMonitorConfig};
 use koi_infra::web_identity::WebUserStore;
 use koi_infra::web_source::KoiWebSource;
 use serde::Deserialize;
@@ -37,6 +38,10 @@ struct RuntimeConfig {
     usage: UsageConfig,
     #[serde(default)]
     qq: QqConfig,
+    #[serde(default)]
+    monitor: ServiceMonitorConfig,
+    #[serde(default)]
+    alerts: AlertConfig,
 }
 
 /// 独立于 Agent 与工具配置的静态权限目录文件。
@@ -111,6 +116,25 @@ struct ServerConfig {
     event_store_dir: PathBuf,
     user_store_path: PathBuf,
     web_cookie_secure: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+struct AlertConfig {
+    /// Secret used by the machine-to-machine alert webhook. It can also be supplied through
+    /// `KOI_ALERT_WEBHOOK_TOKEN` so deployments do not need to store it in the TOML file.
+    webhook_token: Option<String>,
+    /// The registered ingress source assigned to webhook payloads; request bodies cannot change it.
+    webhook_source: String,
+}
+
+impl Default for AlertConfig {
+    fn default() -> Self {
+        Self {
+            webhook_token: None,
+            webhook_source: "alertmanager".into(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,6 +228,7 @@ async fn run() -> Result<(), ServerError> {
             model_registry.default_model().clone(),
         ),
     );
+    validate_alert_webhook_source(&config.alerts.webhook_source)?;
     let auth = WebAuth::new(identities, config.server.web_cookie_secure);
     let mut authorization_providers = SourceAuthorizationRegistry::default();
     authorization_providers
@@ -242,12 +267,39 @@ async fn run() -> Result<(), ServerError> {
         config.agent.max_steps,
         config.agent.max_concurrent_tasks,
     );
+    let monitor = if config.monitor.enabled {
+        Some(
+            ServiceMonitor::new(config.monitor.clone(), Arc::clone(&source))
+                .map_err(|error| ServerError::Monitor(error.to_string()))?,
+        )
+    } else {
+        None
+    };
     let shutdown = CancellationToken::new();
     let supervisor_task = tokio::spawn(Arc::clone(&supervisor).run(shutdown.clone()));
     let qq_task = qq_source.map(|qq_source| tokio::spawn(qq_source.run(shutdown.clone())));
+    let monitor_task = monitor.map(|monitor| tokio::spawn(monitor.run(shutdown.clone())));
 
+    let alert_webhook: Arc<dyn AlertWebhookPort> = source.clone();
     let api: Arc<dyn WebApi> = source;
-    let api_router = koi_api::router(api, auth).layer(TraceLayer::new_for_http());
+    let webhook_token = config
+        .alerts
+        .webhook_token
+        .clone()
+        .filter(|token| !token.trim().is_empty())
+        .or_else(|| {
+            std::env::var("KOI_ALERT_WEBHOOK_TOKEN")
+                .ok()
+                .filter(|token| !token.trim().is_empty())
+        });
+    let api_router = koi_api::router_with_alert_webhook(
+        api,
+        auth,
+        Some(alert_webhook),
+        webhook_token,
+        config.alerts.webhook_source.clone(),
+    )
+    .layer(TraceLayer::new_for_http());
 
     let app = if config.server.web_dist_dir.is_dir() {
         tracing::info!(path = %config.server.web_dist_dir.display(), "已启用 Web 静态文件托管");
@@ -279,7 +331,19 @@ async fn run() -> Result<(), ServerError> {
     if let Some(qq_task) = qq_task {
         let _ = qq_task.await;
     }
+    if let Some(monitor_task) = monitor_task {
+        let _ = monitor_task.await;
+    }
     result
+}
+
+fn validate_alert_webhook_source(source: &str) -> Result<(), ServerError> {
+    if matches!(source, "alertmanager" | "webhook") {
+        return Ok(());
+    }
+    Err(ServerError::Configuration(format!(
+        "alerts.webhook_source 不支持：{source}，可选 alertmanager 或 webhook"
+    )))
 }
 
 fn parse_model_protocol(raw: &str) -> Result<ModelProtocol, ServerError> {
@@ -454,6 +518,8 @@ enum ServerError {
     WebApi(#[from] koi_api::WebApiError),
     #[error("QQ 来源初始化失败：{0}")]
     QqSource(String),
+    #[error("服务监测初始化失败：{0}")]
+    Monitor(String),
     #[error("来源授权 Provider 注册失败：{0}")]
     AuthorizationProvider(String),
     #[error("模型 Provider 初始化失败：{0}")]
@@ -499,9 +565,28 @@ mod tests {
                 protocol = "responses"
                 request_timeout_secs = 60
                 context_window_tokens = 8192
+
+                [monitor]
+                enabled = true
+                interval_secs = 15
+                timeout_secs = 3
+                failure_threshold = 2
+                recovery_threshold = 2
+
+                [[monitor.checks]]
+                id = "api"
+                kind = "http"
+                target = "http://127.0.0.1:8080/healthz"
+
+                [alerts]
+                webhook_source = "webhook"
             "#,
         )
         .unwrap();
+
+        assert!(config.monitor.enabled);
+        assert_eq!(config.monitor.checks.len(), 1);
+        assert_eq!(config.alerts.webhook_source, "webhook");
 
         let registry = build_model_registry(&config).unwrap();
         assert_eq!(

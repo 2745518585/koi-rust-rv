@@ -29,6 +29,8 @@ npm run build        # 等价于 tsc --noEmit && vite build，产物输出到 we
    - `[server]`：监听地址、Web 构建目录、JSONL 事件目录（`data/events`）、Web 用户库路径（`data/users.json`）、Cookie 是否要求 `Secure`；
    - `[models]`：`default_provider`/`default_model_id` 与至少一条可用模型条目（供应商、`base_url`、`model_id`、`api_key`、协议、超时与上下文窗口）；支持 OpenAI Responses 与 Chat Completions 两类协议；
    - `[qq]`：QQ 开放平台 AppID/AppSecret（或设置 `QQ_BOT_APP_ID`、`QQ_BOT_APP_SECRET` 环境变量）；不填写凭证时 QQ 来源自动跳过；
+   - `[monitor]`：可选的本地基础服务监测；支持 HTTP、TCP 和本机原生服务状态检查；
+   - `[alerts]`：外部告警 Webhook 的来源名与密钥；密钥也可以通过 `KOI_ALERT_WEBHOOK_TOKEN` 环境变量提供；
    - `[usage]`：可选月度预算（当前仅用于展示）。
 2. 复制 `config/authorization.example.toml` 为 `config/authorization.toml`，声明核心身份权限目录：`[source_defaults]` 给出来源的默认身份权限，`[[principals]]` 给出 `(来源, 用户)` 精确身份权限；精确身份优先于来源默认值，未配置的身份按 `None` 失败关闭。该目录是核心权限裁决的依据，外部来源只能提交建议权限、不能改写它。
 3. 运行 `cargo run -p koi-server`（启动时读取 `config/agent.toml` 与 `config/authorization.toml`）。模型系统提示词内嵌于 `koi-server`（`apps/koi-server/prompts/main.md`、`qq.md`、`child.md`；QQ 片段会组装到主会话提示词），无需额外配置。
@@ -78,6 +80,45 @@ npm run build        # 等价于 tsc --noEmit && vite build，产物输出到 we
 - **提交输入**：来源方在完成自己的认证后构造 `IngressDraft`（`Context` 上下文输入 / `Approval` 提权确认 / `Cancellation` 取消请求），交给 `IngressRegistrar` 落为已审计事件；`suggested_permission` 仅是建议，核心会按 来源上限 与 身份目录 重新核定并持久化结论。
 - **处理提权**：实现 `SourceAuthorizationProvider` 并注册进 `SourceAuthorizationRegistry`。核心在权限不足时以 `AuthorizationRequest`（含原工具提案、参数指纹、所需权限）调用它，来源方返回 `Denied` / `Pending`（先展示确认，随后以新输入事件继续）/ `Authorized`（核心仍会独立读取并复核该输入事件的绑定关系）。
 - **执行控制事件**：控制事件不注入上下文，由 `ControlExecutor` 直接执行并写入事件流。外部调用方必须先构造经过来源注册、身份认证与权限截断的 `DirectControlAuthority`；模型与工具不能作为控制事件的直接来源。
+
+### 服务监测与外部告警 Webhook
+
+项目内置一个轻量服务监测器，监测器不调用 Agent 工具，而是执行确定性的检查，在状态变化时把告警写入主会话：
+
+- `kind = "http"`：检查 HTTP/HTTPS 状态码，默认期望 `200`；
+- `kind = "tcp"`：检查 `host:port` 是否可以建立连接；
+- `kind = "service"`：Windows 使用 `sc.exe` 检查服务，Linux/Unix 使用 `systemctl` 检查服务是否 active。
+
+示例配置：
+
+```toml
+[monitor]
+enabled = true
+instance = "server-01"
+interval_secs = 30
+timeout_secs = 5
+failure_threshold = 3
+recovery_threshold = 2
+
+[[monitor.checks]]
+id = "koi-api"
+kind = "http"
+target = "http://127.0.0.1:8080/healthz"
+name = "Koi API"
+severity = "critical"
+expected_status = 200
+```
+
+连续失败达到 `failure_threshold` 后产生 `firing` 告警，连续恢复达到 `recovery_threshold` 后产生 `resolved` 告警；重复状态不会持续刷入事件流。监测器以独立后台任务运行，服务器退出时会随统一关闭令牌停止。
+
+外部监控系统可向以下任一地址发送 JSON `POST` 请求：
+
+```text
+/api/v1/alerts/webhook
+/api/v1/webhooks/alerts
+```
+
+请求使用 `Authorization: Bearer <token>` 或 `X-Koi-Webhook-Token: <token>` 鉴权。默认来源为 `alertmanager`，也可以在 `[alerts].webhook_source` 中选择 `webhook`；请求体不能自行提升或切换来源权限。接口同时接受 Alertmanager 风格的 `alerts` 数组和单条规范化告警对象，并按来源实例与告警指纹去重。告警最终都会以 `ContextKind::Alert` 进入 `TaskId::MAIN`，高风险工具操作仍需要现有审批流程。
 
 ### 工具接口
 
