@@ -5,7 +5,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use koi_core::agent::{
     AgentLoop, AgentRunOutcome, AgentRunRequest, PersistedAuthorizationEvidenceResolver,
@@ -21,16 +20,15 @@ use koi_core::ports::{
 };
 use koi_infra::event_store::JsonlEventStore;
 use koi_infra::llm::{ModelProviderEntry, ModelProviderRegistry, ModelRegistryError};
+use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
-
-const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// 进程内的最小 Agent 运行器。
 ///
-/// 当前版本按事件存储轮询任务，适合课程作业和单进程部署。事件存储仍是唯一事实来源，
-/// 因此服务重启后可以重新扫描 `Queued` 或等待审批的任务继续运行。主会话由本运行器
-/// 调度：收到新输入或子任务回传的工具结果时继续运行；子任务结果通过 `TaskManager`
-/// 回传为主会话中的工具事件。
+/// 当前版本使用事件存储广播唤醒任务调度，适合课程作业和单进程部署。事件存储仍是唯一
+/// 事实来源，因此服务重启后会先做一次全量扫描，随后只在有新事件时恢复受影响的任务。
+/// 主会话由本运行器调度：收到新输入或子任务回传的工具结果时继续运行；子任务结果通过
+/// `TaskManager` 回传为主会话中的工具事件。
 pub struct AgentSupervisor {
     store: Arc<JsonlEventStore>,
     models: Arc<ModelProviderRegistry>,
@@ -72,13 +70,29 @@ impl AgentSupervisor {
         })
     }
 
-    /// 运行任务扫描循环，直到服务关闭。
+    /// 运行任务调度循环，直到服务关闭。
+    ///
+    /// 启动时的全量扫描负责恢复服务重启前已经排队的任务。运行中直接订阅事件存储，
+    /// 并在一次唤醒前清空已经积压的通知，让一批连续写入的模型、工具事件只触发一次
+    /// 全量状态检查。这样空闲时不会反复读取和解析所有任务文件，也不会因为一次检查
+    /// 超过固定轮询周期而进入 Tokio 忙等。
     pub async fn run(self: Arc<Self>, shutdown: CancellationToken) {
-        let mut interval = tokio::time::interval(POLL_INTERVAL);
+        let mut notifications = self.store.subscribe();
+        self.tick().await;
+
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => break,
-                _ = interval.tick() => self.tick().await,
+                notification = notifications.recv() => {
+                    match notification {
+                        Ok(_) => {
+                            while notifications.try_recv().is_ok() {}
+                            self.tick().await;
+                        }
+                        Err(RecvError::Lagged(_)) => self.tick().await,
+                        Err(RecvError::Closed) => break,
+                    }
+                }
             }
         }
     }
