@@ -178,7 +178,7 @@ fn registers_qq_group_delivery_tool_with_notification_metadata() {
     assert_eq!(register_qq_tools(&mut registry, source).unwrap(), 2);
 
     let definition = registry.get_definition("qq.group_send").unwrap();
-    assert_eq!(definition.required_permission, PermissionLevel::Operator);
+    assert_eq!(definition.required_permission, PermissionLevel::User);
     assert_eq!(definition.side_effect, ToolSideEffect::Notification);
     assert!(definition.model_visible);
     assert_eq!(
@@ -207,7 +207,7 @@ fn registers_primary_qq_report_tool_only_when_configured() {
     assert_eq!(register_qq_tools(&mut registry, source).unwrap(), 3);
 
     let report = registry.get_definition("qq.report").unwrap();
-    assert_eq!(report.required_permission, PermissionLevel::Operator);
+    assert_eq!(report.required_permission, PermissionLevel::User);
     assert_eq!(report.side_effect, ToolSideEffect::Notification);
     assert!(report.model_visible);
     assert_eq!(report.input_schema["required"], json!(["content"]));

@@ -87,7 +87,7 @@ fn group_definition() -> ToolDefinition {
                 }
             }
         }),
-        PermissionLevel::Operator,
+        PermissionLevel::User,
         ToolSideEffect::Notification,
         TOOL_TIMEOUT_MS,
         true,
@@ -133,7 +133,7 @@ fn report_definition() -> ToolDefinition {
                 }
             }
         }),
-        PermissionLevel::Operator,
+        PermissionLevel::User,
         ToolSideEffect::Notification,
         TOOL_TIMEOUT_MS,
         true,
