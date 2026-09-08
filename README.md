@@ -9,7 +9,7 @@ Koi Rust Remastered Version，即 koi Rust 重置版，原 koi 实现见 [Pond-I
 
 > 注：本节内容由 AI 生成。
 
-前置依赖：Rust stable 工具链（见 `rust-toolchain.toml`，edition 2024）。Web 前端（`web/`，Vite + TypeScript + React）需要 Node.js/npm 构建；仓库已附带构建产物 `web/dist`，不改前端可跳过下面“构建 Web 前端”小节。
+前置依赖：Rust stable 工具链（见 `rust-toolchain.toml`，edition 2024）。Web 前端（`web/`，Vite + TypeScript + React）需要 Node.js/npm 构建，首次使用前必须先执行下面的构建。
 
 ### 构建 Web 前端
 
