@@ -12,7 +12,7 @@ use crate::agent::{
 use crate::domain::{
     AgentEvent, ContextEnvelope, ContextKind, ContextOrigin, ContextPayload, ControlEvent,
     EventEnvelope, EventId, EventProvenance, IngressEvent, PermissionAssessment, PermissionLevel,
-    Scope, TaskId, TaskOperation, ToolEvent, ToolResult,
+    Scope, TaskId, TaskOperation, TaskStatus, ToolEvent, ToolResult,
 };
 use crate::ports::EventStore;
 
@@ -409,11 +409,11 @@ impl<S: EventStore> TaskManager<S> {
         Ok(named.id)
     }
 
-    /// 通过主会话事件流删除一个已终止的子任务事件流。
+    /// 通过主会话事件流删除一个未在执行中的子任务事件流。
     ///
     /// # Errors
     ///
-    /// 当目标为主会话、不存在、尚未终止、存储不支持删除或主会话事件无法写入时返回错误。
+    /// 当目标为主会话、不存在、仍在执行、存储不支持删除或主会话事件无法写入时返回错误。
     pub async fn request_delete_child(
         &self,
         main: &mut TaskRuntime<S>,
@@ -440,12 +440,15 @@ impl<S: EventStore> TaskManager<S> {
             Ok(child) => child.projection().status,
             Err(error) => return self.reject(main, request.id, error.to_string()).await,
         };
-        if !status.is_terminal() {
+        if matches!(
+            status,
+            TaskStatus::Running | TaskStatus::Pausing | TaskStatus::Cancelling
+        ) {
             return self
                 .reject(
                     main,
                     request.id,
-                    format!("子任务尚未终止（{status:?}），请先取消再删除"),
+                    format!("子任务仍在执行中（{status:?}），请先停止后再删除"),
                 )
                 .await;
         }

@@ -264,7 +264,7 @@ pub trait WebCommandPort: Send + Sync {
         command: NameTaskCommand,
     ) -> Result<TaskDto, WebApiError>;
 
-    /// Delete a terminal task session and its event stream. The main session cannot be deleted.
+    /// Delete an inactive child task session and its event stream. The main session cannot be deleted.
     async fn delete_task(
         &self,
         principal: WebPrincipal,

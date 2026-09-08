@@ -954,7 +954,7 @@ impl WebCommandPort for KoiWebSource {
         Ok(task_dto(task_id, &events, runtime.projection()))
     }
 
-    /// 删除已终止的任务会话。与主会话的 `task.delete` 工具走同一管理路径；主会话不可删除。
+    /// 删除未在执行中的任务会话。与主会话的 `task.delete` 工具走同一管理路径；主会话不可删除。
     async fn delete_task(
         &self,
         principal: WebPrincipal,
@@ -2181,26 +2181,7 @@ mod tests {
                 .is_err()
         );
 
-        // 未终止的子任务不能删除。
-        assert!(source.delete_task(admin.clone(), task_id).await.is_err());
-
-        // 终止后可以删除，事件流随之移除。
-        let mut runtime = TaskRuntime::recover(Arc::clone(&store), task_id)
-            .await
-            .unwrap();
-        runtime
-            .record(AgentEvent::control(ControlEvent::TaskResumed), None)
-            .await
-            .unwrap();
-        runtime
-            .record(
-                AgentEvent::control(ControlEvent::TaskCompleted {
-                    response: Some("完成".into()),
-                }),
-                None,
-            )
-            .await
-            .unwrap();
+        // 空会话处于 Queued 状态，也可以直接删除。
         let deleted = source.delete_task(admin, task_id).await.unwrap();
         assert!(deleted.deleted);
         assert!(store.load_task(task_id).await.unwrap().is_empty());
