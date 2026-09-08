@@ -24,6 +24,8 @@ use tokio::net::{UnixListener, UnixStream};
 
 #[cfg(unix)]
 use crate::console::{ConsoleOutcome, TerminalConsole};
+#[cfg(unix)]
+use koi_core::domain::{AgentEvent, ModelDeltaKind, ModelEvent};
 
 /// Starts the local administrative socket listener.
 pub fn spawn(
@@ -74,6 +76,11 @@ enum AdminResponse {
         task_id: String,
         sequence: u64,
         message: String,
+    },
+    Reasoning {
+        task_id: String,
+        sequence: u64,
+        content: String,
     },
     Shutdown,
 }
@@ -195,11 +202,22 @@ async fn handle_connection(
             },
             event = events.recv() => match event {
                 Ok(event) => {
-                    write_response(&mut writer, &AdminResponse::Event {
-                        task_id: event.task_id.to_string(),
-                        sequence: event.sequence,
-                        message: shorten(&format!("{:?}", event.payload), 2_000),
-                    }).await?;
+                    let response = match &event.payload {
+                        AgentEvent::Model(model) => match model.as_ref() {
+                            ModelEvent::Delta {
+                                kind: ModelDeltaKind::Summary,
+                                content,
+                                ..
+                            } => AdminResponse::Reasoning {
+                                task_id: event.task_id.to_string(),
+                                sequence: event.sequence,
+                                content: shorten(content, 2_000),
+                            },
+                            _ => event_response(&event),
+                        },
+                        _ => event_response(&event),
+                    };
+                    write_response(&mut writer, &response).await?;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
                     write_response(&mut writer, &AdminResponse::Output {
@@ -211,6 +229,15 @@ async fn handle_connection(
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn event_response(event: &koi_core::domain::EventEnvelope) -> AdminResponse {
+    AdminResponse::Event {
+        task_id: event.task_id.to_string(),
+        sequence: event.sequence,
+        message: shorten(&format!("{:?}", event.payload), 2_000),
+    }
 }
 
 #[cfg(unix)]

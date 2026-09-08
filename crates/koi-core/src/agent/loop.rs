@@ -15,10 +15,10 @@ use crate::agent::{
 use crate::domain::{
     AgentEvent, ApprovalGrant, AuthorizationRequest, AuthorizationRequestResult,
     AuthorizedToolInvocation, ControlEvent, EventId, MemoryContextBuilder, MemoryQuery,
-    ModelContextItem, ModelError, ModelErrorKind, ModelEvent, ModelGenerationOptions,
-    ModelInputRole, ModelOutput, ModelOutputContract, ModelRequest, ModelStreamEvent,
-    PermissionCheckResult, PermissionChecker, PermissionLevel, PolicyDecision, TaskId, TaskStatus,
-    ToolCall, ToolDefinition, ToolEvent, ToolResult,
+    ModelContextItem, ModelDeltaKind, ModelError, ModelErrorKind, ModelEvent,
+    ModelGenerationOptions, ModelInputRole, ModelOutput, ModelOutputContract, ModelRequest,
+    ModelStreamEvent, PermissionCheckResult, PermissionChecker, PermissionLevel, PolicyDecision,
+    TaskId, TaskStatus, ToolCall, ToolDefinition, ToolEvent, ToolResult,
 };
 use crate::ports::{
     AuthorizationEvidenceResolver, EventStore, MemoryError, MemoryStore, ModelProvider,
@@ -745,9 +745,20 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                     kind,
                     content,
                 }) => {
-                    // Delta 不写入事件存储，避免历史被 token 级事件淹没；但必须完整
-                    // 写入日志。Responses 的 reasoning summary、Chat Completions 的
-                    // reasoning_content，以及普通文本和工具参数都会从这里留下记录。
+                    // 普通 Delta 不写入事件存储，避免历史被 token 级事件淹没；但供应商
+                    // 返回的推理摘要会持久化，供 Web 与本地管理终端实时展示。它不是隐藏
+                    // 思维链，也不会重新进入后续模型上下文。
+                    if kind == ModelDeltaKind::Summary {
+                        self.record_reasoning_summary(
+                            runtime,
+                            call_started_event_id,
+                            sequence,
+                            &content,
+                        )
+                        .await?;
+                    }
+                    // 所有流式中间输出仍完整写入日志，包括 Responses 的 reasoning
+                    // summary、Chat Completions 的 reasoning_content、文本与工具参数。
                     tracing::debug!(
                         target: "koi.model.reasoning",
                         task_id = %task_id,
@@ -774,6 +785,28 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
         }
 
         Err(AgentLoopError::ModelStreamEndedWithoutCompletion)
+    }
+
+    async fn record_reasoning_summary(
+        &self,
+        runtime: &mut TaskRuntime<S>,
+        call_started_event_id: EventId,
+        sequence: u32,
+        content: &str,
+    ) -> Result<(), AgentLoopError> {
+        runtime
+            .record_with_provenance(
+                AgentEvent::model(ModelEvent::Delta {
+                    call_started_event_id,
+                    sequence,
+                    kind: ModelDeltaKind::Summary,
+                    content: content.into(),
+                }),
+                Some(call_started_event_id),
+                crate::domain::EventProvenance::model(None),
+            )
+            .await?;
+        Ok(())
     }
 
     async fn handle_tool_call(

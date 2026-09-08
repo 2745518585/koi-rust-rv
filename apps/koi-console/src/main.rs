@@ -37,6 +37,11 @@ mod unix_client {
             sequence: u64,
             message: String,
         },
+        Reasoning {
+            task_id: String,
+            sequence: u64,
+            content: String,
+        },
         Shutdown,
     }
 
@@ -177,6 +182,13 @@ mod unix_client {
                 message,
             } => {
                 println!("[event {task_id}#{sequence}] {message}");
+            }
+            AdminResponse::Reasoning {
+                task_id,
+                sequence,
+                content,
+            } => {
+                println!("[reasoning {task_id}#{sequence}] {content}");
             }
             AdminResponse::Shutdown => return Err("服务正在关闭".into()),
         }

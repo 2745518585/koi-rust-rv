@@ -113,6 +113,8 @@ struct ModelConfig {
     #[serde(default)]
     max_output_tokens: Option<u32>,
     reasoning_effort: Option<String>,
+    #[serde(default)]
+    reasoning_summary: Option<String>,
 }
 
 /// Configured provider/model pairs. The pair is the model identity; there is no application alias.
@@ -532,6 +534,9 @@ fn build_model_registry(config: &RuntimeConfig) -> Result<Arc<ModelProviderRegis
             reasoning_effort: model
                 .reasoning_effort
                 .filter(|effort| !effort.trim().is_empty()),
+            reasoning_summary: model
+                .reasoning_summary
+                .filter(|summary| !summary.trim().is_empty()),
             ..ModelGenerationOptions::default()
         };
         registry

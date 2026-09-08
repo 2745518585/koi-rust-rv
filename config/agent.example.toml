@@ -53,6 +53,8 @@ request_timeout_secs = 60
 context_window_tokens = 32768
 max_output_tokens = 4096
 reasoning_effort = "medium"
+# 请求提供方允许公开的推理摘要（不是隐藏思维链）；可选 auto、concise、detailed。
+reasoning_summary = "auto"
 
 [[models.entries]]
 # 同一个模型 ID 可以由不同供应商分别提供；控制事件始终携带两者。
@@ -66,6 +68,7 @@ request_timeout_secs = 30
 context_window_tokens = 16384
 max_output_tokens = 4096
 reasoning_effort = "low"
+reasoning_summary = "auto"
 
 [agent]
 max_steps = 8

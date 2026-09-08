@@ -135,6 +135,11 @@ impl ModelProvider for TwoTurnModel {
                 kind: ModelDeltaKind::Text,
                 content: "临时流式片段".into(),
             }),
+            Ok(ModelStreamEvent::Delta {
+                sequence: 1,
+                kind: ModelDeltaKind::Summary,
+                content: "提供方公开的推理摘要".into(),
+            }),
             Ok(ModelStreamEvent::Completed(koi_core::domain::ModelTurn {
                 outputs,
                 usage: Usage {
@@ -357,10 +362,14 @@ async fn main_loop_records_model_tool_and_final_response() {
         .unwrap();
     assert_eq!(finished.provenance.creator, EventSource::Tool);
     assert_eq!(finished.provenance.authority_parent_event_id, None);
-    assert!(!recorded_events.iter().any(|event| matches!(
+    assert!(recorded_events.iter().any(|event| matches!(
         event.payload,
         AgentEvent::Model(ref model)
-            if matches!(model.as_ref(), koi_core::domain::ModelEvent::Delta { .. })
+            if matches!(model.as_ref(), koi_core::domain::ModelEvent::Delta {
+                kind: ModelDeltaKind::Summary,
+                content,
+                ..
+            } if content == "提供方公开的推理摘要")
     )));
     assert!(!recorded_events.iter().any(|event| matches!(
         event.payload,

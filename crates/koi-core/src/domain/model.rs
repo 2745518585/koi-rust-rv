@@ -57,6 +57,9 @@ pub struct ModelGenerationOptions {
     pub max_output_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub reasoning_effort: Option<String>,
+    /// Optional provider-visible reasoning summary level. This never requests hidden chain of
+    /// thought; it only opts into summaries that the provider is willing to return.
+    pub reasoning_summary: Option<String>,
     pub stream: bool,
     pub allow_parallel_tool_calls: bool,
 }
@@ -67,6 +70,7 @@ impl Default for ModelGenerationOptions {
             max_output_tokens: None,
             temperature: None,
             reasoning_effort: None,
+            reasoning_summary: None,
             stream: true,
             allow_parallel_tool_calls: false,
         }

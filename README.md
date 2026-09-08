@@ -39,7 +39,7 @@ npm run build        # 等价于 tsc --noEmit && vite build，产物输出到 we
 3. 运行 `cargo run -p koi-server`（启动时读取 `config/agent.toml` 与 `config/authorization.toml`）。模型系统提示词内嵌于 `koi-server`（`apps/koi-server/prompts/main.md`、`qq.md`、`child.md`；QQ 片段会组装到主会话提示词），无需额外配置。
 4. 打开浏览器访问 `[server].bind_addr`：先注册 Web 账号，随后把该账号写入 `authorization.toml`（`[[principals]] source="web" subject="<用户名>" permission="Admin"`）并重启服务以管理员身份使用——权限目录仅在启动时加载。
 
-服务同时向控制台和 `[logging].directory` 写入日志。文件按天滚动，默认文件名为 `koi.log.YYYY-MM-DD`，每行是独立 JSON；事件持久化、权限审查、模型请求与响应、工具生命周期和任务调度都会记录。`debug` 级别还会记录供应商原始响应与流式中间输出（包括接口实际返回的 reasoning summary 或 `reasoning_content`）。模型供应商未返回的隐藏思维链无法由 Agent 获取；日志只记录实际收到的数据。
+服务同时向控制台和 `[logging].directory` 写入日志。文件按天滚动，默认文件名为 `koi.log.YYYY-MM-DD`，每行是独立 JSON；事件持久化、权限审查、模型请求与响应、工具生命周期和任务调度都会记录。`debug` 级别还会记录供应商原始响应与流式中间输出（包括接口实际返回的 reasoning summary 或 `reasoning_content`）。为 Responses 模型设置 `reasoning_summary = "auto"` 后，提供方返回的摘要也会实时显示在 Web 事件流和 `koi-console attach` 中。模型供应商未返回的隐藏思维链无法由 Agent 获取；日志只记录实际收到的数据。
 
 ### 本地交互控制台
 

@@ -674,22 +674,31 @@ fn apply_common_request_options(
             body.insert("temperature".into(), Value::Number(value));
         }
     }
-    if let Some(reasoning_effort) = options
+    let reasoning_effort = options
         .reasoning_effort
         .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        match protocol {
-            ModelProtocol::Responses => {
-                body.insert("reasoning".into(), json!({"effort": reasoning_effort}));
+        .filter(|value| !value.trim().is_empty());
+    let reasoning_summary = options
+        .reasoning_summary
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    match protocol {
+        ModelProtocol::Responses if reasoning_effort.is_some() || reasoning_summary.is_some() => {
+            let mut reasoning = Map::new();
+            if let Some(effort) = reasoning_effort {
+                reasoning.insert("effort".into(), Value::String(effort.into()));
             }
-            ModelProtocol::ChatCompletions => {
-                body.insert(
-                    "reasoning_effort".into(),
-                    Value::String(reasoning_effort.into()),
-                );
+            if let Some(summary) = reasoning_summary {
+                reasoning.insert("summary".into(), Value::String(summary.into()));
+            }
+            body.insert("reasoning".into(), Value::Object(reasoning));
+        }
+        ModelProtocol::ChatCompletions => {
+            if let Some(effort) = reasoning_effort {
+                body.insert("reasoning_effort".into(), Value::String(effort.into()));
             }
         }
+        ModelProtocol::Responses => {}
     }
     body.insert("stream".into(), Value::Bool(options.stream));
     body.insert(
@@ -2259,6 +2268,19 @@ mod tests {
                 ..ModelGenerationOptions::default()
             },
         }
+    }
+
+    #[test]
+    fn responses_request_includes_only_provider_visible_reasoning_summary() {
+        let mut request = request(ModelProtocol::Responses, true);
+        request.options.reasoning_effort = Some("medium".into());
+        request.options.reasoning_summary = Some("auto".into());
+
+        let body = build_responses_request("test-model", &request, &[]);
+
+        assert_eq!(body["reasoning"]["effort"], "medium");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert!(body["reasoning"].get("chain_of_thought").is_none());
     }
 
     #[test]
