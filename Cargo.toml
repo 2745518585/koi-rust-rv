@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "apps/koi-console",
+  "apps/koi-model-proxy",
   "apps/koi-server",
   "crates/koi-api",
   "crates/koi-core",

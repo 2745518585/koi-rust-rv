@@ -29,15 +29,28 @@ npm run build        # 等价于 tsc --noEmit && vite build，产物输出到 we
 
 1. 复制 `config/agent.example.toml` 为 `config/agent.toml`（本地运行时文件，已被 Git 忽略），填写：
    - `[server]`：监听地址、Web 构建目录、JSONL 事件目录（`data/events`）、Web 用户库路径（`data/users.json`）、Cookie 是否要求 `Secure`；
-   - `[models]`：`default_provider`/`default_model_id` 与至少一条可用模型条目（供应商、`base_url`、`model_id`、`api_key`、协议、超时与上下文窗口）；支持 OpenAI Responses 与 Chat Completions 两类协议；
+   - `[models]`：独立模型配置文件路径，以及可选的 `[models.proxy]` 代理开关；
    - `[qq]`：QQ 开放平台 AppID/AppSecret（或设置 `QQ_BOT_APP_ID`、`QQ_BOT_APP_SECRET` 环境变量）；不填写凭证时 QQ 来源自动跳过；
    - `[monitor]`：可选的本地基础服务监测；支持 HTTP、TCP 和本机原生服务状态检查；
    - `[alerts]`：外部告警 Webhook 的来源名与密钥；密钥也可以通过 `KOI_ALERT_WEBHOOK_TOKEN` 环境变量提供；
    - `[logging]`：按天滚动的 JSON 日志目录与最低级别；`debug` 会保留完整模型请求、供应商原始响应和流式中间输出；
    - `[usage]`：可选月度预算（当前仅用于展示）。
-2. 复制 `config/authorization.example.toml` 为 `config/authorization.toml`，声明核心身份权限目录：`[source_defaults]` 给出来源的默认身份权限，`[[principals]]` 给出 `(来源, 用户)` 精确身份权限；精确身份优先于来源默认值，未配置的身份按 `None` 失败关闭。该目录是核心权限裁决的依据，外部来源只能提交建议权限、不能改写它。
-3. 运行 `cargo run -p koi-server`（启动时读取 `config/agent.toml` 与 `config/authorization.toml`）。模型系统提示词内嵌于 `koi-server`（`apps/koi-server/prompts/main.md`、`qq.md`、`child.md`；QQ 片段会组装到主会话提示词），无需额外配置。
-4. 打开浏览器访问 `[server].bind_addr`：先注册 Web 账号，随后把该账号写入 `authorization.toml`（`[[principals]] source="web" subject="<用户名>" permission="Admin"`）并重启服务以管理员身份使用——权限目录仅在启动时加载。
+2. 复制 `config/models.example.toml` 为 `config/models.toml`，填写供应商、`base_url`、`model_id`、协议、超时、上下文窗口和 API Key。支持 OpenAI Responses 与 Chat Completions 两类协议。生产环境建议使用 `api_key_file` 指向仅模型进程可读的 `0600` 密钥文件，而不是内联 `api_key`。
+3. 复制 `config/authorization.example.toml` 为 `config/authorization.toml`，声明核心身份权限目录：`[source_defaults]` 给出来源的默认身份权限，`[[principals]]` 给出 `(来源, 用户)` 精确身份权限；精确身份优先于来源默认值，未配置的身份按 `None` 失败关闭。该目录是核心权限裁决的依据，外部来源只能提交建议权限、不能改写它。
+4. 运行 `cargo run -p koi-server`（启动时读取 `config/agent.toml`、`config/models.toml` 与 `config/authorization.toml`）。模型系统提示词内嵌于 `koi-server`（`apps/koi-server/prompts/main.md`、`qq.md`、`child.md`；QQ 片段会组装到主会话提示词），无需额外配置。
+5. 打开浏览器访问 `[server].bind_addr`：先注册 Web 账号，随后把该账号写入 `authorization.toml`（`[[principals]] source="web" subject="<用户名>" permission="Admin"`）并重启服务以管理员身份使用——权限目录仅在启动时加载。
+
+### 独立模型代理
+
+> 本节内容由 AI 生成。
+
+默认模式下，`koi-server` 直接读取 `config/models.toml` 并调用供应商，保持单进程部署行为。若需要让 Web/Agent 服务无法读取上游 API Key，可单独运行 `koi-model-proxy`：代理读取模型配置和密钥，主服务只持有代理调用令牌与公开模型目录。
+
+1. 复制 `config/model-proxy.example.toml` 为 `config/model-proxy.toml`；令牌使用同一份 `KOI_MODEL_PROXY_TOKEN` 环境变量提供给代理与主服务。
+2. 在 `agent.toml` 设置 `[models.proxy] enabled = true`、`base_url = "http://127.0.0.1:9510"`；主服务此时不会读取 `[models].config_path` 指向的文件。
+3. 先运行 `cargo run -p koi-model-proxy -- --config config/model-proxy.toml`，再运行 `cargo run -p koi-server`。
+
+生产部署中应让 `koi-model-proxy` 使用独立系统用户运行，并使 `models.toml`、API Key 文件只对该用户可读。代理默认只监听回环地址；跨主机部署时必须使用 mTLS 或等效的网络认证。代理令牌不是上游 API Key，但持有它的服务仍能使用代理发起模型调用，因此还应配置模型白名单、预算与速率限制。
 
 服务同时向控制台和 `[logging].directory` 写入日志。文件按天滚动，默认文件名为 `koi.log.YYYY-MM-DD`，每行是独立 JSON；事件持久化、权限审查、模型请求与响应、工具生命周期和任务调度都会记录。`debug` 级别还会记录供应商原始响应与流式中间输出（包括接口实际返回的 reasoning summary 或 `reasoning_content`）。为 Responses 模型设置 `reasoning_summary = "auto"` 后，提供方返回的摘要会通过进程内通道实时发送到日志和 `koi-console attach`，不会写入事件存储。模型供应商未返回的隐藏思维链无法由 Agent 获取；日志只记录实际收到的数据。
 
@@ -219,7 +232,7 @@ Web 是仓库内置并默认启用的外部来源（`koi-infra::web_source::KoiW
 - **身份权限**：Web 身份权限不随账号记录保存，而是由核心权限目录决定（`authorization.toml` 中 `source="web"` 的 `source_defaults`/`principals`）；Web 来源在 `IngressSourceRegistry` 中的来源上限为 `Admin`。
 - **能力**：创建/浏览任务与会话事件流、向会话追加输入（含告警类）、请求取消、审批或否决提权请求、对会话发起控制（暂停/恢复/取消/选择模型/修改最低控制权限）、命名与删除任务。任务可见性与可操作性以“会话最低控制权限”为门槛，每个 SSE 事件还会再次复核。
 - **实时推送**：`koi-api` 提供 REST 路由与 SSE 事件流（模型、工具与系统事件经事件存储订阅转发，Web 自身命令事件由 Web 来源直接发布）。
-- **接入方式**：`koi-server` 启动时装配 `ModelProviderRegistry`（[models] 条目）、`TaskManager` 与 `AgentSupervisor`，事件存储为 JSONL 文件（`JsonlEventStore`），单一进程部署。
+- **接入方式**：默认由 `koi-server` 从独立 `models.toml` 装配 `ModelProviderRegistry`、`TaskManager` 与 `AgentSupervisor`，事件存储为 JSONL 文件（`JsonlEventStore`）。启用 `[models.proxy]` 后，模型 Provider 改为受令牌保护的 `koi-model-proxy` 客户端，主服务不读取上游 API Key。
 
 #### qq
 
@@ -262,7 +275,7 @@ QQ 来源对接 QQ 开放平台 Bot API v2：启动后使用 AppID/AppSecret 获
 仓库不提供卸载脚本，手动卸载即可：
 
 1. 停止 `koi-server` 进程（Ctrl+C 或结束进程）；
-2. 删除运行期生成的数据与本地配置：事件目录（`[server].event_store_dir`，默认 `data/events/`）、Web 用户库（`[server].user_store_path`，默认 `data/users.json`）、`config/agent.toml` 与 `config/authorization.toml`（这两个文件本身不入库）；
+2. 删除运行期生成的数据与本地配置：事件目录（`[server].event_store_dir`，默认 `data/events/`）、Web 用户库（`[server].user_store_path`，默认 `data/users.json`）、`config/agent.toml`、`config/models.toml`、`config/model-proxy.toml` 与 `config/authorization.toml`（这些文件本身不入库）；
 3. 可选：清理构建产物（`cargo clean`；删除 `web/dist`，如需前端源码构建则保留 `web/`）。
 
 ## 依赖项

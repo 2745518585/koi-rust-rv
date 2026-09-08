@@ -3,18 +3,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use koi_api::{AlertWebhookPort, WebApi, WebAuth};
-use koi_core::agent::DEFAULT_CONTEXT_WINDOW_TOKENS;
-use koi_core::domain::{
-    EventSource, ModelGenerationOptions, ModelProtocol, ModelSelection, PermissionLevel,
-};
+use koi_core::domain::{EventSource, PermissionLevel};
 use koi_core::ports::{
     EventStore, SourceAuthorizationRegistry, StaticPermissionDirectory, ToolRegistry,
 };
 use koi_infra::event_store::JsonlEventStore;
-use koi_infra::llm::{
-    ModelProviderEntry, ModelProviderRegistry, OpenAiCompatibleModelConfig,
-    OpenAiCompatibleModelProvider,
+use koi_infra::llm::ModelProviderRegistry;
+use koi_infra::model_config::{
+    DEFAULT_MODELS_CONFIG_PATH, ModelsConfig, build_direct_model_registry,
 };
+use koi_infra::model_proxy::{ModelProxyClientConfig, build_proxy_model_registry};
 use koi_infra::qq_source::{QqConfig, QqSource};
 use koi_infra::service_monitor::{ServiceMonitor, ServiceMonitorConfig};
 use koi_infra::web_identity::WebUserStore;
@@ -36,7 +34,8 @@ mod prompts;
 #[derive(Debug, Deserialize)]
 struct RuntimeConfig {
     server: ServerConfig,
-    models: ModelsConfig,
+    #[serde(default)]
+    models: ModelRuntimeConfig,
     #[serde(default)]
     agent: AgentConfig,
     #[serde(default)]
@@ -97,33 +96,42 @@ struct PrincipalPermissionConfig {
     permission: PermissionLevel,
 }
 
+/// 主服务只保留模型配置文件的位置及代理开关；供应商地址和 API Key 位于独立文件。
 #[derive(Clone, Debug, Deserialize)]
-struct ModelConfig {
-    provider: String,
-    base_url: String,
-    model_id: String,
-    api_key: Option<String>,
-    protocol: String,
-    request_timeout_secs: u64,
-    /// 模型上下文窗口上限；兼容旧配置时可由 `max_context_messages` 推导。
-    #[serde(default)]
-    context_window_tokens: Option<u32>,
-    /// 旧版按消息数量限制上下文的配置，仅用于迁移，不再直接控制上下文。
-    #[serde(default)]
-    max_context_messages: Option<usize>,
-    #[serde(default)]
-    max_output_tokens: Option<u32>,
-    reasoning_effort: Option<String>,
-    #[serde(default)]
-    reasoning_summary: Option<String>,
+#[serde(default)]
+struct ModelRuntimeConfig {
+    config_path: PathBuf,
+    proxy: ModelProxyRuntimeConfig,
 }
 
-/// Configured provider/model pairs. The pair is the model identity; there is no application alias.
+impl Default for ModelRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            config_path: PathBuf::from(DEFAULT_MODELS_CONFIG_PATH),
+            proxy: ModelProxyRuntimeConfig::default(),
+        }
+    }
+}
+
+/// 启用后，`koi-server` 不再读取 `config_path`，只使用代理公开的脱敏模型目录。
 #[derive(Clone, Debug, Deserialize)]
-struct ModelsConfig {
-    default_provider: String,
-    default_model_id: String,
-    entries: Vec<ModelConfig>,
+#[serde(default)]
+struct ModelProxyRuntimeConfig {
+    enabled: bool,
+    base_url: String,
+    token: Option<String>,
+    request_timeout_secs: u64,
+}
+
+impl Default for ModelProxyRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: "http://127.0.0.1:9510".into(),
+            token: None,
+            request_timeout_secs: 300,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -277,7 +285,7 @@ async fn run(console_enabled: bool) -> Result<(), ServerError> {
     );
     let permissions = Arc::new(load_authorization_directory()?);
     let prompts = prompts::ServerPromptProvider;
-    let model_registry = build_model_registry(&config)?;
+    let model_registry = build_model_registry(&config.models).await?;
 
     let mut registry = ToolRegistry::default();
     let mut registered = koi_infra::tools::register_builtin_tools(&mut registry)
@@ -490,87 +498,38 @@ fn validate_alert_webhook_source(source: &str) -> Result<(), ServerError> {
     )))
 }
 
-fn parse_model_protocol(raw: &str) -> Result<ModelProtocol, ServerError> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "responses" => Ok(ModelProtocol::Responses),
-        "chat_completions" | "chat-completions" | "chat" => Ok(ModelProtocol::ChatCompletions),
-        other => Err(ServerError::Configuration(format!(
-            "不支持的模型协议：{other}，可选 responses 或 chat_completions"
-        ))),
+async fn build_model_registry(
+    config: &ModelRuntimeConfig,
+) -> Result<Arc<ModelProviderRegistry>, ServerError> {
+    if config.proxy.enabled {
+        let token = config
+            .proxy
+            .token
+            .clone()
+            .filter(|token| !token.trim().is_empty())
+            .or_else(|| {
+                std::env::var("KOI_MODEL_PROXY_TOKEN")
+                    .ok()
+                    .filter(|token| !token.trim().is_empty())
+            })
+            .ok_or_else(|| {
+                ServerError::Configuration(
+                    "[models.proxy] 已启用，但未配置 token 或 KOI_MODEL_PROXY_TOKEN".into(),
+                )
+            })?;
+        return build_proxy_model_registry(ModelProxyClientConfig {
+            base_url: config.proxy.base_url.clone(),
+            token,
+            request_timeout_secs: config.proxy.request_timeout_secs,
+        })
+        .await
+        .map_err(|error| ServerError::ModelProvider(error.to_string()));
     }
-}
 
-fn build_model_registry(config: &RuntimeConfig) -> Result<Arc<ModelProviderRegistry>, ServerError> {
-    if config.models.entries.is_empty() {
-        return Err(ServerError::Configuration(
-            "[models] 至少需要配置一个模型条目".into(),
-        ));
-    }
-    let default_model = ModelSelection::new(
-        config.models.default_provider.clone(),
-        config.models.default_model_id.clone(),
-    )
-    .map_err(|error| ServerError::Configuration(format!("默认模型无效：{error}")))?;
-
-    let mut registry = ModelProviderRegistry::new(default_model)
+    let models = ModelsConfig::load(&config.config_path)
         .map_err(|error| ServerError::Configuration(error.to_string()))?;
-    for model in config.models.entries.clone() {
-        let selection = ModelSelection::new(model.provider.clone(), model.model_id.clone())
-            .map_err(|error| ServerError::Configuration(format!("模型条目无效：{error}")))?;
-        let protocol = parse_model_protocol(&model.protocol)?;
-        let context_window_tokens = configured_context_window_tokens(&model)?;
-        let api_key = model.api_key.filter(|value| !value.trim().is_empty());
-        let provider_config = OpenAiCompatibleModelConfig::new(
-            model.provider.clone(),
-            model.base_url,
-            model.model_id.clone(),
-            api_key,
-        )
-        .with_protocol(protocol)
-        .with_request_timeout_secs(model.request_timeout_secs)
-        .with_context_window_tokens(context_window_tokens);
-        let provider = Arc::new(
-            OpenAiCompatibleModelProvider::new(provider_config)
-                .map_err(|error| ServerError::ModelProvider(format!("{selection}：{error}")))?,
-        );
-        let model_options = ModelGenerationOptions {
-            max_output_tokens: model.max_output_tokens,
-            reasoning_effort: model
-                .reasoning_effort
-                .filter(|effort| !effort.trim().is_empty()),
-            reasoning_summary: model
-                .reasoning_summary
-                .filter(|summary| !summary.trim().is_empty()),
-            ..ModelGenerationOptions::default()
-        };
-        registry
-            .register(
-                selection,
-                ModelProviderEntry::new(provider, model_options, context_window_tokens),
-            )
-            .map_err(|error| ServerError::Configuration(error.to_string()))?;
-    }
-    registry
-        .resolve(None)
-        .map_err(|error| ServerError::Configuration(error.to_string()))?;
-    Ok(Arc::new(registry))
-}
-
-fn configured_context_window_tokens(model: &ModelConfig) -> Result<u32, ServerError> {
-    let configured = model.context_window_tokens.or_else(|| {
-        model
-            .max_context_messages
-            .and_then(|messages| u32::try_from(messages).ok())
-            .map(|messages| messages.saturating_mul(1024))
-    });
-    let tokens = configured.unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS);
-    if tokens == 0 {
-        return Err(ServerError::Configuration(format!(
-            "模型 {}/{} 的 context_window_tokens 必须大于零",
-            model.provider, model.model_id
-        )));
-    }
-    Ok(tokens)
+    build_direct_model_registry(&models)
+        .map_err(|error| ServerError::ModelProvider(error.to_string()))
 }
 
 /// 初始化主会话，或在其上一轮被取消/终止后开启新的工作周期。
@@ -684,7 +643,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_provider_model_entries_and_builds_registry() {
+    fn parses_separate_model_configuration_and_proxy_switch() {
         let config: RuntimeConfig = toml::from_str(
             r#"
                 [server]
@@ -694,24 +653,12 @@ mod tests {
                 user_store_path = "./data/users.json"
                 web_cookie_secure = false
                 [models]
-                default_provider = "deepseek"
-                default_model_id = "deepseek-chat"
+                config_path = "./config/models.toml"
 
-                [[models.entries]]
-                provider = "openai"
-                base_url = "http://127.0.0.1:1/v1"
-                model_id = "gpt-5-mini"
-                protocol = "chat_completions"
-                request_timeout_secs = 60
-                context_window_tokens = 24576
-
-                [[models.entries]]
-                provider = "deepseek"
-                base_url = "http://127.0.0.1:1/v1"
-                model_id = "deepseek-chat"
-                protocol = "responses"
-                request_timeout_secs = 60
-                context_window_tokens = 8192
+                [models.proxy]
+                enabled = true
+                base_url = "http://127.0.0.1:9510"
+                request_timeout_secs = 180
 
                 [monitor]
                 enabled = true
@@ -734,29 +681,11 @@ mod tests {
         assert!(config.monitor.enabled);
         assert_eq!(config.monitor.checks.len(), 1);
         assert_eq!(config.alerts.webhook_source, "webhook");
-
-        let registry = build_model_registry(&config).unwrap();
         assert_eq!(
-            registry.default_model(),
-            &ModelSelection::new("deepseek", "deepseek-chat").unwrap()
+            config.models.config_path,
+            PathBuf::from("./config/models.toml")
         );
-        assert_eq!(
-            registry.model_selections().collect::<Vec<_>>(),
-            [
-                &ModelSelection::new("deepseek", "deepseek-chat").unwrap(),
-                &ModelSelection::new("openai", "gpt-5-mini").unwrap()
-            ]
-        );
-        assert_eq!(
-            registry.resolve(None).unwrap().1.context_window_tokens,
-            8192
-        );
-        assert_eq!(
-            registry
-                .resolve(Some(&ModelSelection::new("openai", "gpt-5-mini").unwrap()))
-                .unwrap()
-                .0,
-            &ModelSelection::new("openai", "gpt-5-mini").unwrap()
-        );
+        assert!(config.models.proxy.enabled);
+        assert_eq!(config.models.proxy.request_timeout_secs, 180);
     }
 }

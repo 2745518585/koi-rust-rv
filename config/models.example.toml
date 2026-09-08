@@ -1,0 +1,30 @@
+# 复制为 models.toml 后填写真实配置。该文件包含 API Key，应保持在 Git 之外。
+default_provider = "openai"
+default_model_id = "gpt-5-mini"
+
+[[entries]]
+provider = "openai"
+base_url = "https://api.openai.com/v1"
+model_id = "gpt-5-mini"
+# 推荐保存为单独文件，并将该文件权限设为仅模型进程可读。
+# api_key_file = "/etc/koi/secrets/openai-api-key"
+# 本地兼容模式也支持内联配置，但不要提交该文件。
+api_key = ""
+protocol = "responses"
+request_timeout_secs = 60
+context_window_tokens = 32768
+max_output_tokens = 4096
+reasoning_effort = "medium"
+reasoning_summary = "auto"
+
+[[entries]]
+provider = "deepseek"
+base_url = "https://api.deepseek.com/v1"
+model_id = "deepseek-chat"
+api_key = ""
+protocol = "responses"
+request_timeout_secs = 30
+context_window_tokens = 16384
+max_output_tokens = 4096
+reasoning_effort = "low"
+reasoning_summary = "auto"

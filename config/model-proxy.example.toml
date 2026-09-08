@@ -1,0 +1,7 @@
+# 复制为 model-proxy.toml，供独立 koi-model-proxy 进程使用。
+[proxy]
+# 默认仅监听回环地址；跨主机部署时应使用 mTLS 或置于受控内网。
+bind_addr = "127.0.0.1:9510"
+models_config_path = "config/models.toml"
+# 推荐通过 KOI_MODEL_PROXY_TOKEN 注入；代理拒绝无令牌启动。
+# token = "replace-with-a-long-random-token"

@@ -919,6 +919,7 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "async-trait",
+ "axum",
  "bytes",
  "chrono",
  "futures-util",
@@ -932,8 +933,22 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
+ "toml",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "koi-model-proxy"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "koi-infra",
+ "serde",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

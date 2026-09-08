@@ -382,7 +382,7 @@ pub enum ModelErrorKind {
 }
 
 /// 由模型 Provider 统一返回的错误。
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Deserialize, Error, Serialize)]
 #[error("模型调用失败（{kind:?}）：{message}")]
 pub struct ModelError {
     pub kind: ModelErrorKind,

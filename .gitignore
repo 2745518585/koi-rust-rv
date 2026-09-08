@@ -6,6 +6,9 @@ data/
 .env
 .env.*
 config/agent.toml
+config/models.toml
+config/model-proxy.toml
+config/model-secrets/
 config/persona.toml
 node_modules/
 web/dist/
