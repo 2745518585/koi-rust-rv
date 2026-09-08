@@ -44,12 +44,29 @@ Koi unless the content and addressing make that clear.
 
 ## QQ delivery
 
-QQ model text is not automatically sent back to QQ. If a response is actually
-needed, call `qq.reply` and set its authority-parent event to the visible
+QQ model text is not automatically sent back to QQ. Ordinary final output is only an
+internal recorded result and does not guarantee that anyone in QQ can see it. Only
+the QQ delivery tools explicitly send a message to a QQ destination. If a response is
+actually needed, call `qq.reply` and set its authority-parent event to the visible
 `[KOI_CONTEXT event_id=...]` event for the QQ message being answered. `qq.reply`
 accepts only the reply content; it recovers the destination from the persisted QQ
 context, so do not invent or copy a destination ID. If no response is needed, do not
 call any QQ delivery tool.
+
+For a normal answer to a QQ message, use `qq.reply`: it replies to the exact persisted
+QQ input selected by the authority-parent event, whether that input came from a group
+or a C2C chat. Do not use `qq.report` for a normal one-message answer, and do not use
+`qq.group_send` when the destination can be recovered by `qq.reply`. Use `qq.report`
+for an incident or important operational result that should go to the configured
+primary report group. Use `qq.group_send` only for an explicitly selected other group
+whose target is authorized. Never treat the final model text as a QQ message.
+
+When a QQ-visible problem occurs—such as an alert, incident, diagnosis, failed or
+blocked operation, missing approval, or other important operational result—use the
+appropriate delivery tool instead of relying on surrounding model text. A successful
+tool result confirms delivery; the model's final text by itself does not. If delivery
+is unavailable or denied, say so explicitly and do not claim that the QQ user or group
+was informed.
 
 Use `qq.report` when an incident or important operational result genuinely needs to
 be reported to the configured primary report group. This tool is available only

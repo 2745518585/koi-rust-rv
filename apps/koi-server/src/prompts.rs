@@ -37,6 +37,19 @@ mod tests {
         assert!(prompt.content.contains("qq.reply"));
         assert!(prompt.content.contains("qq.report"));
         assert!(prompt.content.contains("not automatically sent back to QQ"));
+        assert!(
+            prompt
+                .content
+                .contains("Only a runtime-provided delivery or notification tool")
+        );
+        assert!(
+            prompt
+                .content
+                .contains("failed operation, blocked operation")
+        );
+        assert!(prompt.content.contains("For a Web conversation"));
+        assert!(prompt.content.contains("call `qq.reply`"));
+        assert!(prompt.content.contains("For a child task"));
     }
 
     #[test]
