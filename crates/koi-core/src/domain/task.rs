@@ -89,7 +89,7 @@ impl TaskProjection {
     ///
     /// # Errors
     ///
-    /// 当事件属于其他任务、顺序错误、试图修改终态任务或导致非法状态转换时返回错误。
+    /// 当事件属于其他任务、顺序错误、试图非法修改终态任务或导致非法状态转换时返回错误。
     pub fn apply(&mut self, event: &EventEnvelope) -> Result<(), TaskProjectionError> {
         if event.task_id != self.task_id {
             return Err(TaskProjectionError::WrongTask {
@@ -125,10 +125,20 @@ impl TaskProjection {
             );
         let accepting_terminal_context =
             self.status.is_terminal() && is_cycle_input(&event.payload);
+        // 上下文清理只留下审计边界，不改变任务周期或任务状态；即使当前周期已经终止，
+        // 也必须允许管理员清理模型可见上下文。否则 `context clear` 无法处理已取消或已
+        // 完成的会话。
+        let accepting_terminal_compaction = self.status.is_terminal()
+            && matches!(
+                &event.payload,
+                AgentEvent::Control(control)
+                    if matches!(control.as_ref(), ControlEvent::ContextCompacted { .. })
+            );
         if self.status.is_terminal()
             && !accepting_main_terminal_audit
             && !accepting_terminal_requeue
             && !accepting_terminal_context
+            && !accepting_terminal_compaction
         {
             return Err(TaskProjectionError::TerminalTask(self.status));
         }

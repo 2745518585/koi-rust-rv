@@ -338,3 +338,46 @@ fn any_persistent_session_can_start_a_new_cycle_after_termination() {
         assert_eq!(projection.status, TaskStatus::Queued);
     }
 }
+
+#[tokio::test]
+async fn terminal_session_accepts_context_compaction_audit() {
+    let task_id = TaskId::new();
+    let mut runtime = TaskRuntime::new(MemoryEventStore::default(), task_id);
+
+    runtime
+        .record(
+            AgentEvent::control(ControlEvent::TaskCreated {
+                trigger_event_id: None,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    runtime
+        .record(AgentEvent::control(ControlEvent::TaskQueued), None)
+        .await
+        .unwrap();
+    runtime
+        .record(
+            AgentEvent::control(ControlEvent::TaskCancelled {
+                reason: "测试终止".into(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+    runtime
+        .record(
+            AgentEvent::control(ControlEvent::ContextCompacted {
+                dropped_context_event_ids: vec![EventId::new()],
+                summary: "管理员清理上下文".into(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(runtime.projection().status, TaskStatus::Cancelled);
+    assert_eq!(runtime.projection().last_sequence, 4);
+}
