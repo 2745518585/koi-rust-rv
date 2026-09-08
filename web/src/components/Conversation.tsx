@@ -302,6 +302,11 @@ export function Conversation({
   const modelValue = task.selectedModel
     ? `${task.selectedModel.provider}:${task.selectedModel.modelId}`
     : "";
+  const totalTokens = task.usage.inputTokens + task.usage.outputTokens;
+  const contextWindow = task.contextUsage.contextWindowTokens;
+  const contextPercent = contextWindow
+    ? Math.min(100, Math.round((task.contextUsage.estimatedTokens / contextWindow) * 100))
+    : null;
 
   return (
     <section className="conv">
@@ -313,6 +318,19 @@ export function Conversation({
           <strong className="conv-title">{task.title}</strong>
           <StatusBadge status={task.status} />
           <span className="conv-scope">{scopeLabel(task)}</span>
+        </div>
+        <div className="conv-metrics hide-narrow" aria-label={locale === "en" ? "Token usage" : "Token 用量"}>
+          <span className="conv-metric" title={t("contextUsageHint")}>
+            <b>{t("contextUsage")}</b>
+            {formatTokenCount(task.contextUsage.estimatedTokens)}
+            {contextWindow
+              ? ` / ${formatTokenCount(contextWindow)}${contextPercent === null ? "" : ` (${contextPercent}%)`}`
+              : null}
+          </span>
+          <span className="conv-metric" title={`${t("totalTokenUsage")}：${formatTokenUsageDetail(task)}`}>
+            <b>{t("totalTokenUsage")}</b>
+            {formatTokenCount(totalTokens)}
+          </span>
         </div>
         <select
           className="model-select hide-narrow"
@@ -487,6 +505,14 @@ export function Conversation({
 
 function feedItemKey(item: ConversationFeedItem): string {
   return item.type === "tool-group" ? `tool:${item.proposalEventId}` : item.event.id;
+}
+
+function formatTokenCount(tokens: number): string {
+  return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(tokens);
+}
+
+function formatTokenUsageDetail(task: TaskSummary): string {
+  return `input ${task.usage.inputTokens.toLocaleString()} · output ${task.usage.outputTokens.toLocaleString()} · cached ${task.usage.cachedInputTokens.toLocaleString()} · reasoning ${task.usage.reasoningTokens.toLocaleString()}`;
 }
 
 function ConversationFeedMessage({

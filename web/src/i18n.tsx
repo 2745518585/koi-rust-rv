@@ -48,6 +48,9 @@ const messages = {
     noMessages: "还没有对话内容。",
     allEvents: "全部事件",
     defaultModel: "默认模型",
+    contextUsage: "上下文",
+    totalTokenUsage: "累计 Token",
+    contextUsageHint: "当前事件流的文本上下文估算；不包含系统提示词和工具定义。",
     noTaskTitle: "还没有会话",
     noTaskHint: "创建一个会话，把现场交给 Agent。",
 
@@ -129,6 +132,9 @@ const messages = {
     noMessages: "No messages yet.",
     allEvents: "All events",
     defaultModel: "Default model",
+    contextUsage: "Context",
+    totalTokenUsage: "Total tokens",
+    contextUsageHint: "Estimated text context from the current event stream; system instructions and tool definitions are excluded.",
     noTaskTitle: "No sessions yet",
     noTaskHint: "Create a session to brief the agent.",
 

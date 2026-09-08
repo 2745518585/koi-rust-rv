@@ -297,6 +297,17 @@ pub struct UsageDto {
     pub reasoning_tokens: u64,
 }
 
+/// 当前事件流可注入模型的文本上下文估算。
+///
+/// 该值不包含系统提示词、工具定义和供应商协议包装，因此仅用于 Web 控制台的趋势展示；
+/// 核心在实际调用前仍会按完整请求和模型窗口执行压缩。
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextUsageDto {
+    pub estimated_tokens: u32,
+    pub context_window_tokens: Option<u32>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelSelectionDto {
@@ -320,6 +331,7 @@ pub struct TaskDto {
     pub minimum_control_permission: String,
     pub selected_model: Option<ModelSelectionDto>,
     pub usage: UsageDto,
+    pub context_usage: ContextUsageDto,
     pub event_count: usize,
 }
 
@@ -440,6 +452,8 @@ pub struct DashboardDto {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum WebStreamEvent {
+    #[serde(rename = "task.updated")]
+    TaskUpdated { task: TaskDto },
     #[serde(rename = "event.appended")]
     EventAppended { event: EventDto },
     #[serde(rename = "authorization.requested")]
@@ -450,6 +464,7 @@ impl WebStreamEvent {
     #[must_use]
     pub fn task_id(&self) -> &str {
         match self {
+            Self::TaskUpdated { task } => &task.task_id,
             Self::EventAppended { event } => &event.task_id,
             Self::AuthorizationRequested { request } => &request.task_id,
         }

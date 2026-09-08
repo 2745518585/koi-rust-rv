@@ -198,7 +198,9 @@ async fn run() -> Result<(), ServerError> {
         )
         .map_err(ServerError::WebApi)?
         .with_model_catalog(
-            model_registry.model_selections().cloned(),
+            model_registry
+                .entries()
+                .map(|(selection, entry)| (selection.clone(), entry.context_window_tokens)),
             model_registry.default_model().clone(),
         ),
     );

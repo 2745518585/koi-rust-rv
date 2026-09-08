@@ -4,7 +4,7 @@
 //! the authority for ingress permission assessment, event sequencing, projections, and control
 //! state transitions.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use crate::event_store::JsonlEventStore;
@@ -13,14 +13,15 @@ use async_trait::async_trait;
 use chrono::Utc;
 use koi_api::{
     AppendContextCommand, ApprovalCommand, ApprovalDto, CancellationRequestCommand,
-    CreateTaskCommand, DailyUsageDto, DashboardDto, DeletedTaskDto, ElevationRequestDto, EventDto,
-    HealthDto, ModelSelectionDto, NameTaskCommand, ScopeDto, TaskControlAction, TaskControlCommand,
-    TaskDto, ToolDto, UsageDto, UsageSummaryDto, WEB_SOURCE_NAME, WebApiError, WebCommandPort,
-    WebContextKind, WebEventPort, WebPrincipal, WebQueryPort, WebStreamEvent,
+    ContextUsageDto, CreateTaskCommand, DailyUsageDto, DashboardDto, DeletedTaskDto,
+    ElevationRequestDto, EventDto, HealthDto, ModelSelectionDto, NameTaskCommand, ScopeDto,
+    TaskControlAction, TaskControlCommand, TaskDto, ToolDto, UsageDto, UsageSummaryDto,
+    WEB_SOURCE_NAME, WebApiError, WebCommandPort, WebContextKind, WebEventPort, WebPrincipal,
+    WebQueryPort, WebStreamEvent,
 };
 use koi_core::agent::{
-    ControlExecutionRequest, ControlExecutor, DirectControlAuthority, TaskManager,
-    TaskManagerError, TaskRuntime,
+    ContextAssembler, ControlExecutionRequest, ControlExecutor, DirectControlAuthority,
+    TaskManager, TaskManagerError, TaskRuntime,
 };
 use koi_core::domain::{
     AgentEvent, ApprovalGrant, ContextEnvelope, ContextKind, ContextOrigin, ContextPayload,
@@ -78,6 +79,7 @@ pub struct KoiWebSource {
     events: broadcast::Sender<WebStreamEvent>,
     tools: Vec<ToolDefinition>,
     models: Vec<ModelSelection>,
+    model_context_windows: BTreeMap<ModelSelection, u32>,
     default_model: Option<ModelSelection>,
     monthly_budget_usd: f64,
 }
@@ -123,6 +125,7 @@ impl KoiWebSource {
             events,
             tools,
             models: Vec::new(),
+            model_context_windows: BTreeMap::new(),
             default_model: None,
             monthly_budget_usd,
         })
@@ -135,12 +138,32 @@ impl KoiWebSource {
     #[must_use]
     pub fn with_model_catalog(
         mut self,
-        models: impl IntoIterator<Item = ModelSelection>,
+        models: impl IntoIterator<Item = (ModelSelection, u32)>,
         default_model: ModelSelection,
     ) -> Self {
-        self.models = models.into_iter().collect();
+        self.model_context_windows = models
+            .into_iter()
+            .map(|(selection, window)| (selection, window.max(1)))
+            .collect();
+        self.models = self.model_context_windows.keys().cloned().collect();
         self.default_model = Some(default_model);
         self
+    }
+
+    fn task_dto(
+        &self,
+        task_id: TaskId,
+        events: &[EventEnvelope],
+        projection: &TaskProjection,
+    ) -> TaskDto {
+        let selection = projection
+            .selected_model
+            .as_ref()
+            .or(self.default_model.as_ref());
+        let context_window_tokens = selection
+            .and_then(|model| self.model_context_windows.get(model))
+            .copied();
+        task_dto(task_id, events, projection, context_window_tokens)
     }
 
     fn validate_principal(&self, principal: &WebPrincipal) -> Result<(), WebApiError> {
@@ -170,6 +193,13 @@ impl KoiWebSource {
         let _ = self.events.send(WebStreamEvent::EventAppended {
             event: event_dto(event, &events),
         });
+        // Token 累计与可注入上下文都由完整事件流投影得出；单独推送原始事件不足以
+        // 让前端准确更新会话头部指标，因此同时发送新的任务摘要。
+        if let Ok(runtime) = TaskRuntime::recover(Arc::clone(&self.store), event.task_id).await {
+            let _ = self.events.send(WebStreamEvent::TaskUpdated {
+                task: self.task_dto(event.task_id, &events, runtime.projection()),
+            });
+        }
     }
 
     /// 将非 Web 适配器产生的核心事件转发给 Web UI。
@@ -253,7 +283,7 @@ impl KoiWebSource {
             records.push(TaskRecord {
                 task_id,
                 minimum_control_permission: runtime.projection().minimum_control_permission,
-                summary: task_dto(task_id, &events, runtime.projection()),
+                summary: self.task_dto(task_id, &events, runtime.projection()),
                 events,
             });
         }
@@ -288,7 +318,7 @@ impl KoiWebSource {
         let record = TaskRecord {
             task_id,
             minimum_control_permission: runtime.projection().minimum_control_permission,
-            summary: task_dto(task_id, &events, runtime.projection()),
+            summary: self.task_dto(task_id, &events, runtime.projection()),
             events,
         };
         if !Self::can_access_record(principal, &record) {
@@ -647,7 +677,7 @@ impl WebCommandPort for KoiWebSource {
             .load_task(task_id)
             .await
             .map_err(|error| WebApiError::internal(error.to_string()))?;
-        Ok(task_dto(task_id, &events, created.runtime.projection()))
+        Ok(self.task_dto(task_id, &events, created.runtime.projection()))
     }
 
     async fn append_context(
@@ -834,7 +864,7 @@ impl WebCommandPort for KoiWebSource {
         records[record_index] = TaskRecord {
             task_id: record.task_id,
             minimum_control_permission: runtime.projection().minimum_control_permission,
-            summary: task_dto(record.task_id, &updated_events, runtime.projection()),
+            summary: self.task_dto(record.task_id, &updated_events, runtime.projection()),
             events: updated_events,
         };
         self.approval_dtos(&records, None)
@@ -921,7 +951,7 @@ impl WebCommandPort for KoiWebSource {
             .load_task(task_id)
             .await
             .map_err(|error| WebApiError::internal(error.to_string()))?;
-        Ok(task_dto(task_id, &events, runtime.projection()))
+        Ok(self.task_dto(task_id, &events, runtime.projection()))
     }
 
     /// 命名任务会话。与主会话的 `task.name` 工具走同一管理路径；主会话不可命名。
@@ -951,7 +981,7 @@ impl WebCommandPort for KoiWebSource {
         let runtime = TaskRuntime::recover(Arc::clone(&self.store), task_id)
             .await
             .map_err(|error| WebApiError::internal(error.to_string()))?;
-        Ok(task_dto(task_id, &events, runtime.projection()))
+        Ok(self.task_dto(task_id, &events, runtime.projection()))
     }
 
     /// 删除未在执行中的任务会话。与主会话的 `task.delete` 工具走同一管理路径；主会话不可删除。
@@ -1078,7 +1108,12 @@ fn map_task_manager_error(error: TaskManagerError) -> WebApiError {
     }
 }
 
-fn task_dto(task_id: TaskId, events: &[EventEnvelope], projection: &TaskProjection) -> TaskDto {
+fn task_dto(
+    task_id: TaskId,
+    events: &[EventEnvelope],
+    projection: &TaskProjection,
+    context_window_tokens: Option<u32>,
+) -> TaskDto {
     let last_event = events.last().map(|event| event_dto(event, events));
     let started_at = events.first().map_or_else(
         || Utc::now().to_rfc3339(),
@@ -1112,6 +1147,18 @@ fn task_dto(task_id: TaskId, events: &[EventEnvelope], projection: &TaskProjecti
             output_tokens: projection.usage.output_tokens,
             cached_input_tokens: projection.usage.cached_input_tokens,
             reasoning_tokens: projection.usage.reasoning_tokens,
+        },
+        context_usage: ContextUsageDto {
+            estimated_tokens: ContextAssembler::from_events(
+                task_id,
+                events,
+                &HashSet::new(),
+                projection.minimum_control_permission,
+            )
+            .map_or(0, |context| {
+                ContextAssembler::estimate_context_tokens(&context)
+            }),
+            context_window_tokens,
         },
         event_count: events.len(),
     }
@@ -2096,8 +2143,11 @@ mod tests {
             .unwrap()
             .with_model_catalog(
                 [
-                    ModelSelection::new("openai", "gpt-5-mini").unwrap(),
-                    ModelSelection::new("deepseek", "deepseek-chat").unwrap(),
+                    (ModelSelection::new("openai", "gpt-5-mini").unwrap(), 16_384),
+                    (
+                        ModelSelection::new("deepseek", "deepseek-chat").unwrap(),
+                        32_768,
+                    ),
                 ],
                 ModelSelection::new("openai", "gpt-5-mini").unwrap(),
             ),
@@ -2135,6 +2185,8 @@ mod tests {
                 model_id: "deepseek-chat".into(),
             })
         );
+        assert_eq!(selected.context_usage.context_window_tokens, Some(32_768));
+        assert_eq!(selected.context_usage.estimated_tokens, 0);
         let task_events = store.load_task(task_id).await.unwrap();
         assert!(task_events.iter().any(|event| {
             matches!(

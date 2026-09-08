@@ -38,6 +38,12 @@ export interface UsageTotals {
   reasoningTokens: number;
 }
 
+/** 当前事件流将注入模型的文本上下文估算，不含系统提示词和工具定义。 */
+export interface ContextUsage {
+  estimatedTokens: number;
+  contextWindowTokens: number | null;
+}
+
 export interface ModelSelection {
   provider: string;
   modelId: string;
@@ -57,6 +63,7 @@ export interface TaskSummary {
   minimumControlPermission: PermissionLevel;
   selectedModel: ModelSelection | null;
   usage: UsageTotals;
+  contextUsage: ContextUsage;
   eventCount: number;
 }
 
