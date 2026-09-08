@@ -50,6 +50,18 @@ mod tests {
         assert!(prompt.content.contains("For a Web conversation"));
         assert!(prompt.content.contains("call `qq.reply`"));
         assert!(prompt.content.contains("For a child task"));
+        assert!(
+            prompt
+                .content
+                .contains("all currently visible input events")
+        );
+        assert!(
+            prompt
+                .content
+                .contains("An alert input can therefore authorize a delivery")
+        );
+        assert!(prompt.content.contains("never set the"));
+        assert!(prompt.content.contains("authority parent to `null`"));
     }
 
     #[test]
@@ -58,5 +70,7 @@ mod tests {
             .prompt_for(PromptTaskKind::Child)
             .expect("child prompt");
         assert!(!prompt.content.contains("## QQ source context"));
+        assert!(prompt.content.contains("every visible input event"));
+        assert!(prompt.content.contains("An alert can authorize"));
     }
 }

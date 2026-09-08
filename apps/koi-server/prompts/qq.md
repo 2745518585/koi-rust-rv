@@ -53,6 +53,16 @@ accepts only the reply content; it recovers the destination from the persisted Q
 context, so do not invent or copy a destination ID. If no response is needed, do not
 call any QQ delivery tool.
 
+QQ is not the only possible authority source for a QQ delivery. For `qq.report` or
+`qq.group_send`, a visible Web, Bash, monitoring/alert, or delegated task input may
+be the authority parent when it is the input that caused the report and its
+core-assessed permission is sufficient. The source type of an input does not impose
+a prompt-level restriction on which delivery tool it may authorize; never set the
+authority parent to `null` merely because the event is not a QQ message. The special
+requirement that `qq.reply` use the relevant QQ message exists only because that tool
+recovers its destination from that context, not because other input types are
+generally barred from authorizing delivery.
+
 For a normal answer to a QQ message, use `qq.reply`: it replies to the exact persisted
 QQ input selected by the authority-parent event, whether that input came from a group
 or a C2C chat. Do not use `qq.report` for a normal one-message answer, and do not use
