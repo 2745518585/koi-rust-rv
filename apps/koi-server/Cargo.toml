@@ -12,6 +12,7 @@ koi-api = { path = "../../crates/koi-api" }
 koi-core = { path = "../../crates/koi-core" }
 koi-infra = { path = "../../crates/koi-infra" }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -21,9 +22,6 @@ tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true
 
 [lints]
 workspace = true
