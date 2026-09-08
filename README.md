@@ -11,6 +11,8 @@ Koi Rust Remastered Version，即 koi Rust 重置版，原 koi 实现见 [Pond-I
 
 前置依赖：Rust stable 工具链（见 `rust-toolchain.toml`，edition 2024）。Web 前端（`web/`，Vite + TypeScript + React）需要 Node.js/npm 构建，首次使用前必须先执行下面的构建。
 
+> 目前预实现的运维工具示例**仅提供 Linux 版实现**：它们固定调用 `systemctl`、`journalctl`、`ufw`/`iptables`、`crontab`、`apt`/`dnf`/`apk`、`tar`、`sudo` 等 Linux 命令，只能运行在 Linux 主机上；需要其它平台或自研工具时，请按“工具接口”一节自行实现 `ToolExecutor` 并注册。其中需要提权的变更类工具以 `sudo -n` 调用 sudo，运行服务的系统账号必须配置免密 sudo（sudoers 中 `NOPASSWD`），否则工具会因无法输入密码而失败。
+
 ### 构建 Web 前端
 
 ```bash
@@ -180,6 +182,8 @@ QQ 来源对接 QQ 开放平台 Bot API v2：启动后使用 AppID/AppSecret 获
 
 > 注：本节内容由 AI 生成。
 
+> 目前预实现的运维工具示例**仅提供 Linux 版实现**：它们固定调用 `systemctl`、`journalctl`、`ufw`/`iptables`、`crontab`、`apt`/`dnf`/`apk`、`tar`、`sudo` 等 Linux 命令，只能运行在 Linux 主机上；需要其它平台或自研工具时，请按“工具接口”一节自行实现 `ToolExecutor` 并注册。其中需要提权的变更类工具以 `sudo -n` 调用 sudo，运行服务的系统账号必须配置免密 sudo（sudoers 中 `NOPASSWD`），否则工具会因无法输入密码而失败。
+
 - 文件系统：`fs.read` `fs.list` `fs.stat` `fs.find` `fs.search` `fs.write` `fs.mkdir` `fs.copy` `fs.move` `fs.delete`
 - 主机与系统：`system.info` `system.resources` `system.processes` `system.filesystems` `system.logs` `system.kernel_messages`（只读），任意命令执行 `system.command`（Admin）
 - 网络与 HTTP：`network.interfaces` `network.connections` `network.routes` `network.dns_lookup` `network.port_check` `network.tls_check`、`http.get` `http.request`、`curl.get` `curl.request`
@@ -210,6 +214,7 @@ QQ 来源对接 QQ 开放平台 Bot API v2：启动后使用 AppID/AppSecret 获
 > 注：本节内容由 AI 生成。
 
 - Rust stable 工具链（`rust-toolchain.toml`，edition 2024，workspace 要求 rust-version 1.85）
+- 运行平台：仅 Linux（x86_64 / aarch64），详见「开始」；其他平台不作为支持目标
 - 运行与 Web：`tokio`、`axum`、`tower-http`
 - 数据与标识：`serde` / `serde_json`、`chrono`、`uuid`（事件/任务 ID 使用 v7）
 - 安全与网络客户端：`argon2`（Web 密码哈希）、`rand`、`reqwest`（rustls，模型供应商与 HTTP 工具共用）
