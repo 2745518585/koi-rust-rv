@@ -131,6 +131,19 @@ impl EventStore for JsonlEventStore {
             .map_err(|error| io_error(&error))?;
         writeln!(file, "{serialized}").map_err(|error| io_error(&error))?;
         file.sync_data().map_err(|error| io_error(&error))?;
+        // 事件存储是所有来源和 Agent 生命周期的共同边界。这里记录完整事件 JSON，
+        // 让输入、权限审查、模型输出、工具调用和控制事件都能在单独日志中串联；已知
+        // 凭据字段只在日志副本中脱敏，JSONL 事件本身保持原样以便恢复。
+        let log_event = crate::logging::redact_json_text(&serialized);
+        tracing::info!(
+            target: "koi.event",
+            event_id = %event.id,
+            task_id = %event.task_id,
+            sequence = event.sequence,
+            creator = %event.provenance.creator.as_str(),
+            event_json = %log_event,
+            "事件已持久化"
+        );
         let _ = self.events.send(event.clone());
         Ok(())
     }
@@ -178,7 +191,13 @@ impl EventStore for JsonlEventStore {
         if !path.exists() {
             return Ok(());
         }
-        fs::remove_file(&path).map_err(|error| io_error(&error))
+        fs::remove_file(&path).map_err(|error| io_error(&error))?;
+        tracing::warn!(
+            target: "koi.audit",
+            task_id = %task_id,
+            "任务事件流已删除"
+        );
+        Ok(())
     }
 }
 

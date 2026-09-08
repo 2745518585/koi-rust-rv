@@ -3,6 +3,7 @@
 pub mod alerts;
 pub mod event_store;
 pub mod llm;
+pub(crate) mod logging;
 pub mod qq_source;
 pub mod service_monitor;
 pub mod tools;

@@ -25,6 +25,8 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
+use crate::logging::redact_json_text;
+
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
@@ -315,6 +317,18 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             .validate()
             .map_err(|error| invalid_response(error.to_string()))?;
         let body = self.request_body(&request)?;
+        let body_json = serde_json::to_string(&body)
+            .unwrap_or_else(|error| format!("<模型请求序列化失败：{error}>"));
+        tracing::debug!(
+            target: "koi.model.wire",
+            task_id = %request.task_id,
+            provider = %self.config.provider,
+            model_id = %self.config.model_id,
+            protocol = ?self.config.protocol,
+            endpoint = %self.endpoint,
+            body = %redact_json_text(&body_json),
+            "发送模型协议请求"
+        );
         let mut request_builder = self
             .client
             .post(self.endpoint.clone())
@@ -337,6 +351,15 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             result = request_builder.send() => result.map_err(map_request_error)?,
         };
         let status = response.status();
+        tracing::info!(
+            target: "koi.model.response",
+            task_id = %request.task_id,
+            provider = %self.config.provider,
+            model_id = %self.config.model_id,
+            protocol = ?self.config.protocol,
+            status = %status,
+            "模型服务已返回 HTTP 响应"
+        );
         if !status.is_success() {
             return Err(read_http_error(response, cancel).await);
         }
@@ -365,6 +388,16 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         }
 
         let bytes = read_response_body(response, cancel.clone()).await?;
+        let response_text = String::from_utf8_lossy(&bytes);
+        tracing::debug!(
+            target: "koi.model.wire",
+            task_id = %request.task_id,
+            provider = %self.config.provider,
+            model_id = %self.config.model_id,
+            protocol = ?self.config.protocol,
+            body = %redact_json_text(&response_text),
+            "收到模型完整响应"
+        );
         let value: Value = serde_json::from_slice(&bytes)
             .map_err(|error| invalid_response(format!("响应 JSON 无法解析：{error}")))?;
         let turn = parse_turn(self.config.protocol, &value)?;
@@ -1085,6 +1118,16 @@ impl ModelResponseStream {
         if message.data.trim().is_empty() {
             return;
         }
+        // 先记录原始 SSE 数据，再尝试解析；即使供应商返回了无法解析的事件，也能在
+        // 日志中看到导致失败的原文。reasoning summary 等非核心字段同样在这里保留。
+        tracing::debug!(
+            target: "koi.model.wire",
+            task_id = %self.task_id,
+            protocol = ?self.protocol,
+            event = ?message.event,
+            data = %redact_json_text(&message.data),
+            "收到模型 SSE 事件"
+        );
         let value: Value = match serde_json::from_str(&message.data) {
             Ok(value) => value,
             Err(error) => {
@@ -1132,6 +1175,16 @@ impl ModelResponseStream {
                     if self.accumulator.capture_completed_text(text) {
                         self.delta(ModelDeltaKind::Text, text.to_owned());
                     }
+                }
+            }
+            "response.reasoning_summary_text.delta" => {
+                if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                    self.delta(ModelDeltaKind::Summary, delta.to_owned());
+                }
+            }
+            "response.reasoning_summary_text.done" => {
+                if let Some(summary) = value.get("text").and_then(Value::as_str) {
+                    self.delta(ModelDeltaKind::Summary, summary.to_owned());
                 }
             }
             "response.refusal.delta" => {
@@ -1220,6 +1273,13 @@ impl ModelResponseStream {
             if let Some(content) = text_content(delta.get("content")) {
                 self.accumulator.capture_choice_text(choice_index, &content);
                 self.delta(ModelDeltaKind::Text, content);
+            }
+            if let Some(reasoning) = delta
+                .get("reasoning_content")
+                .or_else(|| delta.get("reasoning"))
+                .and_then(|value| text_content(Some(value)))
+            {
+                self.delta(ModelDeltaKind::Summary, reasoning);
             }
             if let Some(refusal) = delta.get("refusal").and_then(Value::as_str) {
                 self.accumulator
@@ -2062,6 +2122,13 @@ async fn read_http_error(response: reqwest::Response, cancel: CancellationToken)
         Ok(body) => body,
         Err(error) => return error,
     };
+    let body_text = String::from_utf8_lossy(&body);
+    tracing::warn!(
+        target: "koi.model.wire",
+        status = %status,
+        body = %redact_json_text(&body_text),
+        "模型服务返回错误响应体"
+    );
     let detail = serde_json::from_slice::<Value>(&body)
         .ok()
         .and_then(|value| {

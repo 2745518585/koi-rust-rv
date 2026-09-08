@@ -33,10 +33,13 @@ npm run build        # 等价于 tsc --noEmit && vite build，产物输出到 we
    - `[qq]`：QQ 开放平台 AppID/AppSecret（或设置 `QQ_BOT_APP_ID`、`QQ_BOT_APP_SECRET` 环境变量）；不填写凭证时 QQ 来源自动跳过；
    - `[monitor]`：可选的本地基础服务监测；支持 HTTP、TCP 和本机原生服务状态检查；
    - `[alerts]`：外部告警 Webhook 的来源名与密钥；密钥也可以通过 `KOI_ALERT_WEBHOOK_TOKEN` 环境变量提供；
+   - `[logging]`：按天滚动的 JSON 日志目录与最低级别；`debug` 会保留完整模型请求、供应商原始响应和流式中间输出；
    - `[usage]`：可选月度预算（当前仅用于展示）。
 2. 复制 `config/authorization.example.toml` 为 `config/authorization.toml`，声明核心身份权限目录：`[source_defaults]` 给出来源的默认身份权限，`[[principals]]` 给出 `(来源, 用户)` 精确身份权限；精确身份优先于来源默认值，未配置的身份按 `None` 失败关闭。该目录是核心权限裁决的依据，外部来源只能提交建议权限、不能改写它。
 3. 运行 `cargo run -p koi-server`（启动时读取 `config/agent.toml` 与 `config/authorization.toml`）。模型系统提示词内嵌于 `koi-server`（`apps/koi-server/prompts/main.md`、`qq.md`、`child.md`；QQ 片段会组装到主会话提示词），无需额外配置。
 4. 打开浏览器访问 `[server].bind_addr`：先注册 Web 账号，随后把该账号写入 `authorization.toml`（`[[principals]] source="web" subject="<用户名>" permission="Admin"`）并重启服务以管理员身份使用——权限目录仅在启动时加载。
+
+服务同时向控制台和 `[logging].directory` 写入日志。文件按天滚动，默认文件名为 `koi.log.YYYY-MM-DD`，每行是独立 JSON；事件持久化、权限审查、模型请求与响应、工具生命周期和任务调度都会记录。`debug` 级别还会记录供应商原始响应与流式中间输出（包括接口实际返回的 reasoning summary 或 `reasoning_content`）。模型供应商未返回的隐藏思维链无法由 Agent 获取；日志只记录实际收到的数据。
 
 ## 核心用法
 
@@ -52,7 +55,7 @@ npm run build        # 等价于 tsc --noEmit && vite build，产物输出到 we
 
 本项目中核心对外通信以事件形式完成，共抽象为四类事件：
 - 输入事件：向具体会话的输入，需要注入会话上下文。
-- 输出事件：模型的输出，目前不包含模型思维链输出。
+- 输出事件：模型的完整可见输出；流式中间片段不写入事件流，但会写入日志。
 - 工具事件：工具相关事件，包括模型调用工具时发起的事件、工具审查结果、工具返回结果等。
 - 控制事件：既不注入上下文，也不来自模型输出的事件，用于外部发起中断、暂停等或内部包括失败等。
 
@@ -219,7 +222,7 @@ QQ 来源对接 QQ 开放平台 Bot API v2：启动后使用 AppID/AppSecret 获
 - 数据与标识：`serde` / `serde_json`、`chrono`、`uuid`（事件/任务 ID 使用 v7）
 - 安全与网络客户端：`argon2`（Web 密码哈希）、`rand`、`reqwest`（rustls，模型供应商与 HTTP 工具共用）
 - 异步与错误：`async-trait`、`futures-util`、`tokio-util`、`thiserror`
-- 日志：`tracing` / `tracing-subscriber`
+- 日志：`tracing` / `tracing-subscriber` / `tracing-appender`；默认写入控制台和 `data/logs/koi.log.YYYY-MM-DD`，日志中的已知凭据字段会脱敏
 - 持久化：事件存储当前为单进程 JSONL 文件实现（`JsonlEventStore`，`koi-infra::event_store`）；`sqlx`（SQLite）已列入 workspace 依赖，作为后续数据库适配器预留，当前代码未使用
 - Web 前端：`web/`（Vite + TypeScript），构建产物为 `web/dist`，由 `koi-server` 静态托管
 

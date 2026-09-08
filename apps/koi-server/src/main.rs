@@ -24,6 +24,8 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
 
 mod agent_runtime;
 mod prompts;
@@ -42,6 +44,32 @@ struct RuntimeConfig {
     monitor: ServiceMonitorConfig,
     #[serde(default)]
     alerts: AlertConfig,
+    #[serde(default)]
+    logging: LoggingConfig,
+}
+
+/// 服务日志配置。完整模型请求、供应商原始响应和流式中间输出使用 `debug` 级别；
+/// 默认文件过滤器会单独放行这些日志，因此开箱即可复盘一次 Agent 调用。
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+struct LoggingConfig {
+    directory: PathBuf,
+    level: String,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            directory: PathBuf::from("./data/logs"),
+            level: "info,koi.model.wire=debug,koi.model.reasoning=debug,koi.lifecycle=debug".into(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LoggingFileConfig {
+    #[serde(default)]
+    logging: LoggingConfig,
 }
 
 /// 独立于 Agent 与工具配置的静态权限目录文件。
@@ -153,16 +181,86 @@ impl Default for UsageConfig {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    let logging = load_logging_config();
+    let _logging_guard = init_logging(&logging);
     if let Err(error) = run().await {
         tracing::error!(%error, "koi-server 启动失败");
         std::process::exit(1);
     }
 }
 
+/// 初始化控制台与按天滚动的 JSON 文件日志。
+///
+/// `RUST_LOG` 优先于配置文件中的级别，便于临时提高或降低日志量。文件日志使用
+/// 非阻塞写入，避免磁盘抖动拖慢 Agent 主循环；返回的 guard 必须在整个进程期间保持
+/// 存活，否则后台日志写入线程会提前停止。
+fn init_logging(config: &LoggingConfig) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    if let Err(error) = fs::create_dir_all(&config.directory) {
+        eprintln!("创建日志目录 {} 失败：{error}", config.directory.display());
+        let filter = EnvFilter::try_from_default_env()
+            .or_else(|_| EnvFilter::try_new(&config.level))
+            .unwrap_or_else(|_| EnvFilter::new("debug"));
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .init();
+        return None;
+    }
+
+    let file_appender = tracing_appender::rolling::daily(&config.directory, "koi.log");
+    let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+    let console_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let file_filter = EnvFilter::try_new(&config.level).unwrap_or_else(|_| EnvFilter::new("debug"));
+
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_ansi(false)
+                .with_filter(console_filter),
+        )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_target(true)
+                .with_current_span(true)
+                .with_span_list(true)
+                .with_ansi(false)
+                .with_writer(file_writer)
+                .with_filter(file_filter),
+        )
+        .init();
+
+    tracing::info!(
+        target: "koi.lifecycle",
+        log_directory = %config.directory.display(),
+        level = %config.level,
+        "日志系统已启动"
+    );
+    Some(guard)
+}
+
+/// 在完整运行配置加载前读取日志配置；配置不存在或格式不正确时使用安全默认值，
+/// 这样配置错误本身仍能进入控制台日志。
+fn load_logging_config() -> LoggingConfig {
+    let Ok(contents) = fs::read_to_string(RUNTIME_CONFIG_PATH) else {
+        return LoggingConfig::default();
+    };
+    toml::from_str::<LoggingFileConfig>(&contents)
+        .map(|config| config.logging)
+        .unwrap_or_default()
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run() -> Result<(), ServerError> {
     let config = load_runtime_config()?;
+    tracing::debug!(
+        target: "koi.lifecycle",
+        log_directory = %config.logging.directory.display(),
+        log_level = %config.logging.level,
+        "运行配置已加载"
+    );
     let permissions = Arc::new(load_authorization_directory()?);
     let prompts = prompts::ServerPromptProvider;
     let model_registry = build_model_registry(&config)?;

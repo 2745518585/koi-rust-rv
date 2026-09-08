@@ -609,21 +609,37 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
             options: request.model_options.clone(),
         };
         model_request.validate()?;
+        // 规范化请求不包含供应商 API key，可以完整写入日志。它保留系统提示词、模型
+        // 可见上下文、工具 Schema 和生成参数，便于复盘模型为什么产生某个输出。
+        let request_json = serde_json::to_string(&model_request)?;
 
         let descriptor = self.model.descriptor();
+        let provider = descriptor.provider.clone();
+        let model_id = descriptor.model_id.clone();
         let task_id = runtime.projection().task_id;
         let call_started = runtime
             .record_with_provenance(
                 AgentEvent::model(ModelEvent::CallStarted {
                     context_event_ids: context.iter().map(|item| item.event_id).collect(),
                     context_hash: fingerprint(&context)?,
-                    provider: descriptor.provider,
-                    model_id: descriptor.model_id,
+                    provider,
+                    model_id,
                 }),
                 None,
                 crate::domain::EventProvenance::model(None),
             )
             .await?;
+        tracing::info!(
+            target: "koi.model.request",
+            task_id = %task_id,
+            model_call_event_id = %call_started.id,
+            provider = %descriptor.provider,
+            model_id = %descriptor.model_id,
+            context_event_count = context.len(),
+            context_event_ids = ?context.iter().map(|item| item.event_id).collect::<Vec<_>>(),
+            request_json = %request_json,
+            "模型请求已开始"
+        );
         let stream = match self.model.start(model_request, cancel.clone()).await {
             Ok(stream) => stream,
             Err(error) if error.kind == ModelErrorKind::Cancelled => {
@@ -650,7 +666,10 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                 return Err(AgentLoopError::Model(error));
             }
         };
-        let turn = match self.record_model_stream(runtime, stream, cancel).await {
+        let turn = match self
+            .record_model_stream(runtime, stream, call_started.id, cancel)
+            .await
+        {
             Ok(turn) => turn,
             Err(AgentLoopError::Cancelled) => return Err(AgentLoopError::Cancelled),
             Err(error) => {
@@ -697,8 +716,10 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
         &self,
         runtime: &mut TaskRuntime<S>,
         mut stream: crate::ports::ModelEventStream,
+        call_started_event_id: EventId,
         cancel: CancellationToken,
     ) -> Result<crate::domain::ModelTurn, AgentLoopError> {
+        let task_id = runtime.projection().task_id;
         while let Some(item) = stream.next().await {
             if cancel.is_cancelled() {
                 self.record_cancelled(runtime, "模型调用已取消").await?;
@@ -709,13 +730,46 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                     self.record_cancelled(runtime, "模型调用已取消").await?;
                     return Err(AgentLoopError::Cancelled);
                 }
-                Err(error) => return Err(AgentLoopError::Model(error)),
-                Ok(ModelStreamEvent::Delta { .. }) => {
-                    // Delta 仅是供应商传输层的临时片段。当前版本不将其写入事件存储，
-                    // 避免历史会话被 token 级事件淹没；`Completed` 会持久化本次调用的
-                    // 完整输出，作为重放和展示的权威记录。
+                Err(error) => {
+                    tracing::error!(
+                        target: "koi.model.response",
+                        task_id = %task_id,
+                        model_call_event_id = %call_started_event_id,
+                        error = %error,
+                        "模型流返回错误"
+                    );
+                    return Err(AgentLoopError::Model(error));
                 }
-                Ok(ModelStreamEvent::Completed(turn)) => return Ok(turn),
+                Ok(ModelStreamEvent::Delta {
+                    sequence,
+                    kind,
+                    content,
+                }) => {
+                    // Delta 不写入事件存储，避免历史被 token 级事件淹没；但必须完整
+                    // 写入日志。Responses 的 reasoning summary、Chat Completions 的
+                    // reasoning_content，以及普通文本和工具参数都会从这里留下记录。
+                    tracing::debug!(
+                        target: "koi.model.reasoning",
+                        task_id = %task_id,
+                        model_call_event_id = %call_started_event_id,
+                        sequence,
+                        kind = ?kind,
+                        content = %content,
+                        "模型流式中间输出"
+                    );
+                }
+                Ok(ModelStreamEvent::Completed(turn)) => {
+                    tracing::info!(
+                        target: "koi.model.response",
+                        task_id = %task_id,
+                        model_call_event_id = %call_started_event_id,
+                        outputs = ?turn.outputs,
+                        usage = ?turn.usage,
+                        provider_response_id = ?turn.provider_response_id,
+                        "模型调用完成"
+                    );
+                    return Ok(turn);
+                }
             }
         }
 
@@ -987,12 +1041,59 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                     .collect(),
             };
 
+            tracing::info!(
+                target: "koi.authorization",
+                task_id = %task_id,
+                source = %source,
+                approval_request_event_id = %flow.approval_request_event_id,
+                tool_proposal_event_id = %flow.proposal_event_id,
+                tool_name = %flow.tool_call.name,
+                required_permission = ?flow.required_permission,
+                evidence_event_ids = ?request.original_evidence_event_ids,
+                "已向来源请求提权"
+            );
             match provider.request_authorization(request).await {
-                Ok(AuthorizationRequestResult::Pending) => pending = true,
-                Ok(AuthorizationRequestResult::Denied { .. }) | Err(_) => {}
+                Ok(AuthorizationRequestResult::Pending) => {
+                    pending = true;
+                    tracing::info!(
+                        target: "koi.authorization",
+                        task_id = %task_id,
+                        source = %source,
+                        approval_request_event_id = %flow.approval_request_event_id,
+                        "来源已受理提权请求，等待授权事件"
+                    );
+                }
+                Ok(AuthorizationRequestResult::Denied { reason }) => {
+                    tracing::warn!(
+                        target: "koi.authorization",
+                        task_id = %task_id,
+                        source = %source,
+                        approval_request_event_id = %flow.approval_request_event_id,
+                        reason = %reason,
+                        "来源拒绝提权请求"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "koi.authorization",
+                        task_id = %task_id,
+                        source = %source,
+                        approval_request_event_id = %flow.approval_request_event_id,
+                        error = %error,
+                        "来源处理提权请求失败"
+                    );
+                }
                 Ok(AuthorizationRequestResult::Authorized {
                     authorization_event_id,
                 }) => {
+                    tracing::info!(
+                        target: "koi.authorization",
+                        task_id = %task_id,
+                        source = %source,
+                        approval_request_event_id = %flow.approval_request_event_id,
+                        authorization_event_id = %authorization_event_id,
+                        "来源返回授权事件"
+                    );
                     let Ok(authorization) = self
                         .evidence_resolver
                         .resolve(task_id, authorization_event_id)

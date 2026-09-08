@@ -8,6 +8,14 @@ event_store_dir = "./data/events"
 user_store_path = "./data/users.json"
 # Set true whenever the Web console is served over HTTPS.
 web_cookie_secure = false
+
+[logging]
+# 按天滚动的结构化日志目录；相对路径相对于 koi-server 工作目录。
+directory = "./data/logs"
+# debug 会记录完整模型请求、供应商原始响应和流式中间输出（包括 reasoning summary）。
+# `level` 控制持久化文件日志；可用环境变量 RUST_LOG 临时调整控制台日志，例如 RUST_LOG=info。
+level = "debug"
+
 [qq]
 # QQ 开放平台机器人凭证；也可以使用 QQ_BOT_APP_ID / QQ_BOT_APP_SECRET 环境变量。
 app_id = ""
