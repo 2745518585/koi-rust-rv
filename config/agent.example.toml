@@ -49,11 +49,11 @@ request_timeout_secs = 300
 # token = "代理调用令牌；生产环境建议使用 KOI_MODEL_PROXY_TOKEN"
 
 [agent]
-max_steps = 8
-max_concurrent_tasks = 4
-max_tasks_per_server = 2
-task_timeout_secs = 180
-token_budget_per_task = 12000
+max_steps = 128
+max_concurrent_tasks = 8
+max_tasks_per_server = 8
+task_timeout_secs = 3600
+token_budget_per_task = 1200000
 
 # 内置基础服务监测。监测器只在状态变化时向主会话写入 firing/resolved 告警。
 [monitor]
