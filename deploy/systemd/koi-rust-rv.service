@@ -1,0 +1,27 @@
+[Unit]
+Description=Koi Rust Agent Server
+Wants=network-online.target
+Requires=koi-model-proxy.service
+After=network-online.target koi-model-proxy.service
+
+[Service]
+Type=simple
+User=ai
+Group=ai
+WorkingDirectory=/opt/koi-rust-rv
+ExecStart=/opt/koi-rust-rv/target/debug/koi-server --no-console
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGINT
+TimeoutStopSec=30s
+UMask=0027
+RuntimeDirectory=koi-rust-rv
+RuntimeDirectoryMode=0750
+Environment=KOI_ADMIN_SOCKET_PATH=/run/koi-rust-rv/koi-admin.sock
+
+# 主服务需要通过 ai 的既有 sudo 策略执行受控运维工具。
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
