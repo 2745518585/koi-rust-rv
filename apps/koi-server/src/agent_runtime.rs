@@ -20,6 +20,7 @@ use koi_core::ports::{
 };
 use koi_infra::event_store::JsonlEventStore;
 use koi_infra::llm::{ModelProviderEntry, ModelProviderRegistry, ModelRegistryError};
+use tokio::sync::Notify;
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 
@@ -40,6 +41,7 @@ pub struct AgentSupervisor {
     max_concurrent_tasks: usize,
     active: Mutex<HashMap<TaskId, CancellationToken>>,
     last_models: Mutex<HashMap<TaskId, ModelSelection>>,
+    wake: Notify,
 }
 
 impl AgentSupervisor {
@@ -67,6 +69,7 @@ impl AgentSupervisor {
             max_concurrent_tasks: max_concurrent_tasks.max(1),
             active: Mutex::new(HashMap::new()),
             last_models: Mutex::new(HashMap::new()),
+            wake: Notify::new(),
         })
     }
 
@@ -83,6 +86,7 @@ impl AgentSupervisor {
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => break,
+                () = self.wake.notified() => self.tick().await,
                 notification = notifications.recv() => {
                     match notification {
                         Ok(_) => {
@@ -546,6 +550,9 @@ impl AgentSupervisor {
         if let Ok(mut active) = self.active.lock() {
             active.remove(&task_id);
         }
+        // 输入或工具结果可能在本轮运行期间到达；当本轮释放执行槽位后重新扫描，
+        // 避免对应的事件通知已经被“活跃任务”分支消费后留下未处理事件。
+        self.wake.notify_one();
     }
 
     /// 执行周期结束后的统一清理。
