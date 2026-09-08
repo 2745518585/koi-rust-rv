@@ -418,10 +418,7 @@ impl KoiWebSource {
             let mut duplicates = 0;
 
             for alert in alerts {
-                if existing
-                    .iter()
-                    .any(|event| is_duplicate_alert(event, &alert))
-                {
+                if is_duplicate_alert(&existing, &alert) {
                     duplicates += 1;
                     continue;
                 }
@@ -1207,18 +1204,63 @@ fn alert_context(alert: AlertInput) -> Result<ContextEnvelope, WebApiError> {
     })
 }
 
-fn is_duplicate_alert(event: &EventEnvelope, alert: &AlertInput) -> bool {
-    matches!(
-        &event.payload,
-        AgentEvent::Ingress(ingress)
-            if matches!(
-                ingress.as_ref(),
-                IngressEvent::ContextReceived { context, .. }
-                    if context.kind == ContextKind::Alert
-                        && context.origin.source == alert.source
-                        && context.origin.native_event_id == alert.native_event_id
-            )
-    )
+fn is_duplicate_alert(events: &[EventEnvelope], alert: &AlertInput) -> bool {
+    let incoming_state = alert_state(alert);
+    events
+        .iter()
+        .rev()
+        .find_map(|event| {
+            let AgentEvent::Ingress(ingress) = &event.payload else {
+                return None;
+            };
+            let IngressEvent::ContextReceived { context, .. } = ingress.as_ref() else {
+                return None;
+            };
+            if context.kind != ContextKind::Alert
+                || context.origin.source != alert.source
+                || context.origin.source_instance != alert.source_instance
+                || alert_identity(&context.origin.native_event_id)
+                    != alert_identity(&alert.native_event_id)
+            {
+                return None;
+            }
+            Some(alert_state_from_context(context))
+        })
+        .is_some_and(|latest_state| latest_state == incoming_state)
+}
+
+/// Returns the current state of an alert identity rather than treating any historical state as a
+/// duplicate. This allows a new `firing` event after a persisted `resolved` event.
+fn alert_state(alert: &AlertInput) -> &str {
+    alert
+        .labels
+        .get("state")
+        .map(String::as_str)
+        .unwrap_or_else(|| state_from_native_event_id(&alert.native_event_id))
+}
+
+fn alert_state_from_context(context: &ContextEnvelope) -> &str {
+    if let ContextPayload::Alert { labels, .. } = &context.payload {
+        if let Some(state) = labels.get("state") {
+            return state;
+        }
+    }
+    state_from_native_event_id(&context.origin.native_event_id)
+}
+
+fn state_from_native_event_id(native_event_id: &str) -> &str {
+    if native_event_id.ends_with(":resolved") {
+        "resolved"
+    } else {
+        "firing"
+    }
+}
+
+fn alert_identity(native_event_id: &str) -> &str {
+    native_event_id
+        .strip_suffix(":firing")
+        .or_else(|| native_event_id.strip_suffix(":resolved"))
+        .unwrap_or(native_event_id)
 }
 
 /// 校验 Web 请求中携带的建议授权等级。
@@ -2459,14 +2501,58 @@ mod tests {
         assert_eq!(first.event_ids.len(), 1);
 
         let second = source
-            .ingest_alert_webhook(ALERTMANAGER_SOURCE_NAME, payload)
+            .ingest_alert_webhook(ALERTMANAGER_SOURCE_NAME, payload.clone())
             .await
             .unwrap();
         assert_eq!(second.accepted, 0);
         assert_eq!(second.duplicates, 1);
         assert_eq!(second.event_ids, Vec::<String>::new());
 
+        let recovery_payload = serde_json::json!({
+            "status": "resolved",
+            "receiver": "ops",
+            "alerts": [{
+                "status": "resolved",
+                "labels": {
+                    "alertname": "ApiDown",
+                    "severity": "critical",
+                    "service": "api"
+                },
+                "annotations": {"summary": "API 已恢复"},
+                "fingerprint": "alert-1"
+            }]
+        });
+        let recovery = source
+            .ingest_alert_webhook(ALERTMANAGER_SOURCE_NAME, recovery_payload)
+            .await
+            .unwrap();
+        assert_eq!(recovery.accepted, 1);
+        assert_eq!(recovery.duplicates, 0);
+
+        let second_failure = source
+            .ingest_alert_webhook(ALERTMANAGER_SOURCE_NAME, payload)
+            .await
+            .unwrap();
+        assert_eq!(second_failure.accepted, 1);
+        assert_eq!(second_failure.duplicates, 0);
+
         let events = store.load_task(TaskId::MAIN).await.unwrap();
+        let firing_count = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.payload,
+                    AgentEvent::Ingress(ingress)
+                        if matches!(
+                            ingress.as_ref(),
+                            IngressEvent::ContextReceived { context, .. }
+                                if context.kind == ContextKind::Alert
+                                    && context.origin.native_event_id == "alert-1:firing"
+                        )
+                )
+            })
+            .count();
+        assert_eq!(firing_count, 2);
         assert!(events.iter().any(|event| {
             matches!(
                 &event.payload,
@@ -2475,7 +2561,7 @@ mod tests {
                         ingress.as_ref(),
                         IngressEvent::ContextReceived { context, .. }
                             if context.kind == ContextKind::Alert
-                                && context.origin.native_event_id == "alert-1:firing"
+                                && context.origin.native_event_id == "alert-1:resolved"
                     )
             )
         }));
