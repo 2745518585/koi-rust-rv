@@ -12,6 +12,7 @@ use koi_core::agent::{
     ContextAssembler, ControlExecutionRequest, ControlExecutor, DirectControlAuthority, TaskRuntime,
 };
 use koi_core::domain::{ControlEvent, ModelSelection, PermissionLevel, TaskId};
+use koi_core::ports::EventStore;
 use koi_infra::event_store::JsonlEventStore;
 use koi_infra::llm::ModelProviderRegistry;
 use tokio::sync::mpsc;
@@ -318,10 +319,16 @@ impl TerminalConsole {
     }
 
     async fn context_command(&self, args: &[String]) -> Result<ConsoleOutcome, String> {
-        if args.len() != 2 || !args[0].eq_ignore_ascii_case("clear") {
-            return Err("用法：context clear <task_id|all>".into());
+        let (target, all_events) = parse_context_clear_args(args)?;
+        if all_events {
+            if target.eq_ignore_ascii_case("all") {
+                return self.clear_all_event_streams().await;
+            }
+            return Ok(ConsoleOutcome::Continue(
+                self.clear_all_events(parse_task_id(&target)?).await?,
+            ));
         }
-        if args[1].eq_ignore_ascii_case("all") {
+        if target.eq_ignore_ascii_case("all") {
             let task_ids = JsonlEventStore::list_task_ids(self.store.as_ref())
                 .map_err(|error| error.to_string())?;
             let mut results = Vec::new();
@@ -334,8 +341,91 @@ impl TerminalConsole {
             return Ok(ConsoleOutcome::Continue(results.join("\n")));
         }
         Ok(ConsoleOutcome::Continue(
-            self.clear_context(parse_task_id(&args[1])?).await?,
+            self.clear_context(parse_task_id(&target)?).await?,
         ))
+    }
+
+    async fn clear_all_event_streams(&self) -> Result<ConsoleOutcome, String> {
+        let task_ids = JsonlEventStore::list_task_ids(self.store.as_ref())
+            .map_err(|error| error.to_string())?;
+        if task_ids.is_empty() {
+            return Ok(ConsoleOutcome::Continue(
+                "没有已持久化的任务事件流。".into(),
+            ));
+        }
+
+        let mut results = Vec::new();
+        for task_id in task_ids {
+            match self.clear_all_events(task_id).await {
+                Ok(message) => results.push(message),
+                Err(error) => results.push(format!("{task_id}: 跳过（{error}）")),
+            }
+        }
+        Ok(ConsoleOutcome::Continue(results.join("\n")))
+    }
+
+    async fn clear_all_events(&self, task_id: TaskId) -> Result<String, String> {
+        let existing_events = self
+            .store
+            .load_task(task_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if existing_events.is_empty() {
+            if task_id.is_main() {
+                self.supervisor.reset_model_state(task_id);
+                self.initialize_empty_main_session().await?;
+                return Ok("主会话没有历史事件；已创建空会话骨架".into());
+            }
+            return Err("任务事件流不存在".into());
+        }
+        if self.supervisor.is_task_active(task_id) {
+            return Err("任务正在执行；请先 pause 或 cancel，等待其停止".into());
+        }
+        // 先验证事件流可以恢复，避免把损坏的事件流直接当作可清理目标。
+        let _runtime = self.runtime(task_id).await?;
+        self.store
+            .delete_task(task_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.supervisor.reset_model_state(task_id);
+
+        if task_id.is_main() {
+            self.initialize_empty_main_session().await?;
+            tracing::warn!(
+                target: "koi.audit",
+                %task_id,
+                "主会话历史事件已完全清理并重建空会话骨架"
+            );
+            Ok("主会话全部历史事件已删除，并已重建空会话骨架".into())
+        } else {
+            tracing::warn!(
+                target: "koi.audit",
+                %task_id,
+                "子任务全部事件已删除，任务事件流已移除"
+            );
+            Ok(format!("子任务 {task_id} 的全部事件已删除；该任务已移除"))
+        }
+    }
+
+    async fn initialize_empty_main_session(&self) -> Result<(), String> {
+        let mut runtime = TaskRuntime::new(Arc::clone(&self.store), TaskId::MAIN);
+        runtime
+            .record(
+                koi_core::domain::AgentEvent::control(ControlEvent::TaskCreated {
+                    trigger_event_id: None,
+                }),
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        runtime
+            .record(
+                koi_core::domain::AgentEvent::control(ControlEvent::TaskQueued),
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     async fn clear_context(&self, task_id: TaskId) -> Result<String, String> {
@@ -434,6 +524,32 @@ fn required_task(args: &[String]) -> Result<TaskId, String> {
         .and_then(|value| parse_task_id(value))
 }
 
+fn parse_context_clear_args(args: &[String]) -> Result<(String, bool), String> {
+    if args
+        .first()
+        .is_none_or(|command| !command.eq_ignore_ascii_case("clear"))
+    {
+        return Err("用法：context clear <task_id|all> [--all-events]".into());
+    }
+
+    let mut target = None;
+    let mut all_events = false;
+    for argument in &args[1..] {
+        if argument.eq_ignore_ascii_case("--all-events") {
+            if all_events {
+                return Err("--all-events 只能指定一次".into());
+            }
+            all_events = true;
+        } else if target.replace(argument.clone()).is_some() {
+            return Err("context clear 只能接受一个 task_id 或 all".into());
+        }
+    }
+
+    target
+        .map(|target| (target, all_events))
+        .ok_or_else(|| "用法：context clear <task_id|all> [--all-events]".into())
+}
+
 fn parse_task_id(value: &str) -> Result<TaskId, String> {
     if value.eq_ignore_ascii_case("main") {
         return Ok(TaskId::MAIN);
@@ -517,6 +633,7 @@ minimum <task_id> <User|Operator|Admin>  修改最低控制权限\n\
 queue <task_id>                    以系统身份重新入队（任务须空闲）\n\
 complete|fail|expire <task_id> [reason]  写入内部生命周期事件（任务须空闲）\n\
 context clear <task_id|all>        清理模型可见上下文，保留审计事件\n\
+context clear <task_id|all> --all-events  删除全部历史事件（主会话会重建空骨架）\n\
 model reset <task_id|all>          只重置模型供应商的续接状态\n\
 shutdown                           优雅关闭服务\n\
 提示：task_id 可用 main 表示主会话；含空格的原因请使用单引号或双引号。"
@@ -524,7 +641,10 @@ shutdown                           优雅关闭服务\n\
 
 #[cfg(test)]
 mod tests {
-    use super::{console_enabled_from_args, parse_permission, parse_task_id, split_command_line};
+    use super::{
+        console_enabled_from_args, parse_context_clear_args, parse_permission, parse_task_id,
+        split_command_line,
+    };
     use koi_core::domain::{PermissionLevel, TaskId};
 
     #[test]
@@ -554,5 +674,35 @@ mod tests {
     fn explicit_console_option_overrides_non_interactive_detection() {
         assert!(console_enabled_from_args(["--console".into()]).unwrap());
         assert!(!console_enabled_from_args(["--no-console".into()]).unwrap());
+    }
+
+    #[test]
+    fn parses_context_clear_preserve_and_full_modes() {
+        let preserve = ["clear", "main"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parse_context_clear_args(&preserve).unwrap(),
+            ("main".to_owned(), false)
+        );
+
+        let full = ["clear", "--all-events", "main"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parse_context_clear_args(&full).unwrap(),
+            ("main".to_owned(), true)
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_context_clear_targets() {
+        let args = ["clear", "main", "child"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert!(parse_context_clear_args(&args).is_err());
     }
 }

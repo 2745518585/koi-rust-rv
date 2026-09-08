@@ -58,6 +58,7 @@ cancel <task_id> "终止本次执行"
 model <task_id> <provider> <model_id>
 minimum <task_id> <User|Operator|Admin>
 context clear <task_id|all>
+context clear <task_id|all> --all-events
 model reset <task_id|all>
 shutdown
 ```
@@ -65,6 +66,11 @@ shutdown
 `context clear` 不删除 JSONL 审计事件；它写入一个上下文压缩检查点，使此前历史不再进入模型
 上下文，并重置该任务的模型供应商续接状态。为避免影响进行中的模型调用，任务活跃时该命令会
 要求先暂停或取消并等待其停止。
+
+如需为测试彻底清空事件，可显式使用 `context clear <task_id> --all-events`。该模式会删除目标
+任务的全部 JSONL 事件并重置模型续接状态；对主会话会立即重建最小的空会话骨架，对子任务则会
+移除整个任务。`context clear all --all-events` 会对所有已持久化任务执行同样操作，属于不可逆的
+管理员维护操作。
 
 ### 服务模式管理终端
 
