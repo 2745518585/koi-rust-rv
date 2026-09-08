@@ -269,14 +269,7 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
             let grant_matches = authorization.as_ref().map_or(Ok(true), |authorization| {
                 approval_grant_matches_tool_call(&events, authorization, &binding.tool_call, true)
             })?;
-            if !grant_matches {
-                self.deny_tool(
-                    runtime,
-                    binding.proposal_event_id,
-                    "当前操作授权与原始工具负载不一致",
-                )
-                .await?
-            } else {
+            if grant_matches {
                 if let Some(authorization) = authorization {
                     all_evidence.push(authorization);
                 }
@@ -303,6 +296,13 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                             .await?
                     }
                 }
+            } else {
+                self.deny_tool(
+                    runtime,
+                    binding.proposal_event_id,
+                    "当前操作授权与原始工具负载不一致",
+                )
+                .await?
             }
         } else {
             self.deny_tool(runtime, binding.proposal_event_id, "来源方拒绝了工具调用")
@@ -362,6 +362,10 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
             context = self
                 .fit_context_to_budget(runtime, &request, context)
                 .await?;
+            if cancel.is_cancelled() {
+                self.record_cancelled(runtime, "任务已取消").await?;
+                return Ok(AgentRunOutcome::Cancelled);
+            }
             let completed = match self
                 .call_model(runtime, &request, &context, cancel.clone())
                 .await
@@ -406,6 +410,10 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
 
             let available_evidence = context.iter().map(|item| item.event_id).collect();
             for tool_call in tool_calls {
+                if cancel.is_cancelled() {
+                    self.record_cancelled(runtime, "任务已取消").await?;
+                    return Ok(AgentRunOutcome::Cancelled);
+                }
                 match self
                     .handle_tool_call(
                         runtime,
@@ -603,6 +611,7 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
         model_request.validate()?;
 
         let descriptor = self.model.descriptor();
+        let task_id = runtime.projection().task_id;
         let call_started = runtime
             .record_with_provenance(
                 AgentEvent::model(ModelEvent::CallStarted {
@@ -624,6 +633,9 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                 return Err(AgentLoopError::Cancelled);
             }
             Err(error) => {
+                // start 可能在发送请求、读取非流式响应或解析响应时失败；这些路径
+                // 都可能留下 Provider 的上一次工具续接状态，必须在下一次请求前丢弃。
+                self.model.reset_task(task_id);
                 runtime
                     .record_with_provenance(
                         AgentEvent::model(ModelEvent::Failed {
@@ -638,7 +650,32 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                 return Err(AgentLoopError::Model(error));
             }
         };
-        let turn = self.record_model_stream(runtime, stream, cancel).await?;
+        let turn = match self.record_model_stream(runtime, stream, cancel).await {
+            Ok(turn) => turn,
+            Err(AgentLoopError::Cancelled) => return Err(AgentLoopError::Cancelled),
+            Err(error) => {
+                // 流式响应没有 Completed 时，Provider 不能再沿用这次调用的工具
+                // call id；同时持久化模型失败事件，避免最终只看到一个笼统的 TaskFailed。
+                self.model.reset_task(task_id);
+                if matches!(
+                    &error,
+                    AgentLoopError::Model(_) | AgentLoopError::ModelStreamEndedWithoutCompletion
+                ) {
+                    runtime
+                        .record_with_provenance(
+                            AgentEvent::model(ModelEvent::Failed {
+                                call_started_event_id: call_started.id,
+                                error: error.to_string(),
+                            }),
+                            Some(call_started.id),
+                            crate::domain::EventProvenance::model(None),
+                        )
+                        .await?;
+                    self.record_failed(runtime, error.to_string()).await?;
+                }
+                return Err(error);
+            }
+        };
         let completed = runtime
             .record_with_provenance(
                 AgentEvent::model(ModelEvent::Completed {
@@ -1459,6 +1496,9 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
         runtime: &mut TaskRuntime<S>,
         reason: &str,
     ) -> Result<(), AgentLoopError> {
+        // 取消是一次执行周期的边界。任何未完成的模型工具续接关系都不能泄漏到
+        // 下一次用户输入，否则 Chat Completions 会重新携带过期的 tool_call_id。
+        self.model.reset_task(runtime.projection().task_id);
         // 取消令牌没有区分“暂停”与“显式取消”的信息；外部控制可能在当前模型调用
         // 开始后才写入事件流，因此必须以持久化投影为准，不能相信旧内存状态。
         runtime.refresh_projection().await?;

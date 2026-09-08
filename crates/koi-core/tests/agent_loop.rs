@@ -69,7 +69,9 @@ struct TwoTurnModel {
     calls: AtomicUsize,
 }
 
-struct CancelledStartModel;
+struct CancelledStartModel {
+    reset_count: Arc<AtomicUsize>,
+}
 
 #[async_trait]
 impl ModelProvider for CancelledStartModel {
@@ -92,6 +94,10 @@ impl ModelProvider for CancelledStartModel {
             "测试模型调用已取消",
             false,
         ))
+    }
+
+    fn reset_task(&self, _task_id: TaskId) {
+        self.reset_count.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -365,7 +371,10 @@ async fn main_loop_records_model_tool_and_final_response() {
 
 #[tokio::test]
 async fn cancelled_model_call_during_pause_is_not_recorded_as_failure() {
-    let model = CancelledStartModel;
+    let reset_count = Arc::new(AtomicUsize::new(0));
+    let model = CancelledStartModel {
+        reset_count: Arc::clone(&reset_count),
+    };
     let tools = ToolRegistry::default();
     let store = Arc::new(InMemoryEventStore::default());
     let mut setup = TaskRuntime::new(Arc::clone(&store), TaskId::MAIN);
@@ -450,6 +459,7 @@ async fn cancelled_model_call_during_pause_is_not_recorded_as_failure() {
                 )
             })
     );
+    assert_eq!(reset_count.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

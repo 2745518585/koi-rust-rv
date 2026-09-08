@@ -244,7 +244,7 @@ impl OpenAiCompatibleModelProvider {
         &self.config
     }
 
-    /// Drops provider-local tool continuation state for a task.
+    /// 清理任务级 Provider 工具续接状态。
     pub fn reset_task(&self, task_id: TaskId) {
         if let Ok(mut conversations) = self.conversations.lock() {
             conversations.remove(&task_id);
@@ -1291,10 +1291,29 @@ impl ModelResponseStream {
         self.queue.push_back(Ok(ModelStreamEvent::Completed(turn)));
     }
 
+    fn clear_task_state(&self) {
+        if let Ok(mut conversations) = self.conversations.lock() {
+            conversations.remove(&self.task_id);
+        }
+    }
+
     fn fail(&mut self, error: ModelError) {
         if !self.done {
+            // 只有 Completed 才能建立下一轮工具调用的续接关系。取消、超时、传输
+            // 异常和格式错误都不能把未完成的 provider call id 带入下一次请求。
+            self.clear_task_state();
             self.done = true;
             self.queue.push_back(Err(error));
+        }
+    }
+}
+
+impl Drop for ModelResponseStream {
+    fn drop(&mut self) {
+        // 覆盖上层任务被直接 abort、迭代器尚未消费到错误事件等异常退出路径。
+        // 正常完成时 `done` 已经为 true，不会清除刚刚保存的工具续接状态。
+        if !self.done {
+            self.clear_task_state();
         }
     }
 }
@@ -2145,7 +2164,7 @@ fn truncate_message(message: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::StreamExt;
+    use futures_util::{StreamExt, stream};
     use koi_core::domain::{ModelGenerationOptions, PermissionLevel};
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2456,6 +2475,39 @@ mod tests {
                 ..
             }) if name == "service_status" && call_id == "call-1"
         ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_model_stream_clears_pending_tool_state() {
+        let task_id = TaskId::new();
+        let conversations = Arc::new(Mutex::new(HashMap::from([(
+            task_id,
+            ConversationState {
+                pending_tool_calls: vec![PendingToolCall {
+                    id: "call-stale".into(),
+                    name: "service_status".into(),
+                    arguments: "{}".into(),
+                }],
+            },
+        )])));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let body: ResponseBodyStream =
+            stream::pending::<Result<bytes::Bytes, reqwest::Error>>().boxed();
+        let mut response = ModelResponseStream::new(
+            body,
+            ModelProtocol::ChatCompletions,
+            task_id,
+            cancel,
+            Arc::clone(&conversations),
+        );
+
+        let result = response.next_item().await;
+        assert!(matches!(
+            result,
+            Some(Err(error)) if error.kind == ModelErrorKind::Cancelled
+        ));
+        assert!(!conversations.lock().unwrap().contains_key(&task_id));
     }
 
     #[tokio::test]

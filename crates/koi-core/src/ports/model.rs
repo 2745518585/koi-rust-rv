@@ -40,7 +40,10 @@ pub trait ModelProvider: Send + Sync {
         cancel: CancellationToken,
     ) -> Result<ModelEventStream, ModelError>;
 
-    /// Clears provider-local continuation state for a task after its selected model changes.
-    /// Providers without such state can keep the default no-op implementation.
+    /// 清理任务级的 Provider 续接状态。
+    ///
+    /// 当一次模型调用被取消、超时、流异常结束，或者任务执行失败后，调用方会调用此
+    /// 方法。Provider 不得把未完成调用中的工具调用 ID 带入下一次独立模型请求。没有
+    /// 续接状态的 Provider 可以保留默认的空实现。
     fn reset_task(&self, _task_id: TaskId) {}
 }

@@ -179,13 +179,13 @@ impl AgentSupervisor {
             let result = supervisor
                 .execute_initial(task_id, input_events, cancel)
                 .await;
-            if let Err(error) = result {
+            if let Err(error) = &result {
                 tracing::error!(%task_id, %error, "Agent 任务执行失败");
                 supervisor
                     .fail_task_if_needed(task_id, error.to_string())
                     .await;
             }
-            supervisor.finish(task_id);
+            supervisor.finish_run(task_id, &result);
         });
     }
 
@@ -203,13 +203,13 @@ impl AgentSupervisor {
             let result = supervisor
                 .execute_resume(task_id, approval_event_id, input_events, cancel)
                 .await;
-            if let Err(error) = result {
+            if let Err(error) = &result {
                 tracing::error!(%task_id, %error, "审批后的 Agent 任务恢复失败");
                 supervisor
                     .fail_task_if_needed(task_id, error.to_string())
                     .await;
             }
-            supervisor.finish(task_id);
+            supervisor.finish_run(task_id, &result);
         });
     }
 
@@ -228,7 +228,7 @@ impl AgentSupervisor {
             let result = supervisor
                 .execute_main(task_id, input_events, tool_results, cancel)
                 .await;
-            match result {
+            match &result {
                 Ok(outcome) => {
                     if let AgentRunOutcome::StartedChildTask { task_id } = outcome {
                         tracing::info!(%task_id, "主会话已启动子任务，等待结果回传");
@@ -241,7 +241,7 @@ impl AgentSupervisor {
                         .await;
                 }
             }
-            supervisor.finish(task_id);
+            supervisor.finish_run(task_id, &result);
         });
     }
 
@@ -259,13 +259,13 @@ impl AgentSupervisor {
             let result = supervisor
                 .execute_main_resume(task_id, approval_event_id, input_events, cancel)
                 .await;
-            if let Err(error) = result {
+            if let Err(error) = &result {
                 tracing::error!(%task_id, %error, "主会话审批后的恢复失败");
                 supervisor
                     .fail_task_if_needed(task_id, error.to_string())
                     .await;
             }
-            supervisor.finish(task_id);
+            supervisor.finish_run(task_id, &result);
         });
     }
 
@@ -409,6 +409,7 @@ impl AgentSupervisor {
     }
 
     async fn finish_cancelling(&self, task_id: TaskId) {
+        self.models.reset_task(task_id);
         let Ok(mut runtime) = TaskRuntime::recover(Arc::clone(&self.store), task_id).await else {
             return;
         };
@@ -531,6 +532,21 @@ impl AgentSupervisor {
         if let Ok(mut active) = self.active.lock() {
             active.remove(&task_id);
         }
+    }
+
+    /// 执行周期结束后的统一清理。
+    ///
+    /// 等待审批和正常完成都可能需要保留 Provider 的工具续接状态；只有取消或异常
+    /// 结束才可以清理它。这样下一次同一会话输入会获得全新的模型调用边界。
+    fn finish_run(
+        &self,
+        task_id: TaskId,
+        result: &Result<AgentRunOutcome, koi_core::agent::AgentLoopError>,
+    ) {
+        if result.is_err() || matches!(result.as_ref(), Ok(AgentRunOutcome::Cancelled)) {
+            self.models.reset_task(task_id);
+        }
+        self.finish(task_id);
     }
 
     fn is_active(&self, task_id: TaskId) -> bool {
