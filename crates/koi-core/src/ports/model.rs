@@ -4,11 +4,27 @@ use async_trait::async_trait;
 use futures_util::Stream;
 use tokio_util::sync::CancellationToken;
 
-use crate::domain::{ModelError, ModelProviderDescriptor, ModelRequest, ModelStreamEvent, TaskId};
+use crate::domain::{
+    EventId, ModelError, ModelProviderDescriptor, ModelRequest, ModelStreamEvent, TaskId,
+};
 
 /// 模型流中的每一项要么是增量输出，要么是调用完成结果。
 pub type ModelEventStream =
     Pin<Box<dyn Stream<Item = Result<ModelStreamEvent, ModelError>> + Send>>;
+
+/// 非持久化的模型推理摘要观察端口。
+///
+/// 该通道只用于实时日志或管理终端；实现不得把摘要写回任务事件流，也不得把摘要
+/// 当作下一次模型调用的上下文。
+pub trait ModelReasoningSink: Send + Sync {
+    fn publish_reasoning_summary(
+        &self,
+        task_id: TaskId,
+        call_started_event_id: EventId,
+        sequence: u32,
+        content: &str,
+    );
+}
 
 /// 模型供应商适配器的核心端口。
 ///

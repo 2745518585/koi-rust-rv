@@ -19,9 +19,9 @@ use koi_core::domain::{
 };
 use koi_core::ports::{
     AuthorizationError, AuthorizationEvidenceResolver, EventStore, EventStoreError,
-    InMemoryEventStore, ModelEventStream, ModelProvider, PromptError, PromptTaskKind,
-    SourceAuthorizationProvider, SourceAuthorizationRegistry, SystemPrompt, SystemPromptProvider,
-    ToolExecutor, ToolRegistry,
+    InMemoryEventStore, ModelEventStream, ModelProvider, ModelReasoningSink, PromptError,
+    PromptTaskKind, SourceAuthorizationProvider, SourceAuthorizationRegistry, SystemPrompt,
+    SystemPromptProvider, ToolExecutor, ToolRegistry,
 };
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -71,6 +71,25 @@ struct TwoTurnModel {
 
 struct CancelledStartModel {
     reset_count: Arc<AtomicUsize>,
+}
+
+struct TestReasoningSink {
+    summaries: Arc<Mutex<Vec<String>>>,
+}
+
+impl ModelReasoningSink for TestReasoningSink {
+    fn publish_reasoning_summary(
+        &self,
+        _task_id: TaskId,
+        _call_started_event_id: EventId,
+        _sequence: u32,
+        content: &str,
+    ) {
+        self.summaries
+            .try_lock()
+            .expect("reasoning sink lock")
+            .push(content.to_owned());
+    }
 }
 
 #[async_trait]
@@ -297,7 +316,12 @@ async fn main_loop_records_model_tool_and_final_response() {
     };
     let providers = SourceAuthorizationRegistry::default();
     let prompts = TestPromptProvider;
-    let agent = AgentLoop::new(&model, &tools, &resolver, &providers, None, &prompts);
+    let summaries = Arc::new(Mutex::new(Vec::new()));
+    let reasoning_sink = TestReasoningSink {
+        summaries: Arc::clone(&summaries),
+    };
+    let agent = AgentLoop::new(&model, &tools, &resolver, &providers, None, &prompts)
+        .with_reasoning_sink(&reasoning_sink);
 
     let outcome = agent
         .run_main(
@@ -362,15 +386,18 @@ async fn main_loop_records_model_tool_and_final_response() {
         .unwrap();
     assert_eq!(finished.provenance.creator, EventSource::Tool);
     assert_eq!(finished.provenance.authority_parent_event_id, None);
-    assert!(recorded_events.iter().any(|event| matches!(
+    assert!(!recorded_events.iter().any(|event| matches!(
         event.payload,
         AgentEvent::Model(ref model)
             if matches!(model.as_ref(), koi_core::domain::ModelEvent::Delta {
-                kind: ModelDeltaKind::Summary,
-                content,
                 ..
-            } if content == "提供方公开的推理摘要")
+            })
     )));
+    let summaries = summaries.lock().await.clone();
+    assert_eq!(
+        summaries,
+        vec!["提供方公开的推理摘要", "提供方公开的推理摘要"]
+    );
     assert!(!recorded_events.iter().any(|event| matches!(
         event.payload,
         AgentEvent::Control(ref control)

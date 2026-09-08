@@ -12,6 +12,9 @@ use koi_infra::llm::ModelProviderRegistry;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_runtime::AgentSupervisor;
+use crate::model_trace::ModelTrace;
+#[cfg(unix)]
+use crate::model_trace::ReasoningSummary;
 
 #[cfg(unix)]
 use serde::{Deserialize, Serialize};
@@ -24,8 +27,6 @@ use tokio::net::{UnixListener, UnixStream};
 
 #[cfg(unix)]
 use crate::console::{ConsoleOutcome, TerminalConsole};
-#[cfg(unix)]
-use koi_core::domain::{AgentEvent, ModelDeltaKind, ModelEvent};
 
 /// Starts the local administrative socket listener.
 pub fn spawn(
@@ -33,12 +34,13 @@ pub fn spawn(
     store: Arc<JsonlEventStore>,
     models: Arc<ModelProviderRegistry>,
     supervisor: Arc<AgentSupervisor>,
+    reasoning: Arc<ModelTrace>,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     #[cfg(unix)]
     {
         tokio::spawn(async move {
-            if let Err(error) = serve(path, store, models, supervisor, shutdown).await {
+            if let Err(error) = serve(path, store, models, supervisor, reasoning, shutdown).await {
                 tracing::error!(%error, "本地管理套接字已停止");
             }
         })
@@ -46,7 +48,7 @@ pub fn spawn(
 
     #[cfg(not(unix))]
     {
-        let _ = (path, store, models, supervisor, shutdown);
+        let _ = (path, store, models, supervisor, reasoning, shutdown);
         tokio::spawn(async {
             tracing::warn!("当前平台不支持 Unix 管理套接字；请使用进程内 --console 控制台");
         })
@@ -79,6 +81,7 @@ enum AdminResponse {
     },
     Reasoning {
         task_id: String,
+        call_started_event_id: String,
         sequence: u64,
         content: String,
     },
@@ -91,6 +94,7 @@ async fn serve(
     store: Arc<JsonlEventStore>,
     models: Arc<ModelProviderRegistry>,
     supervisor: Arc<AgentSupervisor>,
+    reasoning: Arc<ModelTrace>,
     shutdown: CancellationToken,
 ) -> Result<(), String> {
     prepare_socket_path(&path)?;
@@ -108,6 +112,7 @@ async fn serve(
                     let connection_store = Arc::clone(&store);
                     let connection_models = Arc::clone(&models);
                     let connection_supervisor = Arc::clone(&supervisor);
+                    let connection_reasoning = Arc::clone(&reasoning);
                     let connection_shutdown = shutdown.clone();
                     tokio::spawn(async move {
                         if let Err(error) = handle_connection(
@@ -115,6 +120,7 @@ async fn serve(
                             connection_store,
                             connection_models,
                             connection_supervisor,
+                            connection_reasoning,
                             connection_shutdown,
                         ).await {
                             tracing::debug!(%error, "本地管理客户端已断开");
@@ -159,12 +165,14 @@ async fn handle_connection(
     store: Arc<JsonlEventStore>,
     models: Arc<ModelProviderRegistry>,
     supervisor: Arc<AgentSupervisor>,
+    reasoning: Arc<ModelTrace>,
     shutdown: CancellationToken,
 ) -> Result<(), String> {
     let console = TerminalConsole::new(store.clone(), models, supervisor, shutdown.clone());
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     let mut events = store.subscribe();
+    let mut reasoning_events = reasoning.subscribe();
     write_response(
         &mut writer,
         &AdminResponse::Ready {
@@ -202,26 +210,22 @@ async fn handle_connection(
             },
             event = events.recv() => match event {
                 Ok(event) => {
-                    let response = match &event.payload {
-                        AgentEvent::Model(model) => match model.as_ref() {
-                            ModelEvent::Delta {
-                                kind: ModelDeltaKind::Summary,
-                                content,
-                                ..
-                            } => AdminResponse::Reasoning {
-                                task_id: event.task_id.to_string(),
-                                sequence: event.sequence,
-                                content: shorten(content, 2_000),
-                            },
-                            _ => event_response(&event),
-                        },
-                        _ => event_response(&event),
-                    };
-                    write_response(&mut writer, &response).await?;
+                    write_response(&mut writer, &event_response(&event)).await?;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
                     write_response(&mut writer, &AdminResponse::Output {
                         message: format!("管理事件流落后，已跳过 {count} 条事件"),
+                    }).await?;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
+            summary = reasoning_events.recv() => match summary {
+                Ok(summary) => {
+                    write_response(&mut writer, &reasoning_response(&summary)).await?;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                    write_response(&mut writer, &AdminResponse::Output {
+                        message: format!("推理摘要流落后，已跳过 {count} 个片段"),
                     }).await?;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -237,6 +241,16 @@ fn event_response(event: &koi_core::domain::EventEnvelope) -> AdminResponse {
         task_id: event.task_id.to_string(),
         sequence: event.sequence,
         message: shorten(&format!("{:?}", event.payload), 2_000),
+    }
+}
+
+#[cfg(unix)]
+fn reasoning_response(summary: &ReasoningSummary) -> AdminResponse {
+    AdminResponse::Reasoning {
+        task_id: summary.task_id.to_string(),
+        call_started_event_id: summary.call_started_event_id.to_string(),
+        sequence: u64::from(summary.sequence),
+        content: shorten(&summary.content, 2_000),
     }
 }
 

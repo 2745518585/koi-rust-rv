@@ -24,6 +24,8 @@ use tokio::sync::Notify;
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 
+use crate::model_trace::ModelTrace;
+
 /// 进程内的最小 Agent 运行器。
 ///
 /// 当前版本使用事件存储广播唤醒任务调度，适合课程作业和单进程部署。事件存储仍是唯一
@@ -37,6 +39,7 @@ pub struct AgentSupervisor {
     authorization_providers: Arc<SourceAuthorizationRegistry>,
     prompts: Arc<dyn SystemPromptProvider>,
     task_manager: Arc<TaskManager<Arc<JsonlEventStore>>>,
+    reasoning: Arc<ModelTrace>,
     max_model_turns: u16,
     max_concurrent_tasks: usize,
     active: Mutex<HashMap<TaskId, CancellationToken>>,
@@ -55,6 +58,7 @@ impl AgentSupervisor {
         authorization_providers: Arc<SourceAuthorizationRegistry>,
         prompts: Arc<dyn SystemPromptProvider>,
         task_manager: Arc<TaskManager<Arc<JsonlEventStore>>>,
+        reasoning: Arc<ModelTrace>,
         max_model_turns: u16,
         max_concurrent_tasks: usize,
     ) -> Arc<Self> {
@@ -65,6 +69,7 @@ impl AgentSupervisor {
             authorization_providers,
             prompts,
             task_manager,
+            reasoning,
             max_model_turns: max_model_turns.max(1),
             max_concurrent_tasks: max_concurrent_tasks.max(1),
             active: Mutex::new(HashMap::new()),
@@ -314,6 +319,7 @@ impl AgentSupervisor {
             None,
             self.prompts.as_ref(),
         )
+        .with_reasoning_sink(self.reasoning.as_ref())
     }
 
     fn build_main_agent<'a>(

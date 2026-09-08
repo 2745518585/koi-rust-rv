@@ -22,7 +22,7 @@ use crate::domain::{
 };
 use crate::ports::{
     AuthorizationEvidenceResolver, EventStore, MemoryError, MemoryStore, ModelProvider,
-    SourceAuthorizationRegistry, ToolRegistry,
+    ModelReasoningSink, SourceAuthorizationRegistry, ToolRegistry,
 };
 
 /// 执行一个新 Agent 任务所需的供应商无关输入。
@@ -134,6 +134,7 @@ pub struct AgentLoop<'a, S: EventStore> {
     memory: Option<&'a dyn MemoryStore>,
     prompts: &'a dyn crate::ports::SystemPromptProvider,
     task_manager: Option<&'a TaskManager<S>>,
+    reasoning_sink: Option<&'a dyn ModelReasoningSink>,
 }
 
 impl<'a, S: EventStore> AgentLoop<'a, S> {
@@ -154,6 +155,7 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
             memory,
             prompts,
             task_manager: None,
+            reasoning_sink: None,
         }
     }
 
@@ -161,6 +163,13 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
     #[must_use]
     pub const fn with_task_manager(mut self, task_manager: &'a TaskManager<S>) -> Self {
         self.task_manager = Some(task_manager);
+        self
+    }
+
+    /// 绑定非持久化的推理摘要通道，仅供实时日志或管理终端使用。
+    #[must_use]
+    pub const fn with_reasoning_sink(mut self, sink: &'a dyn ModelReasoningSink) -> Self {
+        self.reasoning_sink = Some(sink);
         self
     }
 
@@ -746,16 +755,17 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                     content,
                 }) => {
                     // 普通 Delta 不写入事件存储，避免历史被 token 级事件淹没；但供应商
-                    // 返回的推理摘要会持久化，供 Web 与本地管理终端实时展示。它不是隐藏
-                    // 思维链，也不会重新进入后续模型上下文。
+                    // 推理摘要只走进程内观察通道，不进入事件存储，也不会重新进入后续
+                    // 模型上下文。
                     if kind == ModelDeltaKind::Summary {
-                        self.record_reasoning_summary(
-                            runtime,
-                            call_started_event_id,
-                            sequence,
-                            &content,
-                        )
-                        .await?;
+                        if let Some(sink) = self.reasoning_sink {
+                            sink.publish_reasoning_summary(
+                                task_id,
+                                call_started_event_id,
+                                sequence,
+                                &content,
+                            );
+                        }
                     }
                     // 所有流式中间输出仍完整写入日志，包括 Responses 的 reasoning
                     // summary、Chat Completions 的 reasoning_content、文本与工具参数。
@@ -785,28 +795,6 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
         }
 
         Err(AgentLoopError::ModelStreamEndedWithoutCompletion)
-    }
-
-    async fn record_reasoning_summary(
-        &self,
-        runtime: &mut TaskRuntime<S>,
-        call_started_event_id: EventId,
-        sequence: u32,
-        content: &str,
-    ) -> Result<(), AgentLoopError> {
-        runtime
-            .record_with_provenance(
-                AgentEvent::model(ModelEvent::Delta {
-                    call_started_event_id,
-                    sequence,
-                    kind: ModelDeltaKind::Summary,
-                    content: content.into(),
-                }),
-                Some(call_started_event_id),
-                crate::domain::EventProvenance::model(None),
-            )
-            .await?;
-        Ok(())
     }
 
     async fn handle_tool_call(

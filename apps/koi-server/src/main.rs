@@ -30,6 +30,7 @@ use tracing_subscriber::prelude::*;
 mod admin_socket;
 mod agent_runtime;
 mod console;
+mod model_trace;
 mod prompts;
 
 #[derive(Debug, Deserialize)]
@@ -368,6 +369,7 @@ async fn run(console_enabled: bool) -> Result<(), ServerError> {
         }
     });
 
+    let reasoning_trace = model_trace::ModelTrace::new();
     let supervisor = agent_runtime::AgentSupervisor::new(
         Arc::clone(&store),
         Arc::clone(&model_registry),
@@ -375,6 +377,7 @@ async fn run(console_enabled: bool) -> Result<(), ServerError> {
         authorization_providers,
         Arc::new(prompts),
         task_manager,
+        Arc::clone(&reasoning_trace),
         config.agent.max_steps,
         config.agent.max_concurrent_tasks,
     );
@@ -396,6 +399,7 @@ async fn run(console_enabled: bool) -> Result<(), ServerError> {
             Arc::clone(&store),
             Arc::clone(&model_registry),
             Arc::clone(&supervisor),
+            Arc::clone(&reasoning_trace),
             shutdown.clone(),
         )
     });

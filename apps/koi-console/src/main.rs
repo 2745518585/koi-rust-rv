@@ -39,7 +39,7 @@ mod unix_client {
         },
         Reasoning {
             task_id: String,
-            sequence: u64,
+            call_started_event_id: String,
             content: String,
         },
         Shutdown,
@@ -92,7 +92,8 @@ mod unix_client {
     async fn run_command(stream: UnixStream, command: &str) -> Result<(), String> {
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
-        print_response(read_response(&mut lines).await?)?;
+        let mut printer = ResponsePrinter::default();
+        printer.print(read_response(&mut lines).await?)?;
         send_command(&mut writer, command).await?;
         loop {
             let response = read_response(&mut lines).await?;
@@ -100,8 +101,9 @@ mod unix_client {
                 response,
                 AdminResponse::Output { .. } | AdminResponse::Error { .. }
             );
-            print_response(response)?;
+            printer.print(response)?;
             if finished {
+                printer.finish_reasoning();
                 return Ok(());
             }
         }
@@ -110,7 +112,8 @@ mod unix_client {
     async fn attach(stream: UnixStream) -> Result<(), String> {
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
-        print_response(read_response(&mut lines).await?)?;
+        let mut printer = ResponsePrinter::default();
+        printer.print(read_response(&mut lines).await?)?;
         println!("输入 help 查看命令，Ctrl+C 断开客户端。\n");
         print_prompt();
         let (sender, mut commands) = mpsc::unbounded_channel();
@@ -123,10 +126,14 @@ mod unix_client {
             tokio::select! {
                 line = lines.next_line() => match line {
                     Ok(Some(line)) => {
-                        print_response(parse_response(&line)?)?;
-                        print_prompt();
+                        if printer.print(parse_response(&line)?)? {
+                            print_prompt();
+                        }
                     }
-                    Ok(None) => return Ok(()),
+                    Ok(None) => {
+                        printer.finish_reasoning();
+                        return Ok(());
+                    }
                     Err(error) => return Err(format!("读取服务端消息失败：{error}")),
                 },
                 command = commands.recv() => if let Some(command) = command {
@@ -170,29 +177,66 @@ mod unix_client {
         serde_json::from_str(line).map_err(|error| format!("服务端响应格式无效：{error}"))
     }
 
-    fn print_response(response: AdminResponse) -> Result<(), String> {
-        match response {
-            AdminResponse::Ready { message } | AdminResponse::Output { message } => {
-                println!("{message}");
+    #[derive(Default)]
+    struct ResponsePrinter {
+        reasoning_key: Option<(String, String)>,
+    }
+
+    impl ResponsePrinter {
+        fn print(&mut self, response: AdminResponse) -> Result<bool, String> {
+            match response {
+                AdminResponse::Ready { message } => {
+                    self.finish_reasoning();
+                    println!("{message}");
+                    Ok(false)
+                }
+                AdminResponse::Output { message } => {
+                    self.finish_reasoning();
+                    println!("{message}");
+                    Ok(true)
+                }
+                AdminResponse::Error { message } => {
+                    self.finish_reasoning();
+                    eprintln!("命令失败：{message}");
+                    Ok(true)
+                }
+                AdminResponse::Event {
+                    task_id,
+                    sequence,
+                    message,
+                } => {
+                    self.finish_reasoning();
+                    println!("[event {task_id}#{sequence}] {message}");
+                    Ok(false)
+                }
+                AdminResponse::Reasoning {
+                    task_id,
+                    call_started_event_id,
+                    content,
+                    ..
+                } => {
+                    let key = (task_id.clone(), call_started_event_id.clone());
+                    if self.reasoning_key.as_ref() != Some(&key) {
+                        self.finish_reasoning();
+                        print!("[reasoning {task_id}] ");
+                        self.reasoning_key = Some(key);
+                    }
+                    print!("{content}");
+                    io::stdout().flush().map_err(|error| error.to_string())?;
+                    Ok(false)
+                }
+                AdminResponse::Shutdown => {
+                    self.finish_reasoning();
+                    Err("服务正在关闭".into())
+                }
             }
-            AdminResponse::Error { message } => eprintln!("命令失败：{message}"),
-            AdminResponse::Event {
-                task_id,
-                sequence,
-                message,
-            } => {
-                println!("[event {task_id}#{sequence}] {message}");
-            }
-            AdminResponse::Reasoning {
-                task_id,
-                sequence,
-                content,
-            } => {
-                println!("[reasoning {task_id}#{sequence}] {content}");
-            }
-            AdminResponse::Shutdown => return Err("服务正在关闭".into()),
         }
-        Ok(())
+
+        fn finish_reasoning(&mut self) {
+            if self.reasoning_key.take().is_some() {
+                println!();
+            }
+        }
     }
 
     fn read_stdin(sender: &mpsc::UnboundedSender<String>) {
