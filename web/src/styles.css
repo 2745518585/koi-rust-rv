@@ -386,12 +386,39 @@ textarea { resize: none; }
 .conv-loading { margin: auto; color: var(--faint); font-size: 12px; }
 
 /* —— 对话气泡 —— */
-.msg { max-width: min(680px, 82%); padding: 9px 13px; border-radius: 12px; box-shadow: var(--shadow-sm); }
+.msg { min-width: 0; max-width: min(680px, 82%); padding: 9px 13px; border-radius: 12px; box-shadow: var(--shadow-sm); flex-shrink: 0; }
 .msg p { margin: 0; font-size: 13px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
 .msg time { display: block; margin-top: 5px; font-family: var(--mono); font-size: 9.5px; }
 
+/* Markdown 正文：限制在自身宽度内，代码块单独横向滚动，避免撑坏气泡布局。 */
+.markdown-content { min-width: 0; max-width: 100%; }
+.markdown-body { min-width: 0; max-width: 100%; color: inherit; font-size: 13px; line-height: 1.65; overflow-wrap: anywhere; word-break: break-word; }
+.markdown-body > :first-child { margin-top: 0; }
+.markdown-body > :last-child { margin-bottom: 0; }
+.markdown-body p { margin: 0 0 0.7em; white-space: normal; }
+.markdown-body ul, .markdown-body ol { margin: 0.35em 0 0.75em; padding-left: 1.5em; }
+.markdown-body li + li { margin-top: 0.2em; }
+.markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4 { margin: 0.8em 0 0.35em; line-height: 1.35; }
+.markdown-body h1 { font-size: 1.25em; }
+.markdown-body h2 { font-size: 1.15em; }
+.markdown-body h3, .markdown-body h4 { font-size: 1.05em; }
+.markdown-body blockquote { margin: 0.65em 0; padding: 0.05em 0 0.05em 0.85em; border-left: 3px solid currentColor; opacity: 0.82; }
+.markdown-body a { color: var(--accent-strong); overflow-wrap: anywhere; }
+.markdown-body code { padding: 0.12em 0.35em; border-radius: 4px; background: rgba(47, 73, 78, 0.09); font-family: var(--mono); font-size: 0.9em; }
+.markdown-body pre { max-width: 100%; margin: 0.7em 0; padding: 9px 10px; overflow: auto; border: 1px solid rgba(93, 117, 121, 0.2); border-radius: 7px; background: rgba(248, 250, 251, 0.88); font-family: var(--mono); font-size: 0.88em; line-height: 1.55; white-space: pre; word-break: normal; }
+.markdown-body pre code { padding: 0; background: transparent; font-size: inherit; }
+.markdown-body table { display: block; max-width: 100%; margin: 0.7em 0; overflow-x: auto; border-collapse: collapse; }
+.markdown-body th, .markdown-body td { padding: 5px 8px; border: 1px solid var(--line); text-align: left; white-space: nowrap; }
+.markdown-body th { background: rgba(230, 243, 240, 0.72); font-weight: 600; }
+.markdown-body hr { margin: 0.9em 0; border: 0; border-top: 1px solid currentColor; opacity: 0.2; }
+.markdown-body input[type="checkbox"] { accent-color: var(--accent); }
+.markdown-body-collapsed { max-height: 280px; overflow: hidden; }
+.markdown-toggle { display: block; margin-top: 8px; padding: 0; border: 0; color: var(--accent-strong); background: transparent; font-size: 11px; font-weight: 600; }
+.markdown-toggle:hover { text-decoration: underline; }
+
 .msg-user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
 .msg-user time { color: rgba(255, 255, 255, 0.72); text-align: right; }
+.msg-user .markdown-body a { color: #fff; }
 
 /* 非当前 Web 用户的输入保留消息气泡和来源署名，避免被误认成自己发送的指令。 */
 .msg-external-input {
@@ -439,6 +466,8 @@ textarea { resize: none; }
   align-items: flex-start;
   gap: 9px;
   align-self: flex-start;
+  min-width: 0;
+  flex-shrink: 0;
   max-width: min(720px, 88%);
   padding: 8px 12px;
   border: 1px dashed #ccd6d9;
@@ -449,6 +478,9 @@ textarea { resize: none; }
 .msg-tool-copy { min-width: 0; flex: 1; }
 .msg-tool-copy strong { display: block; color: #45555f; font-family: var(--mono); font-size: 10.5px; font-weight: 500; }
 .msg-tool-copy p { margin: 3px 0 0; color: var(--muted); font-size: 12px; line-height: 1.55; }
+.msg-tool-content { color: var(--muted); font-size: 12px; line-height: 1.55; }
+.msg-tool-content .markdown-body { font-size: inherit; line-height: inherit; }
+.msg-tool-content .markdown-toggle { color: var(--accent-strong); }
 .msg-tool time { margin-top: 2px; color: var(--faint); font-family: var(--mono); font-size: 9px; white-space: nowrap; }
 .msg-tool-group-head { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
 .msg-tool-group-head strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

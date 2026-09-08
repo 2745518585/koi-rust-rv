@@ -26,6 +26,7 @@ import {
   suggestedPermissionOptions,
 } from "../lib/ui";
 import { ApprovalCard } from "./ApprovalCard";
+import { MarkdownContent } from "./MarkdownContent";
 
 type FeedMode = "conversation" | "events";
 
@@ -546,7 +547,10 @@ function ToolEventGroupMessage({ events }: { events: TaskEvent[] }) {
           <strong>{proposal.summary}</strong>
           <span className="msg-tool-group-status">{latest.title}</span>
         </div>
-        <p>{latest.id === proposal.id ? proposal.title : latest.summary}</p>
+        <MarkdownContent
+          className="msg-tool-content"
+          content={latest.id === proposal.id ? proposal.title : latest.detail ?? latest.summary}
+        />
         {detailEvents.length ? (
           <details className="msg-tool-details">
             <summary>已合并 {events.length} 个工具事件</summary>
@@ -556,7 +560,7 @@ function ToolEventGroupMessage({ events }: { events: TaskEvent[] }) {
                   <strong>
                     {event.sequence.toString().padStart(3, "0")} · {event.title}
                   </strong>
-                  <span>{event.summary}</span>
+                  <MarkdownContent content={event.detail ?? event.summary} />
                 </div>
               ))}
             </div>
@@ -612,7 +616,7 @@ function ConversationMessage({ event, currentUsername }: { event: TaskEvent; cur
     return (
       <article className={ownInput ? "msg msg-user" : "msg msg-external-input"}>
         {!ownInput ? <strong className="msg-source">{sourceLabel}</strong> : null}
-        <p>{event.summary}</p>
+        <MarkdownContent content={event.detail ?? event.summary} />
         <time>{formatRelative(event.occurredAt, locale)}</time>
       </article>
     );
@@ -625,7 +629,7 @@ function ConversationMessage({ event, currentUsername }: { event: TaskEvent; cur
         </span>
         <div className="msg-tool-copy">
           <strong>{event.title}</strong>
-          <p>{event.summary}</p>
+          <MarkdownContent className="msg-tool-content" content={event.detail ?? event.summary} />
         </div>
         <time>{formatRelative(event.occurredAt, locale)}</time>
       </article>
@@ -635,7 +639,7 @@ function ConversationMessage({ event, currentUsername }: { event: TaskEvent; cur
   return (
     <article className={`msg msg-agent ${failed ? "msg-agent-error" : ""}`}>
       {failed ? <strong>{event.title}</strong> : null}
-      <p>{event.summary}</p>
+      <MarkdownContent content={event.detail ?? event.summary} />
       <time>{formatRelative(event.occurredAt, locale)}</time>
     </article>
   );

@@ -86,6 +86,8 @@ const messages = {
     elevationDeny: "拒绝",
     elevationApprove: "批准操作",
     elevationQueue: "另有 {{count}} 个提权请求等待处理",
+    expandContent: "展开内容",
+    collapseContent: "收起内容",
   },
   en: {
     language: "中文",
@@ -170,6 +172,8 @@ const messages = {
     elevationDeny: "Deny",
     elevationApprove: "Approve operation",
     elevationQueue: "{{count}} more authorization requests are waiting",
+    expandContent: "Expand content",
+    collapseContent: "Collapse content",
   },
 } as const;
 
