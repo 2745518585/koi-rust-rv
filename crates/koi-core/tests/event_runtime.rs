@@ -381,3 +381,62 @@ async fn terminal_session_accepts_context_compaction_audit() {
     assert_eq!(runtime.projection().status, TaskStatus::Cancelled);
     assert_eq!(runtime.projection().last_sequence, 4);
 }
+
+#[tokio::test]
+async fn terminal_session_accepts_configuration_for_next_cycle() {
+    let task_id = TaskId::new();
+    let mut runtime = TaskRuntime::new(MemoryEventStore::default(), task_id);
+
+    runtime
+        .record(
+            AgentEvent::control(ControlEvent::TaskCreated {
+                trigger_event_id: None,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    runtime
+        .record(AgentEvent::control(ControlEvent::TaskQueued), None)
+        .await
+        .unwrap();
+    runtime
+        .record(
+            AgentEvent::control(ControlEvent::TaskCancelled {
+                reason: "测试终止".into(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+    runtime
+        .record(
+            AgentEvent::control(ControlEvent::ModelSelected {
+                provider: "deepseek".into(),
+                model_id: "deepseek-chat".into(),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    runtime
+        .record(
+            AgentEvent::control(ControlEvent::MinimumControlPermissionChanged {
+                minimum_permission: PermissionLevel::Operator,
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(runtime.projection().status, TaskStatus::Cancelled);
+    assert_eq!(
+        runtime.projection().selected_model,
+        Some(koi_core::domain::ModelSelection::new("deepseek", "deepseek-chat").unwrap())
+    );
+    assert_eq!(
+        runtime.projection().minimum_control_permission,
+        PermissionLevel::Operator
+    );
+}

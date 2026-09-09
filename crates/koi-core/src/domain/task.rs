@@ -141,11 +141,24 @@ impl TaskProjection {
                 AgentEvent::Control(control)
                     if matches!(control.as_ref(), ControlEvent::ContextCompacted { .. })
             );
+        // 模型选择和最低控制权限是会话配置，不属于上一轮执行周期的终态结果。
+        // 终态会话仍然可以追加这些配置，下一条输入再通过 TaskQueued 开启新周期。
+        let accepting_terminal_configuration = self.status.is_terminal()
+            && matches!(
+                &event.payload,
+                AgentEvent::Control(control)
+                    if matches!(
+                        control.as_ref(),
+                        ControlEvent::ModelSelected { .. }
+                            | ControlEvent::MinimumControlPermissionChanged { .. }
+                    )
+            );
         if self.status.is_terminal()
             && !accepting_main_terminal_audit
             && !accepting_terminal_requeue
             && !accepting_terminal_context
             && !accepting_terminal_compaction
+            && !accepting_terminal_configuration
         {
             return Err(TaskProjectionError::TerminalTask(self.status));
         }
