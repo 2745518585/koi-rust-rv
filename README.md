@@ -53,6 +53,12 @@ npm run build        # 等价于 tsc --noEmit && vite build，产物输出到 we
 
 生产部署中应让 `koi-model-proxy` 使用独立系统用户运行，并使 `models.toml`、API Key 文件只对该用户可读。代理默认只监听回环地址；跨主机部署时必须使用 mTLS 或等效的网络认证。代理令牌不是上游 API Key，但持有它的服务仍能使用代理发起模型调用，因此还应配置模型白名单、预算与速率限制。
 
+### GitHub Actions CI
+
+仓库内的 `.github/workflows/ci.yml` 会在 Push 和 Pull Request 上执行 Rust 格式检查、workspace
+检查、Clippy、全量测试和 Web 构建。CI 使用 `Cargo.lock`、Rust 工具链和 `package-lock.json`
+缓存，以便尽早发现核心逻辑或前端构建回归；它不读取或上传 `config/`、`data/` 中的运行期配置和密钥。
+
 ### 用量与计费
 
 每次 Responses 或 Chat Completions 调用完成后，核心保存供应商响应中的输入 Token、输出 Token
