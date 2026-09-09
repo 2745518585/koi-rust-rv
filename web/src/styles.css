@@ -103,10 +103,7 @@ textarea { resize: none; }
 .side-new-button { width: 100%; }
 
 .side-usage {
-  display: grid;
-  gap: 5px;
   margin: 0 12px 4px;
-  padding: 9px 10px;
   border: 1px solid var(--line);
   border-radius: 9px;
   background: var(--bg);
@@ -114,6 +111,20 @@ textarea { resize: none; }
   font-family: var(--mono);
   font-size: 9.5px;
 }
+.side-usage-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 9px 10px;
+  color: var(--muted);
+  cursor: pointer;
+  list-style: none;
+}
+.side-usage-summary::-webkit-details-marker { display: none; }
+.side-usage-summary svg { color: var(--faint); transition: transform 0.15s ease; }
+.side-usage[open] .side-usage-summary svg { transform: rotate(180deg); }
+.side-usage-body { display: grid; gap: 5px; padding: 0 10px 9px; }
 .side-usage-head,
 .side-usage-line { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .side-usage-head strong { color: var(--accent-strong); font-size: 11px; }
@@ -356,13 +367,27 @@ textarea { resize: none; }
 .conv-head-main { display: flex; align-items: center; gap: 9px; min-width: 0; flex: 1; }
 .conv-title { overflow: hidden; font-size: 13.5px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .conv-scope { overflow: hidden; color: var(--faint); font-family: var(--mono); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.conv-metrics { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-family: var(--mono); font-size: 10px; white-space: nowrap; }
+.conv-context-metric,
+.conv-usage-summary { display: inline-flex; align-items: baseline; gap: 4px; color: var(--muted); font-family: var(--mono); font-size: 10px; white-space: nowrap; }
+.conv-context-metric { flex-shrink: 0; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
+.conv-context-metric b { color: var(--faint); font-weight: 600; }
+.conv-usage-details { position: relative; flex-shrink: 0; color: var(--muted); font-family: var(--mono); font-size: 10px; }
+.conv-usage-summary { align-items: center; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); cursor: pointer; list-style: none; }
+.conv-usage-summary::-webkit-details-marker { display: none; }
+.conv-usage-summary svg { color: var(--faint); transition: transform 0.15s ease; }
+.conv-usage-details[open] .conv-usage-summary { border-color: #cfe5e0; color: var(--accent-strong); background: var(--accent-soft); }
+.conv-usage-details[open] .conv-usage-summary svg { transform: rotate(180deg); }
+.conv-usage-panel { position: absolute; top: calc(100% + 6px); right: 0; z-index: 20; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; min-width: 310px; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); box-shadow: var(--shadow-md); }
 .conv-metric { display: inline-flex; align-items: baseline; gap: 4px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
 .conv-metric b { color: var(--faint); font-weight: 600; }
 .conv-metric-danger { border-color: #e7b9b6; color: var(--danger); background: var(--danger-soft); }
 .conv-metric-danger b { color: var(--danger); }
+.conv-usage-panel .conv-metric { min-width: 0; }
 .conv-month-usage { color: var(--muted); font-family: var(--mono); font-size: 10px; white-space: nowrap; }
 .conv-month-usage b { margin-right: 4px; color: var(--faint); font-weight: 600; }
+.conv-usage-breakdown,
+.conv-usage-pricing { grid-column: 1 / -1; overflow: hidden; color: var(--faint); font-family: var(--mono); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.conv-usage-pricing { color: var(--muted); }
 
 .model-select {
   height: 29px;
@@ -470,7 +495,6 @@ textarea { resize: none; }
   box-shadow: none;
 }
 .msg-agent time { color: var(--faint); }
-.msg-usage { display: block; margin-top: 6px; color: var(--faint); font-family: var(--mono); font-size: 9.5px; }
 .msg-agent-error {
   align-self: flex-start;
   width: auto;
@@ -881,6 +905,10 @@ textarea { resize: none; }
   .conv-head { padding: 8px 10px; }
   .conv-title { font-size: 13px; }
   .conv-head-main { order: 1; flex: 1 1 auto; }
+  .conv-context-metric,
+  .conv-usage-details { order: 1; }
+  .conv-usage-details[open] { flex-basis: 100%; }
+  .conv-usage-panel { position: static; grid-template-columns: 1fr; width: 100%; min-width: 0; margin-top: 6px; box-shadow: var(--shadow-sm); }
   .conv-mode { order: 2; }
   .conv-controls { order: 3; }
   .conv-feed { padding: 14px 10px; }

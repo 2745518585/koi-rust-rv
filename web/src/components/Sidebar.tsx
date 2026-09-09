@@ -1,5 +1,5 @@
 import type { LucideIcon } from "lucide-react";
-import { FileClock, LogOut, Plus, ShieldCheck, Wrench, X } from "lucide-react";
+import { ChevronDown, FileClock, LogOut, Plus, ShieldCheck, Wrench, X } from "lucide-react";
 import type { AuthUser } from "../api/client";
 import type { TaskSummary, UsageSummary } from "../api/types";
 import { useI18n } from "../i18n";
@@ -145,27 +145,33 @@ function UsageCard({ usage }: { usage: UsageSummary }) {
     ? t("unlimited")
     : `${formatTokenCount(taskBudgetValue)} ${t("tokens")}`;
   return (
-    <section className="side-usage" aria-label={t("usageSummary")}>
-      <div className="side-usage-head">
-        <span>{t("monthCost")}</span>
-        <strong>{formatUsd(usage.monthSpentUsd)}{monthlyBudget}</strong>
+    <details className="side-usage">
+      <summary className="side-usage-summary">
+        <span>{t("usageSummary")}</span>
+        <ChevronDown size={13} aria-hidden="true" />
+      </summary>
+      <div className="side-usage-body" aria-label={t("usageSummary")}>
+        <div className="side-usage-head">
+          <span>{t("monthCost")}</span>
+          <strong>{formatUsd(usage.monthSpentUsd)}{monthlyBudget}</strong>
+        </div>
+        <div className="side-usage-line">
+          <span>{t("monthTokens")}</span>
+          <strong>{formatTokenCount(usage.totalTokensMonth)}</strong>
+        </div>
+        <div className="side-usage-line">
+          <span>{t("taskTokenBudget")}</span>
+          <strong>{taskBudget}</strong>
+        </div>
+        <small title={t("pricingHint")}>
+          {t("pricingShort", {
+            input: usage.inputPricePerMillionTokens,
+            cached: usage.cachedInputPricePerMillionTokens,
+            output: usage.outputPricePerMillionTokens,
+          })}
+        </small>
       </div>
-      <div className="side-usage-line">
-        <span>{t("monthTokens")}</span>
-        <strong>{formatTokenCount(usage.totalTokensMonth)}</strong>
-      </div>
-      <div className="side-usage-line">
-        <span>{t("taskTokenBudget")}</span>
-        <strong>{taskBudget}</strong>
-      </div>
-      <small title={t("pricingHint")}>
-        {t("pricingShort", {
-          input: usage.inputPricePerMillionTokens,
-          cached: usage.cachedInputPricePerMillionTokens,
-          output: usage.outputPricePerMillionTokens,
-        })}
-      </small>
-    </section>
+    </details>
   );
 }
 

@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent, UIEvent } from "react";
 import {
+  ChevronDown,
   CircleStop,
   FileClock,
   Inbox,
@@ -31,7 +32,6 @@ import { groupConversationEvents, type ConversationFeedItem } from "../lib/event
 import { formatRelative, scopeLabel } from "../lib/format";
 import {
   EmptyState, EventIcon, EventLine, EventSummary, PermissionSelector, StatusBadge,
-  formatEventUsage,
   suggestedPermissionOptions,
 } from "../lib/ui";
 import { ApprovalCard } from "./ApprovalCard";
@@ -331,36 +331,54 @@ export function Conversation({
           <StatusBadge status={task.status} />
           <span className="conv-scope">{scopeLabel(task)}</span>
         </div>
-        <div className="conv-metrics hide-narrow" aria-label={locale === "en" ? "Token usage" : "Token 用量"}>
-          <span className="conv-metric" title={t("contextUsageHint")}>
-            <b>{t("contextUsage")}</b>
-            {formatTokenCount(task.contextUsage.estimatedTokens)}
-            {contextWindow
-              ? ` / ${formatTokenCount(contextWindow)}${contextPercent === null ? "" : ` (${contextPercent}%)`}`
-              : null}
-          </span>
-          <span className="conv-metric" title={`${t("totalTokenUsage")}：${formatTokenUsageDetail(task)}`}>
-            <b>{t("totalTokenUsage")}</b>
-            {formatTokenCount(totalTokens)}
-          </span>
-          <span className="conv-metric" title={t("costHint")}>
-            <b>{t("cost")}</b>
-            {formatUsd(task.usage.costUsd)}
-          </span>
-          {task.tokenBudget !== null ? (
-            <span
-              className={`conv-metric ${totalTokens >= task.tokenBudget ? "conv-metric-danger" : ""}`}
-              title={t("taskBudgetHint")}
-            >
-              <b>{t("budget")}</b>
-              {formatTokenCount(totalTokens)} / {formatTokenCount(task.tokenBudget)}
+        <div
+          className="conv-context-metric"
+          title={t("contextUsageHint")}
+          aria-label={`${t("contextUsage")} ${formatTokenCount(task.contextUsage.estimatedTokens)}`}
+        >
+          <b>{t("contextUsage")}</b>
+          {formatTokenCount(task.contextUsage.estimatedTokens)}
+          {contextWindow
+            ? ` / ${formatTokenCount(contextWindow)}${contextPercent === null ? "" : ` (${contextPercent}%)`}`
+            : null}
+        </div>
+        <details className="conv-usage-details">
+          <summary className="conv-usage-summary">
+            <span>{t("usageSummary")}</span>
+            <ChevronDown size={13} aria-hidden="true" />
+          </summary>
+          <div className="conv-usage-panel">
+            <span className="conv-metric" title={`${t("totalTokenUsage")}：${formatTokenUsageDetail(task)}`}>
+              <b>{t("totalTokenUsage")}</b>
+              {formatTokenCount(totalTokens)}
             </span>
-          ) : null}
-        </div>
-        <div className="conv-month-usage hide-narrow" title={t("globalUsageHint")}>
-          <b>{t("monthCost")}</b>
-          {formatUsd(usage.monthSpentUsd)}
-        </div>
+            <span className="conv-metric" title={t("costHint")}>
+              <b>{t("cost")}</b>
+              {formatUsd(task.usage.costUsd)}
+            </span>
+            {task.tokenBudget !== null ? (
+              <span
+                className={`conv-metric ${totalTokens >= task.tokenBudget ? "conv-metric-danger" : ""}`}
+                title={t("taskBudgetHint")}
+              >
+                <b>{t("budget")}</b>
+                {formatTokenCount(totalTokens)} / {formatTokenCount(task.tokenBudget)}
+              </span>
+            ) : null}
+            <div className="conv-month-usage" title={t("globalUsageHint")}>
+              <b>{t("monthCost")}</b>
+              {formatUsd(usage.monthSpentUsd)}
+            </div>
+            <small className="conv-usage-breakdown">{formatTokenUsageDetail(task)}</small>
+            <small className="conv-usage-pricing" title={t("pricingHint")}>
+              {t("pricingShort", {
+                input: usage.inputPricePerMillionTokens,
+                cached: usage.cachedInputPricePerMillionTokens,
+                output: usage.outputPricePerMillionTokens,
+              })}
+            </small>
+          </div>
+        </details>
         <select
           className="model-select hide-narrow"
           aria-label={locale === "en" ? "Minimum control permission" : "最低控制权限"}
@@ -642,7 +660,6 @@ function ToolEventGroupLine({ events }: { events: TaskEvent[] }) {
 
 function ConversationMessage({ event, currentUsername }: { event: TaskEvent; currentUsername: string }) {
   const { locale } = useI18n();
-  const usage = formatEventUsage(event);
   if (event.kind === "ingress") {
     const ownInput = event.source === "web" && event.sourceUser === currentUsername;
     const sourceLabel = event.sourceUser ? `${event.source} · ${event.sourceUser}` : event.source;
@@ -673,7 +690,6 @@ function ConversationMessage({ event, currentUsername }: { event: TaskEvent; cur
     <article className={`msg msg-agent ${failed ? "msg-agent-error" : ""}`}>
       {failed ? <strong>{event.title}</strong> : null}
       <MarkdownContent content={event.detail ?? event.summary} />
-      {usage ? <small className="msg-usage">{usage}</small> : null}
       <time>{formatRelative(event.occurredAt, locale)}</time>
     </article>
   );
