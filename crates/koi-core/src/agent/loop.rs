@@ -25,6 +25,12 @@ use crate::ports::{
     ModelReasoningSink, SourceAuthorizationRegistry, ToolRegistry,
 };
 
+/// 单次模型请求的可恢复传输或服务端错误最多再尝试两次。
+///
+/// 重试只覆盖模型提供方明确标为可重试的错误；格式、权限、预算等本地错误仍立即
+/// 结束，避免对同一无效请求进行无意义循环。
+const MAX_RETRYABLE_MODEL_ATTEMPTS: u8 = 2;
+
 /// 执行一个新 Agent 任务所需的供应商无关输入。
 #[derive(Clone, Debug)]
 pub struct AgentRunRequest {
@@ -674,69 +680,47 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
         let provider = descriptor.provider.clone();
         let model_id = descriptor.model_id.clone();
         let task_id = runtime.projection().task_id;
-        let call_started = runtime
-            .record_with_provenance(
-                AgentEvent::model(ModelEvent::CallStarted {
-                    context_event_ids: context.iter().map(|item| item.event_id).collect(),
-                    context_hash: fingerprint(&context)?,
-                    provider,
-                    model_id,
-                }),
-                None,
-                crate::domain::EventProvenance::model(None),
-            )
-            .await?;
-        tracing::info!(
-            target: "koi.model.request",
-            task_id = %task_id,
-            model_call_event_id = %call_started.id,
-            provider = %descriptor.provider,
-            model_id = %descriptor.model_id,
-            context_event_count = context.len(),
-            context_event_ids = ?context.iter().map(|item| item.event_id).collect::<Vec<_>>(),
-            request_json = %request_json,
-            "模型请求已开始"
-        );
-        let stream = match self.model.start(model_request, cancel.clone()).await {
-            Ok(stream) => stream,
-            Err(error) if error.kind == ModelErrorKind::Cancelled => {
-                // `Cancelled` 是预期控制流，不是模型供应商故障。暂停中的调用尤其不能
-                // 写成失败或终止任务，运行器会在循环退出后确认 `TaskPaused`。
-                self.record_cancelled(runtime, "模型调用已取消").await?;
-                return Err(AgentLoopError::Cancelled);
-            }
-            Err(error) => {
-                // start 可能在发送请求、读取非流式响应或解析响应时失败；这些路径
-                // 都可能留下 Provider 的上一次工具续接状态，必须在下一次请求前丢弃。
-                self.model.reset_task(task_id);
-                runtime
-                    .record_with_provenance(
-                        AgentEvent::model(ModelEvent::Failed {
-                            call_started_event_id: call_started.id,
-                            error: error.to_string(),
-                        }),
-                        Some(call_started.id),
-                        crate::domain::EventProvenance::model(None),
-                    )
-                    .await?;
-                self.record_failed(runtime, error.to_string()).await?;
-                return Err(AgentLoopError::Model(error));
-            }
-        };
-        let turn = match self
-            .record_model_stream(runtime, stream, call_started.id, cancel)
-            .await
-        {
-            Ok(turn) => turn,
-            Err(AgentLoopError::Cancelled) => return Err(AgentLoopError::Cancelled),
-            Err(error) => {
-                // 流式响应没有 Completed 时，Provider 不能再沿用这次调用的工具
-                // call id；同时持久化模型失败事件，避免最终只看到一个笼统的 TaskFailed。
-                self.model.reset_task(task_id);
-                if matches!(
-                    &error,
-                    AgentLoopError::Model(_) | AgentLoopError::ModelStreamEndedWithoutCompletion
-                ) {
+        let mut retry_attempt = 0_u8;
+        loop {
+            let call_started = runtime
+                .record_with_provenance(
+                    AgentEvent::model(ModelEvent::CallStarted {
+                        context_event_ids: context.iter().map(|item| item.event_id).collect(),
+                        context_hash: fingerprint(&context)?,
+                        provider: provider.clone(),
+                        model_id: model_id.clone(),
+                    }),
+                    None,
+                    crate::domain::EventProvenance::model(None),
+                )
+                .await?;
+            tracing::info!(
+                target: "koi.model.request",
+                task_id = %task_id,
+                model_call_event_id = %call_started.id,
+                provider = %descriptor.provider,
+                model_id = %descriptor.model_id,
+                context_event_count = context.len(),
+                context_event_ids = ?context.iter().map(|item| item.event_id).collect::<Vec<_>>(),
+                request_json = %request_json,
+                "模型请求已开始"
+            );
+            let stream = match self
+                .model
+                .start(model_request.clone(), cancel.clone())
+                .await
+            {
+                Ok(stream) => stream,
+                Err(error) if error.kind == ModelErrorKind::Cancelled => {
+                    // `Cancelled` 是预期控制流，不是模型供应商故障。暂停中的调用尤其不能
+                    // 写成失败或终止任务，运行器会在循环退出后确认 `TaskPaused`。
+                    self.record_cancelled(runtime, "模型调用已取消").await?;
+                    return Err(AgentLoopError::Cancelled);
+                }
+                Err(error) => {
+                    // start 可能在发送请求、读取非流式响应或解析响应时失败；这些路径
+                    // 都可能留下 Provider 的上一次工具续接状态，必须在下一次请求前丢弃。
+                    self.model.reset_task(task_id);
                     runtime
                         .record_with_provenance(
                             AgentEvent::model(ModelEvent::Failed {
@@ -747,26 +731,88 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                             crate::domain::EventProvenance::model(None),
                         )
                         .await?;
+                    if error.retryable && retry_attempt < MAX_RETRYABLE_MODEL_ATTEMPTS {
+                        retry_attempt += 1;
+                        tracing::warn!(
+                            task_id = %task_id,
+                            model_call_event_id = %call_started.id,
+                            attempt = retry_attempt,
+                            error = %error,
+                            "模型调用暂时失败，稍后重试"
+                        );
+                        if cancel.is_cancelled() {
+                            self.record_cancelled(runtime, "模型调用已取消").await?;
+                            return Err(AgentLoopError::Cancelled);
+                        }
+                        continue;
+                    }
                     self.record_failed(runtime, error.to_string()).await?;
+                    return Err(AgentLoopError::Model(error));
                 }
-                return Err(error);
-            }
-        };
-        let completed = runtime
-            .record_with_provenance(
-                AgentEvent::model(ModelEvent::Completed {
-                    call_started_event_id: call_started.id,
-                    outputs: turn.outputs.clone(),
-                    usage: turn.usage,
-                }),
-                Some(call_started.id),
-                crate::domain::EventProvenance::model(None),
-            )
-            .await?;
-        Ok(CompletedModel {
-            event_id: completed.id,
-            outputs: turn.outputs,
-        })
+            };
+            let turn = match self
+                .record_model_stream(runtime, stream, call_started.id, cancel.clone())
+                .await
+            {
+                Ok(turn) => turn,
+                Err(AgentLoopError::Cancelled) => return Err(AgentLoopError::Cancelled),
+                Err(error) => {
+                    // 流式响应没有 Completed 时，Provider 不能再沿用这次调用的工具
+                    // call id；同时持久化模型失败事件，避免最终只看到一个笼统的 TaskFailed。
+                    self.model.reset_task(task_id);
+                    if matches!(
+                        &error,
+                        AgentLoopError::Model(_)
+                            | AgentLoopError::ModelStreamEndedWithoutCompletion
+                    ) {
+                        runtime
+                            .record_with_provenance(
+                                AgentEvent::model(ModelEvent::Failed {
+                                    call_started_event_id: call_started.id,
+                                    error: error.to_string(),
+                                }),
+                                Some(call_started.id),
+                                crate::domain::EventProvenance::model(None),
+                            )
+                            .await?;
+                        if retryable_model_error(&error)
+                            && retry_attempt < MAX_RETRYABLE_MODEL_ATTEMPTS
+                        {
+                            retry_attempt += 1;
+                            tracing::warn!(
+                                task_id = %task_id,
+                                model_call_event_id = %call_started.id,
+                                attempt = retry_attempt,
+                                error = %error,
+                                "模型流暂时失败，稍后重试"
+                            );
+                            if cancel.is_cancelled() {
+                                self.record_cancelled(runtime, "模型调用已取消").await?;
+                                return Err(AgentLoopError::Cancelled);
+                            }
+                            continue;
+                        }
+                        self.record_failed(runtime, error.to_string()).await?;
+                    }
+                    return Err(error);
+                }
+            };
+            let completed = runtime
+                .record_with_provenance(
+                    AgentEvent::model(ModelEvent::Completed {
+                        call_started_event_id: call_started.id,
+                        outputs: turn.outputs.clone(),
+                        usage: turn.usage,
+                    }),
+                    Some(call_started.id),
+                    crate::domain::EventProvenance::model(None),
+                )
+                .await?;
+            return Ok(CompletedModel {
+                event_id: completed.id,
+                outputs: turn.outputs,
+            });
+        }
     }
 
     async fn record_model_stream(
@@ -1759,6 +1805,16 @@ enum ToolHandlingOutcome {
 struct CompletedModel {
     event_id: EventId,
     outputs: Vec<ModelOutput>,
+}
+
+fn retryable_model_error(error: &AgentLoopError) -> bool {
+    matches!(
+        error,
+        AgentLoopError::Model(ModelError {
+            retryable: true,
+            ..
+        })
+    )
 }
 
 struct AuthorizationFlow {
