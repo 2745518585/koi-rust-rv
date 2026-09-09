@@ -1319,7 +1319,14 @@ impl ModelResponseStream {
                         return None;
                     }
                 }
-                self.fail(invalid_response("模型 SSE 在完成事件前结束"));
+                // 个别兼容 OpenAI 的服务会在已经发送完全部 delta 后直接关闭连接，
+                // 而不会再发送 `[DONE]` 或 `response.completed`。只要累积器中已经
+                // 有可解析的完整输出，就把 EOF 视为正常完成；空响应和不完整工具
+                // 参数仍会由 `finish` 返回格式错误，避免把网络截断误判为成功。
+                match self.accumulator.finish(&self.tool_names) {
+                    Ok(turn) => self.complete(turn),
+                    Err(_) => self.fail(invalid_response("模型 SSE 在完成事件前结束")),
+                }
                 return self.queue.pop_front();
             }
 
@@ -2974,6 +2981,38 @@ mod tests {
                 ..
             }) if name == "service_status" && call_id == "call-1"
         ));
+    }
+
+    #[tokio::test]
+    async fn responses_stream_accepts_eof_after_complete_delta_output() {
+        let response = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Content-Type: text/event-stream\r\n",
+            "Connection: close\r\n\r\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-eof\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"服务已恢复\"}\n\n",
+        );
+        let (base_url, handle) = test_server(response.into()).await;
+        let config =
+            OpenAiCompatibleModelConfig::new("test-provider", base_url, "test-model", None);
+        let provider = OpenAiCompatibleModelProvider::with_client(
+            Client::builder().no_proxy().build().unwrap(),
+            config,
+        )
+        .unwrap();
+        let events = provider
+            .start(request(ModelProtocol::Responses, true), CancellationToken::new())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        handle.await.unwrap();
+
+        let Some(Ok(ModelStreamEvent::Completed(turn))) = events.last() else {
+            panic!("expected completed event: {events:?}");
+        };
+        assert_eq!(turn.provider_response_id.as_deref(), Some("resp-eof"));
+        assert!(matches!(&turn.outputs[0], ModelOutput::Text { text } if text == "服务已恢复"));
     }
 
     #[tokio::test]
