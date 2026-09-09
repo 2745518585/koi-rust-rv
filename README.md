@@ -310,7 +310,9 @@ QQ 来源对接 QQ 开放平台 Bot API v2：启动后使用 AppID/AppSecret 获
 
 ## 开源协议
 
-[MIT](LICENSE) LICENSE
+本项目自有代码采用 [MIT](LICENSE) 许可证。第三方依赖不随本项目许可证重新授权，依赖的许可证、版权声明和分发注意事项见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+如果发布可执行文件、Docker 镜像或包含依赖目录的完整运行包，请将该第三方声明文件以及各依赖要求的许可证文本一并保留；仅提交源代码时也应保留 `Cargo.lock`、`web/package-lock.json` 和该声明文件，便于复核依赖版本。
 
 ## 致谢
 
