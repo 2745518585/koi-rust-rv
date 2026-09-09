@@ -12,8 +12,8 @@ use koi_core::agent::{
 };
 use koi_core::domain::{
     AgentEvent, ControlEvent, EventEnvelope, IngressEvent, ModelContextItem, ModelError,
-    ModelErrorKind, ModelEvent, ModelInputRole, ModelOutputContract, ModelSelection, TaskId,
-    TaskStatus, ToolEvent,
+    ModelErrorKind, ModelEvent, ModelOutputContract, ModelSelection, TaskId, TaskStatus, ToolCall,
+    ToolEvent,
 };
 use koi_core::ports::{
     EventStore, ModelProvider, SourceAuthorizationRegistry, SystemPromptProvider, ToolRegistry,
@@ -695,17 +695,63 @@ fn pending_tool_results(events: &[EventEnvelope]) -> Vec<ModelContextItem> {
         .filter(|event| !injected_context_event_ids.contains(&event.id))
         .filter_map(|event| match &event.payload {
             AgentEvent::Tool(tool) => match tool.as_ref() {
-                ToolEvent::Finished { result, .. } => Some(ModelContextItem {
-                    event_id: event.id,
-                    role: ModelInputRole::Tool,
-                    content: result.model_content(),
-                    permission: koi_core::domain::PermissionLevel::None,
-                }),
+                ToolEvent::Finished {
+                    execution_started_event_id,
+                    result,
+                } => {
+                    let tool_call =
+                        tool_call_for_started_event(events, *execution_started_event_id);
+                    let (tool_name, provider_call_id) = tool_call
+                        .map_or((None, None), |tool_call| {
+                            (Some(tool_call.name), tool_call.provider_call_id)
+                        });
+                    Some(ModelContextItem::tool_result(
+                        event.id,
+                        tool_name,
+                        provider_call_id,
+                        result.model_content(),
+                    ))
+                }
                 _ => None,
             },
             _ => None,
         })
         .collect()
+}
+
+/// 从主会话中的工具生命周期事件反查子任务回传结果对应的模型工具调用。
+///
+/// 子任务结果以新的 `ToolEvent::Finished` 写入主会话，但该事件本身只保存执行开始
+/// 事件 ID。恢复完整的 `ToolCall` 后，模型 Provider 才能按 provider call ID 将回传结果
+/// 与 `task.start` 等原始调用正确配对。
+fn tool_call_for_started_event(
+    events: &[EventEnvelope],
+    started_event_id: koi_core::domain::EventId,
+) -> Option<ToolCall> {
+    let proposal_event_id = events.iter().find_map(|event| {
+        if event.id != started_event_id {
+            return None;
+        }
+        let AgentEvent::Tool(tool) = &event.payload else {
+            return None;
+        };
+        match tool.as_ref() {
+            ToolEvent::Started { proposal_event_id } => Some(*proposal_event_id),
+            _ => None,
+        }
+    })?;
+    events.iter().find_map(|event| {
+        if event.id != proposal_event_id {
+            return None;
+        }
+        let AgentEvent::Tool(tool) = &event.payload else {
+            return None;
+        };
+        match tool.as_ref() {
+            ToolEvent::Proposed { tool_call } => Some(tool_call.clone()),
+            _ => None,
+        }
+    })
 }
 
 fn has_cancellation_request(events: &[EventEnvelope]) -> bool {
@@ -885,7 +931,12 @@ mod tests {
 
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].event_id, arrived_during_call.id);
-        assert_eq!(pending[0].content, "arrived during call");
+        assert!(pending[0].content.contains("arrived during call"));
+        assert!(
+            pending[0]
+                .content
+                .contains(&format!("event_id={}", arrived_during_call.id))
+        );
 
         let second_call = model_call_started(6, vec![already_injected.id, arrived_during_call.id]);
         let events = [events, vec![second_call]].concat();

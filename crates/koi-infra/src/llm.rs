@@ -711,25 +711,53 @@ fn responses_input(
     context: &[ModelContextItem],
     pending_tool_calls: &[PendingToolCall],
 ) -> Vec<Value> {
+    let matches = matched_tool_results(context, pending_tool_calls);
+    let first_match_index = matches.iter().map(|(index, _)| *index).min();
+    let matched_pending_indices = matches
+        .iter()
+        .map(|(_, pending_index)| *pending_index)
+        .collect::<std::collections::HashSet<_>>();
     let mut input = Vec::with_capacity(context.len() + pending_tool_calls.len());
-    let mut tool_index = 0;
-    let mut inserted_pending_calls = false;
-    for item in context {
-        if item.role == ModelInputRole::Tool {
-            if !inserted_pending_calls && !pending_tool_calls.is_empty() {
-                input.extend(pending_tool_calls.iter().map(responses_function_call));
-                inserted_pending_calls = true;
-            }
-            if let Some(call) = pending_tool_calls.get(tool_index) {
+
+    for (index, item) in context.iter().enumerate() {
+        if Some(index) == first_match_index {
+            input.extend(
+                pending_tool_calls
+                    .iter()
+                    .enumerate()
+                    .filter(|(pending_index, _)| matched_pending_indices.contains(pending_index))
+                    .map(|(_, call)| responses_function_call(call)),
+            );
+            for (pending_index, call) in pending_tool_calls.iter().enumerate() {
+                if !matched_pending_indices.contains(&pending_index) {
+                    continue;
+                }
+                let Some((context_index, _)) = matches
+                    .iter()
+                    .find(|(_, candidate)| *candidate == pending_index)
+                else {
+                    continue;
+                };
                 input.push(json!({
                     "type": "function_call_output",
                     "call_id": call.id,
-                    "output": item.content,
+                    "output": context[*context_index].content,
                 }));
-            } else {
-                input.push(responses_message("user", "input_text", &item.content));
             }
-            tool_index += 1;
+        }
+
+        if matches
+            .iter()
+            .any(|(context_index, _)| *context_index == index)
+        {
+            continue;
+        }
+        if item.role == ModelInputRole::Tool {
+            input.push(responses_message(
+                "user",
+                "input_text",
+                &unpaired_tool_result_content(item),
+            ));
         } else {
             input.push(responses_message(
                 responses_role(item.role),
@@ -770,36 +798,61 @@ fn chat_messages(
     };
     let mut messages = Vec::with_capacity(context.len() + pending_tool_calls.len() + 1);
     messages.push(json!({"role": "system", "content": system_message}));
-    let mut tool_index = 0;
-    let mut inserted_pending_calls = false;
+    let matches = matched_tool_results(context, pending_tool_calls);
+    let first_match_index = matches.iter().map(|(index, _)| *index).min();
+    let matched_pending_indices = matches
+        .iter()
+        .map(|(_, pending_index)| *pending_index)
+        .collect::<std::collections::HashSet<_>>();
     let mut has_user_message = false;
-    for item in context {
+    for (index, item) in context.iter().enumerate() {
         if matches!(
             item.role,
             ModelInputRole::System | ModelInputRole::Developer
         ) {
             continue;
         }
-        if item.role == ModelInputRole::Tool {
-            if !inserted_pending_calls && !pending_tool_calls.is_empty() {
-                messages.push(chat_assistant_tool_call(pending_tool_calls));
-                inserted_pending_calls = true;
+        if Some(index) == first_match_index {
+            let matched_calls = pending_tool_calls
+                .iter()
+                .enumerate()
+                .filter(|(pending_index, _)| matched_pending_indices.contains(pending_index))
+                .map(|(_, call)| call.clone())
+                .collect::<Vec<_>>();
+            if !matched_calls.is_empty() {
+                messages.push(chat_assistant_tool_call(&matched_calls));
             }
-            if let Some(call) = pending_tool_calls.get(tool_index) {
+            for (pending_index, call) in pending_tool_calls.iter().enumerate() {
+                if !matched_pending_indices.contains(&pending_index) {
+                    continue;
+                }
+                let Some((context_index, _)) = matches
+                    .iter()
+                    .find(|(_, candidate)| *candidate == pending_index)
+                else {
+                    continue;
+                };
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": call.id,
-                    "content": item.content,
-                }));
-            } else {
-                // After a process restart there is no provider call ID in the core context. A
-                // user message keeps the result visible without fabricating an invalid tool link.
-                messages.push(json!({
-                    "role": "user",
-                    "content": format!("工具执行结果（仅供分析）：{}", item.content),
+                    "content": context[*context_index].content,
                 }));
             }
-            tool_index += 1;
+        }
+        if matches
+            .iter()
+            .any(|(context_index, _)| *context_index == index)
+        {
+            continue;
+        }
+        if item.role == ModelInputRole::Tool {
+            has_user_message = true;
+            // 未能与当前 pending call 精确配对的工具结果只能作为普通历史资料传入，
+            // 不能伪造 tool_call_id，否则模型服务可能把旧结果归到新工具调用上。
+            messages.push(json!({
+                "role": "user",
+                "content": unpaired_tool_result_content(item),
+            }));
         } else {
             has_user_message |= chat_role(item.role) == "user";
             messages.push(json!({
@@ -818,6 +871,62 @@ fn chat_messages(
         }));
     }
     messages
+}
+
+/// 找出可以与当前 Provider 续接状态安全配对的工具结果。
+///
+/// 旧实现使用所有 `Tool` 上下文项的序号与最新 pending call 配对，连续多轮工具调用
+/// 时会把旧结果交给新工具。现在只接受上下文项中明确记录、且与当前 pending call 相同
+/// 的 Provider call ID；没有匹配关系的结果一律作为历史资料传入。
+fn matched_tool_results(
+    context: &[ModelContextItem],
+    pending_tool_calls: &[PendingToolCall],
+) -> Vec<(usize, usize)> {
+    let mut matches = Vec::new();
+    for (context_index, item) in context.iter().enumerate() {
+        if item.role != ModelInputRole::Tool {
+            continue;
+        }
+        let Some(provider_call_id) = item.provider_call_id.as_deref() else {
+            continue;
+        };
+        let Some((pending_index, call)) = pending_tool_calls
+            .iter()
+            .enumerate()
+            .find(|(_, call)| call.id == provider_call_id)
+        else {
+            continue;
+        };
+        if item
+            .tool_name
+            .as_deref()
+            .is_some_and(|tool_name| tool_name != call.name)
+        {
+            tracing::warn!(
+                provider_call_id,
+                expected_tool_name = %call.name,
+                actual_tool_name = ?item.tool_name,
+                "工具结果名称与 Provider 调用不一致，跳过续接配对"
+            );
+            continue;
+        }
+        if matches
+            .iter()
+            .any(|(_, matched_pending_index)| *matched_pending_index == pending_index)
+        {
+            continue;
+        }
+        matches.push((context_index, pending_index));
+    }
+    matches
+}
+
+/// 给未能与当前 Provider 调用配对的工具结果添加明确的历史资料边界。
+fn unpaired_tool_result_content(item: &ModelContextItem) -> String {
+    format!(
+        "工具执行结果（仅供分析，未绑定当前模型工具调用）：{}",
+        model_context_content(item)
+    )
 }
 
 fn responses_message(role: &str, content_type: &str, content: &str) -> Value {
@@ -2255,6 +2364,8 @@ mod tests {
                 role: ModelInputRole::User,
                 content: "检查服务状态".into(),
                 permission: PermissionLevel::User,
+                provider_call_id: None,
+                tool_name: None,
             }],
             tools: vec![ModelToolDefinition {
                 name: "service_status".into(),
@@ -2377,6 +2488,8 @@ mod tests {
             role: ModelInputRole::Tool,
             content: "工具结果".into(),
             permission: PermissionLevel::None,
+            provider_call_id: None,
+            tool_name: None,
         });
 
         let responses = responses_input(&request.context, &[]);
@@ -2394,6 +2507,8 @@ mod tests {
             role: ModelInputRole::Memory,
             content: "更早的历史事实".into(),
             permission: PermissionLevel::None,
+            provider_call_id: None,
+            tool_name: None,
         };
         let rendered_history = model_context_content(&history);
         assert!(rendered_history.contains(&format!("KOI_HISTORY event_id={history_id}")));
@@ -2418,6 +2533,99 @@ mod tests {
     }
 
     #[test]
+    fn tool_results_are_paired_by_provider_call_id_in_both_protocols() {
+        let old_tool_result = ModelContextItem::tool_result(
+            EventId::new(),
+            Some("fs.stat".into()),
+            Some("call-old-stat".into()),
+            "旧的 stat 结果",
+        );
+        let current_tool_result = ModelContextItem::tool_result(
+            EventId::new(),
+            Some("fs.read".into()),
+            Some("call-current-read".into()),
+            "当前的 read 结果",
+        );
+        let pending_tool_calls = vec![PendingToolCall {
+            id: "call-current-read".into(),
+            name: "fs.read".into(),
+            arguments: "{}".into(),
+        }];
+        let context = vec![
+            ModelContextItem {
+                event_id: EventId::new(),
+                role: ModelInputRole::User,
+                content: "继续检查文件".into(),
+                permission: PermissionLevel::User,
+                provider_call_id: None,
+                tool_name: None,
+            },
+            old_tool_result,
+            ModelContextItem {
+                event_id: EventId::new(),
+                role: ModelInputRole::Assistant,
+                content: "先获取元数据，再读取内容".into(),
+                permission: PermissionLevel::None,
+                provider_call_id: None,
+                tool_name: None,
+            },
+            current_tool_result,
+        ];
+
+        let responses = responses_input(&context, &pending_tool_calls);
+        let response_call = responses
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .expect("Responses 应包含当前工具调用");
+        assert_eq!(response_call["name"], "fs.read");
+        let response_output = responses
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .expect("Responses 应包含当前工具结果");
+        assert_eq!(response_output["call_id"], "call-current-read");
+        assert!(
+            response_output["output"]
+                .as_str()
+                .unwrap()
+                .contains("当前的 read 结果")
+        );
+        let response_history = responses
+            .iter()
+            .find(|item| item["role"] == "user" && item.to_string().contains("旧的 stat 结果"))
+            .expect("旧工具结果应作为普通历史资料传入 Responses");
+        assert!(
+            response_history
+                .to_string()
+                .contains("未绑定当前模型工具调用")
+        );
+        assert!(!response_output.to_string().contains("旧的 stat 结果"));
+
+        let chat = chat_messages("运维助手", &context, &pending_tool_calls);
+        let chat_call = chat
+            .iter()
+            .find(|item| item["role"] == "assistant" && item.get("tool_calls").is_some())
+            .expect("Chat Completions 应包含当前工具调用");
+        assert_eq!(chat_call["tool_calls"][0]["function"]["name"], "fs.read");
+        let chat_output = chat
+            .iter()
+            .find(|item| item["role"] == "tool")
+            .expect("Chat Completions 应包含当前工具结果");
+        assert_eq!(chat_output["tool_call_id"], "call-current-read");
+        assert!(
+            chat_output["content"]
+                .as_str()
+                .unwrap()
+                .contains("当前的 read 结果")
+        );
+        let chat_history = chat
+            .iter()
+            .find(|item| item["role"] == "user" && item.to_string().contains("旧的 stat 结果"))
+            .expect("旧工具结果应作为普通历史资料传入 Chat Completions");
+        assert!(chat_history.to_string().contains("未绑定当前模型工具调用"));
+        assert!(!chat_output.to_string().contains("旧的 stat 结果"));
+    }
+
+    #[test]
     fn chat_messages_merge_system_context_into_the_single_system_message() {
         let mut request = request(ModelProtocol::ChatCompletions, false);
         request.context.insert(
@@ -2427,6 +2635,8 @@ mod tests {
                 role: ModelInputRole::System,
                 content: "子任务的系统创建指令".into(),
                 permission: PermissionLevel::System,
+                provider_call_id: None,
+                tool_name: None,
             },
         );
 
@@ -2450,6 +2660,8 @@ mod tests {
                 role: ModelInputRole::System,
                 content: "子任务的系统创建指令".into(),
                 permission: PermissionLevel::System,
+                provider_call_id: None,
+                tool_name: None,
             }],
             ..request(ModelProtocol::ChatCompletions, false)
         };

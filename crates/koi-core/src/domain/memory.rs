@@ -65,6 +65,8 @@ impl MemoryRecord {
             role: ModelInputRole::Memory,
             content: self.content.clone(),
             permission: PermissionLevel::None,
+            provider_call_id: None,
+            tool_name: None,
         }
     }
 

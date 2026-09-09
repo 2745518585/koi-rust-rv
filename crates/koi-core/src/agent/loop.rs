@@ -16,9 +16,9 @@ use crate::domain::{
     AgentEvent, ApprovalGrant, AuthorizationRequest, AuthorizationRequestResult,
     AuthorizedToolInvocation, ControlEvent, EventId, MemoryContextBuilder, MemoryQuery,
     ModelContextItem, ModelDeltaKind, ModelError, ModelErrorKind, ModelEvent,
-    ModelGenerationOptions, ModelInputRole, ModelOutput, ModelOutputContract, ModelRequest,
-    ModelStreamEvent, PermissionCheckResult, PermissionChecker, PermissionLevel, PolicyDecision,
-    TaskId, TaskStatus, ToolCall, ToolDefinition, ToolEvent, ToolResult,
+    ModelGenerationOptions, ModelOutput, ModelOutputContract, ModelRequest, ModelStreamEvent,
+    PermissionCheckResult, PermissionChecker, PermissionLevel, PolicyDecision, TaskId, TaskStatus,
+    ToolCall, ToolDefinition, ToolEvent, ToolResult,
 };
 use crate::ports::{
     AuthorizationEvidenceResolver, EventStore, MemoryError, MemoryStore, ModelProvider,
@@ -1172,6 +1172,7 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
         flow: ExecutionFlow,
         cancel: CancellationToken,
     ) -> Result<ToolHandlingOutcome, AgentLoopError> {
+        let tool_call = flow.tool_call.clone();
         let checked = runtime
             .record(
                 AgentEvent::tool(ToolEvent::AuthorizationChecked {
@@ -1214,6 +1215,7 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                     .await?;
                 Ok(ToolHandlingOutcome::Continue(tool_result_context(
                     finished.id,
+                    &tool_call,
                     &result,
                 )))
             }
@@ -1228,12 +1230,14 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                         crate::domain::EventProvenance::tool(),
                     )
                     .await?;
-                Ok(ToolHandlingOutcome::Continue(ModelContextItem {
-                    event_id: failed.id,
-                    role: ModelInputRole::Tool,
-                    content: format!("工具执行失败：{error}"),
-                    permission: PermissionLevel::None,
-                }))
+                Ok(ToolHandlingOutcome::Continue(
+                    ModelContextItem::tool_result(
+                        failed.id,
+                        Some(tool_call.name.clone()),
+                        tool_call.provider_call_id.clone(),
+                        format!("工具执行失败：{error}"),
+                    ),
+                ))
             }
         }
     }
@@ -1311,8 +1315,13 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                     )
                     .await?;
                 self.bootstrap_child_task(&mut created).await?;
-                self.acknowledge_child_started(runtime, started.id, created.task_id)
-                    .await
+                self.acknowledge_child_started(
+                    runtime,
+                    proposal_event_id,
+                    started.id,
+                    created.task_id,
+                )
+                .await
             }
             TaskToolAction::Input(args) => {
                 let Some(authority_parent_event_id) = tool_call.authority_parent_event_id else {
@@ -1497,10 +1506,15 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                 crate::domain::EventProvenance::tool(),
             )
             .await?;
-        Ok(ToolHandlingOutcome::Continue(tool_result_context(
-            finished.id,
-            &result,
-        )))
+        Ok(ToolHandlingOutcome::Continue(
+            self.tool_result_context_for_proposal(
+                runtime,
+                proposal_event_id,
+                finished.id,
+                result.model_content(),
+            )
+            .await,
+        ))
     }
 
     /// 为被拒绝的任务管理操作记录 `Started` 与 `Failed` 并返回失败上下文。
@@ -1528,12 +1542,15 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                 crate::domain::EventProvenance::tool(),
             )
             .await?;
-        Ok(ToolHandlingOutcome::Continue(ModelContextItem {
-            event_id: failed.id,
-            role: ModelInputRole::Tool,
-            content: format!("任务管理操作被拒绝：{error}"),
-            permission: PermissionLevel::None,
-        }))
+        Ok(ToolHandlingOutcome::Continue(
+            self.tool_result_context_for_proposal(
+                runtime,
+                proposal_event_id,
+                failed.id,
+                format!("任务管理操作被拒绝：{error}"),
+            )
+            .await,
+        ))
     }
 
     /// 为新子任务写入生命周期事件。
@@ -1563,6 +1580,7 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
     async fn acknowledge_child_started(
         &self,
         runtime: &mut TaskRuntime<S>,
+        proposal_event_id: EventId,
         started_event_id: EventId,
         task_id: TaskId,
     ) -> Result<ToolHandlingOutcome, AgentLoopError> {
@@ -1580,12 +1598,10 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                 crate::domain::EventProvenance::tool(),
             )
             .await?;
-        Ok(ToolHandlingOutcome::Continue(ModelContextItem {
-            event_id: output.id,
-            role: ModelInputRole::Tool,
-            content,
-            permission: PermissionLevel::None,
-        }))
+        Ok(ToolHandlingOutcome::Continue(
+            self.tool_result_context_for_proposal(runtime, proposal_event_id, output.id, content)
+                .await,
+        ))
     }
 
     async fn deny_tool(
@@ -1605,12 +1621,38 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                 Some(proposal_event_id),
             )
             .await?;
-        Ok(ToolHandlingOutcome::Continue(ModelContextItem {
-            event_id: denied.id,
-            role: ModelInputRole::Tool,
-            content: format!("工具调用被拒绝：{reason}"),
-            permission: PermissionLevel::None,
-        }))
+        Ok(ToolHandlingOutcome::Continue(
+            self.tool_result_context_for_proposal(
+                runtime,
+                proposal_event_id,
+                denied.id,
+                format!("工具调用被拒绝：{reason}"),
+            )
+            .await,
+        ))
+    }
+
+    /// 根据已持久化的工具提案为结果上下文补齐规范工具名和 Provider 调用 ID。
+    ///
+    /// 拒绝、任务管理失败以及子任务启动确认等路径没有直接携带 `ToolCall`，因此从
+    /// `proposal_event_id` 反查。反查失败时仍返回无绑定的工具结果，Provider 会将其
+    /// 当作历史资料发送，绝不能猜测一个调用 ID。
+    async fn tool_result_context_for_proposal(
+        &self,
+        runtime: &TaskRuntime<S>,
+        proposal_event_id: EventId,
+        event_id: EventId,
+        content: String,
+    ) -> ModelContextItem {
+        let tool_call = runtime
+            .load_events()
+            .await
+            .ok()
+            .and_then(|events| proposed_tool_call(&events, proposal_event_id).ok());
+        let (tool_name, provider_call_id) = tool_call.map_or((None, None), |tool_call| {
+            (Some(tool_call.name), tool_call.provider_call_id)
+        });
+        ModelContextItem::tool_result(event_id, tool_name, provider_call_id, content)
     }
 
     async fn record_cancelled(
@@ -1867,13 +1909,17 @@ fn approval_grant_matches_tool_call(
     }
 }
 
-fn tool_result_context(event_id: EventId, result: &ToolResult) -> ModelContextItem {
-    ModelContextItem {
+fn tool_result_context(
+    event_id: EventId,
+    tool_call: &ToolCall,
+    result: &ToolResult,
+) -> ModelContextItem {
+    ModelContextItem::tool_result(
         event_id,
-        role: ModelInputRole::Tool,
-        content: result.model_content(),
-        permission: PermissionLevel::None,
-    }
+        Some(tool_call.name.clone()),
+        tool_call.provider_call_id.clone(),
+        result.model_content(),
+    )
 }
 
 fn push_unique_context(context: &mut Vec<ModelContextItem>, item: ModelContextItem) {

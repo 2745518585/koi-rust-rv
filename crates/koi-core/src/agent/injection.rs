@@ -133,6 +133,8 @@ impl InputInjector {
             role,
             content,
             permission: assessment.effective_permission,
+            provider_call_id: None,
+            tool_name: None,
         })
     }
 

@@ -68,6 +68,8 @@ fn valid_request() -> ModelRequest {
             role: ModelInputRole::User,
             content: "检查服务状态".into(),
             permission: PermissionLevel::User,
+            provider_call_id: None,
+            tool_name: None,
         }],
         tools: vec![ModelToolDefinition {
             name: "service_status".into(),
