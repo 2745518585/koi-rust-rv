@@ -257,6 +257,7 @@ QQ 来源对接 QQ 开放平台 Bot API v2：启动后使用 AppID/AppSecret 获
 - **会话与审计**：所有 QQ C2C/群/频道消息统一注入 Koi 主会话（`TaskId::MAIN`），消息统一写入主会话事件存储，再由 Agent Supervisor 调度；每条模型可见正文前都会标记 QQ 来源类型、会话标识、发言人、消息 ID 及是否明确 `@bot`，避免跨群汇总时混淆；结构化 `scope`、`actor` 与 `origin` 仍作为权限和回复路由的事实依据；重启后从事件流恢复消息去重状态。
 - **可靠性**：Gateway 实现 Hello/Identify、Heartbeat、Resume、Reconnect 与断线退避；HTTP 请求带超时、有限重试和 Token 缓存。
 - **权限与审批**：QQ 来源的权限建议固定为两级：普通发言建议 `User`，明确 @bot 的发言建议 `Operator`；来源注册最高为 `Operator`，不会从 QQ 输入建议 `Admin`。QQ 投送工具最低只需 `User`，但运维类高风险工具仍按自身定义要求更高权限。其他工具需要提权时，QQ 会在群里描述操作并给出 token；有权限成员必须 @bot 回复 `/confirm <token>` 确认当前操作，或回复 `/confirm all` 确认当前群全部待处理操作。最终权限仍由 `authorization.toml` 按来源和具体 `subject` 截断，未配置身份继续失败关闭。
+- **QQ 控制命令**：明确 `@bot` 的群消息可以使用 `@bot /pause [原因]`、`@bot /resume`、`@bot /cancel [原因]`；`/abort` 与 `/stop` 是中止命令别名。这些消息直接交给核心写入 `PauseRequested`、`ResumeRequested` 或 `TaskCancelled` 控制事件，不作为模型上下文输入。命令的有效权限由 QQ 身份目录和主会话最低控制权限共同裁决；显式 @bot 只提供 `Operator` 建议，不能绕过核心权限检查，QQ 也不会产生 `Admin`。
 - **模型控制出站**：QQ 模型最终文本不会自动发送回 QQ。模型需要回复当前 QQ 消息时调用 `qq.reply`（目标从授权父事件恢复，参数只有正文）；需要向指定群主动通知时调用 `qq.group_send`；配置 `[qq].report_group_openid` 后，可调用 `qq.report` 向固定的主要汇报群发送事故或运维报告。三类投送都会按 QQ 来源的单条消息长度配置拆分。
 - **主要汇报群**：在 `[qq]` 中设置 `report_group_openid = "<group_openid>"` 即可启用 `qq.report`。该工具不接受目标群参数，模型不能改写汇报目的地；提权审批通知仍发送到发起操作的原群。
 

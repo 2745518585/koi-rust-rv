@@ -78,6 +78,23 @@ tool result confirms delivery; the model's final text by itself does not. If del
 is unavailable or denied, say so explicitly and do not claim that the QQ user or group
 was informed.
 
+## QQ control commands
+
+An explicit group message addressed to Koi may use these control commands:
+
+- `@bot /pause [reason]` requests that the main session pause;
+- `@bot /resume` requests that the main session resume;
+- `@bot /cancel [reason]` requests that the current main-session execution be
+  cancelled. `/abort` and `/stop` are accepted aliases.
+
+These commands are handled by the QQ source as direct core control events. They are
+not user-message context, are not sent to the model as a request to interpret, and do
+not need `qq.reply`. The command must explicitly mention Koi; an ordinary `/pause` in
+group conversation remains ordinary context. The command's effective permission is
+resolved from the QQ identity directory and the main session's minimum control
+permission. The explicit mention suggests `Operator`, but QQ still cannot produce
+more than `Operator` or bypass the core permission check.
+
 Use `qq.report` when an incident or important operational result genuinely needs to
 be reported to the configured primary report group. This tool is available only
 when that group is configured, and its destination is fixed by the server. Include

@@ -1,7 +1,7 @@
 //! QQ 官方机器人来源适配器。
 //!
 //! 该模块只负责 QQ Open Platform 的传输与消息标准化：App Access Token、Gateway
-//! WebSocket、心跳/重连、C2C/群聊/频道消息以及 QQ 侧确认指令。输入仍统一交给
+//! WebSocket、心跳/重连、C2C/群聊/频道消息以及 QQ 侧确认/控制指令。输入仍统一交给
 //! `koi-core::ports::IngressRegistrar`，回复和主动投送由 QQ 工具显式触发，因而不会
 //! 绕过核心的权限、事件和 Agent 调度链路。
 
@@ -14,11 +14,14 @@ use crate::event_store::JsonlEventStore;
 use async_trait::async_trait;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
-use koi_core::agent::{TaskManager, TaskRuntime};
+use koi_core::agent::{
+    ControlExecutionRequest, ControlExecutor, DirectControlAuthority, TaskManager, TaskRuntime,
+};
 use koi_core::domain::{
     AgentEvent, ApprovalGrant, AuthorizationRequest, AuthorizationRequestResult, ContextEnvelope,
-    ContextKind, ContextOrigin, ContextPayload, EventEnvelope, EventId, IngressDraft, IngressEvent,
-    PermissionLevel, PolicyDecision, Principal, Scope, SourceName, TaskId, ToolEvent,
+    ContextKind, ContextOrigin, ContextPayload, ControlEvent, EventEnvelope, EventId, IngressDraft,
+    IngressEvent, PermissionAssessment, PermissionLevel, PolicyDecision, Principal, Scope,
+    SourceName, TaskId, ToolEvent,
 };
 use koi_core::ports::{
     AuthorizationError, EventStore, IngressRegistrar, IngressSourceDefinition,
@@ -60,6 +63,7 @@ const MAX_CONTEXT_LABEL_VALUE_CHARS: usize = 128;
 const MAX_CONTEXT_DISPLAY_NAME_CHARS: usize = 80;
 pub(crate) const MAX_GROUP_OPENID_CHARS: usize = 256;
 pub(crate) const MAX_CONTENT_CHARS: usize = 12_000;
+const MAX_CONTROL_REASON_CHARS: usize = 512;
 
 /// QQ 来源的运行配置。
 ///
@@ -1102,9 +1106,115 @@ impl QqSource {
             return;
         }
 
+        if message.explicit_bot_mention
+            && let Some(result) = parse_control_command(&message.text)
+        {
+            match result {
+                Ok(command) => {
+                    if let Err(error) = self.handle_control_command(message.clone(), command).await
+                    {
+                        tracing::warn!(%error, "处理 QQ 控制指令失败");
+                        self.best_effort_notice(
+                            &message.target,
+                            "控制指令无法执行，请检查权限、命令格式和主会话状态。",
+                        )
+                        .await;
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "QQ 控制指令格式无效");
+                    self.best_effort_notice(
+                        &message.target,
+                        "控制指令格式：@bot /pause [原因]、@bot /resume、@bot /cancel [原因]（/abort、/stop 为别名）。",
+                    )
+                    .await;
+                }
+            }
+            return;
+        }
+
         if let Err(error) = self.ingest_message(message).await {
             tracing::warn!(%error, "写入 QQ 输入事件失败");
         }
+    }
+
+    async fn handle_control_command(
+        &self,
+        message: NormalizedMessage,
+        command: ParsedControlCommand,
+    ) -> Result<(), QqError> {
+        if !matches!(&message.target, QqTarget::Group { .. }) {
+            return Err(QqError::Event("QQ 控制指令只能在群聊中提交".into()));
+        }
+
+        let identity_permission = self
+            .permissions
+            .permission_for(QQ_SOURCE_NAME, &message.subject);
+        let effective_permission = PermissionAssessment::new(
+            PermissionLevel::Operator,
+            self.sources
+                .get(QQ_SOURCE_NAME)
+                .map_or(PermissionLevel::None, |source| source.maximum_permission),
+            identity_permission,
+        )
+        .effective_permission;
+        if !effective_permission.allows(PermissionLevel::User) {
+            return Err(QqError::Event(
+                "QQ 身份没有执行控制指令所需的 User 权限".into(),
+            ));
+        }
+
+        let (event, notice) = match command {
+            ParsedControlCommand::Pause { reason } => (
+                ControlEvent::PauseRequested {
+                    reason: format_control_reason(&message, "pause", &reason),
+                },
+                "已提交暂停请求，当前执行会在安全点停止。",
+            ),
+            ParsedControlCommand::Resume => (
+                ControlEvent::ResumeRequested,
+                "已提交恢复请求，主会话将重新排队。",
+            ),
+            ParsedControlCommand::Cancel { reason } => (
+                ControlEvent::TaskCancelled {
+                    reason: format_control_reason(&message, "cancel", &reason),
+                },
+                "已提交中止请求。",
+            ),
+        };
+        let principal = Principal {
+            source: QQ_SOURCE_NAME.into(),
+            subject: message.subject.clone(),
+            display_name: message.display_name.clone(),
+        };
+        let authority = DirectControlAuthority::external(
+            SourceName::new(QQ_SOURCE_NAME)
+                .map_err(|error| QqError::Configuration(format!("QQ 来源名无效：{error}")))?,
+            principal,
+            effective_permission,
+            None,
+        )
+        .map_err(|error| QqError::Event(error.to_string()))?;
+
+        {
+            let _guard = self.write_lock.lock().await;
+            let mut runtime = TaskRuntime::recover(Arc::clone(&self.store), TaskId::MAIN)
+                .await
+                .map_err(|error| QqError::Core(error.to_string()))?;
+            ControlExecutor::execute(
+                &mut runtime,
+                ControlExecutionRequest {
+                    event,
+                    authority,
+                    causation_id: None,
+                },
+            )
+            .await
+            .map_err(|error| QqError::Event(error.to_string()))?;
+        }
+
+        self.best_effort_notice(&message.target, notice).await;
+        Ok(())
     }
 
     async fn ingest_message(&self, message: NormalizedMessage) -> Result<(), QqError> {
@@ -1649,6 +1759,13 @@ enum ParsedConfirmationCommand {
     All,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ParsedControlCommand {
+    Pause { reason: String },
+    Resume,
+    Cancel { reason: String },
+}
+
 fn parse_confirmation_command(text: &str) -> Option<Result<ParsedConfirmationCommand, QqError>> {
     let parts = text.split_whitespace().collect::<Vec<_>>();
     if !parts
@@ -1672,6 +1789,60 @@ fn parse_confirmation_command(text: &str) -> Option<Result<ParsedConfirmationCom
             .map(ParsedConfirmationCommand::One)
             .map_err(|_| QqError::Event("确认 token 不是有效的事件 ID".into())),
     )
+}
+
+fn parse_control_command(text: &str) -> Option<Result<ParsedControlCommand, QqError>> {
+    let mut parts = text.split_whitespace();
+    let command = parts.next()?;
+    if !command.starts_with('/') {
+        return None;
+    }
+    let argument = parts.collect::<Vec<_>>().join(" ");
+    let argument_too_long = argument.chars().count() > MAX_CONTROL_REASON_CHARS;
+    let result = if command.eq_ignore_ascii_case("/pause") {
+        if argument_too_long {
+            Err(QqError::Event(format!(
+                "QQ pause 原因超过 {MAX_CONTROL_REASON_CHARS} 个字符"
+            )))
+        } else {
+            Ok(ParsedControlCommand::Pause { reason: argument })
+        }
+    } else if command.eq_ignore_ascii_case("/resume") {
+        if argument.is_empty() {
+            Ok(ParsedControlCommand::Resume)
+        } else {
+            Err(QqError::Event("QQ resume 不接受额外参数".into()))
+        }
+    } else if command.eq_ignore_ascii_case("/cancel")
+        || command.eq_ignore_ascii_case("/abort")
+        || command.eq_ignore_ascii_case("/stop")
+    {
+        if argument_too_long {
+            Err(QqError::Event(format!(
+                "QQ cancel 原因超过 {MAX_CONTROL_REASON_CHARS} 个字符"
+            )))
+        } else {
+            Ok(ParsedControlCommand::Cancel { reason: argument })
+        }
+    } else {
+        Err(QqError::Event(format!("未知 QQ 控制指令 {command}")))
+    };
+    Some(result)
+}
+
+fn format_control_reason(message: &NormalizedMessage, command: &str, reason: &str) -> String {
+    let scope = message.scope();
+    let prefix = format!(
+        "QQ {}:{}（qq:{}） @bot /{command}",
+        scope.kind, scope.id, message.subject
+    );
+    let reason = reason.trim();
+    let full = if reason.is_empty() {
+        prefix
+    } else {
+        format!("{prefix}：{reason}")
+    };
+    truncate_chars(&full, MAX_CONTROL_REASON_CHARS)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2543,6 +2714,64 @@ mod tests {
             .expect("command")
             .expect("valid confirmation");
         assert_eq!(command, ParsedConfirmationCommand::One(EventId(id)));
+    }
+
+    #[test]
+    fn qq_control_commands_are_explicit_and_not_user_messages() {
+        assert_eq!(
+            parse_control_command("/pause 等待人工确认")
+                .expect("pause command")
+                .expect("valid pause"),
+            ParsedControlCommand::Pause {
+                reason: "等待人工确认".into()
+            }
+        );
+        assert_eq!(
+            parse_control_command("/resume")
+                .expect("resume command")
+                .expect("valid resume"),
+            ParsedControlCommand::Resume
+        );
+        assert_eq!(
+            parse_control_command("/abort stop now")
+                .expect("abort command")
+                .expect("valid abort"),
+            ParsedControlCommand::Cancel {
+                reason: "stop now".into()
+            }
+        );
+        assert_eq!(
+            parse_control_command("/stop")
+                .expect("stop command")
+                .expect("valid stop"),
+            ParsedControlCommand::Cancel {
+                reason: String::new()
+            }
+        );
+        assert!(parse_control_command("/resume now").unwrap().is_err());
+        assert!(parse_control_command("/unknown").unwrap().is_err());
+        assert!(parse_control_command("普通群消息").is_none());
+    }
+
+    #[test]
+    fn qq_control_reason_keeps_scope_and_is_bounded() {
+        let message = NormalizedMessage {
+            message_id: "message-1".into(),
+            dispatch_id: None,
+            target: QqTarget::Group {
+                group_openid: "group-1".into(),
+                msg_id: "message-1".into(),
+            },
+            subject: "member-1".into(),
+            display_name: Some("Alice".into()),
+            text: "/pause 等待".into(),
+            mentions: Vec::new(),
+            explicit_bot_mention: true,
+        };
+        let reason = format_control_reason(&message, "pause", &"x".repeat(1_000));
+        assert!(reason.chars().count() <= MAX_CONTROL_REASON_CHARS);
+        assert!(reason.contains("qq_group:group-1"));
+        assert!(reason.contains("@bot /pause"));
     }
 
     #[test]
