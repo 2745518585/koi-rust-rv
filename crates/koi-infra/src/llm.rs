@@ -4,7 +4,7 @@
 //! the normalized `koi-core` model contract to the Responses API or Chat Completions API and turns
 //! JSON/SSE responses back into the same contract.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -253,15 +253,25 @@ impl OpenAiCompatibleModelProvider {
         }
     }
 
-    fn request_body(&self, request: &ModelRequest) -> Result<Value, ModelError> {
+    fn request_body(
+        &self,
+        request: &ModelRequest,
+        tool_names: &ProviderToolNameMap,
+    ) -> Result<Value, ModelError> {
         let pending_tool_calls = self.conversation_snapshot(request.task_id)?;
         Ok(match self.config.protocol {
-            ModelProtocol::Responses => {
-                build_responses_request(&self.config.model_id, request, &pending_tool_calls)
-            }
-            ModelProtocol::ChatCompletions => {
-                build_chat_request(&self.config.model_id, request, &pending_tool_calls)
-            }
+            ModelProtocol::Responses => build_responses_request(
+                &self.config.model_id,
+                request,
+                &pending_tool_calls,
+                tool_names,
+            ),
+            ModelProtocol::ChatCompletions => build_chat_request(
+                &self.config.model_id,
+                request,
+                &pending_tool_calls,
+                tool_names,
+            ),
         })
     }
 
@@ -316,7 +326,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         request
             .validate()
             .map_err(|error| invalid_response(error.to_string()))?;
-        let body = self.request_body(&request)?;
+        let tool_names = ProviderToolNameMap::from_tools(&request.tools);
+        let body = self.request_body(&request, &tool_names)?;
         let body_json = serde_json::to_string(&body)
             .unwrap_or_else(|error| format!("<模型请求序列化失败：{error}>"));
         tracing::debug!(
@@ -381,6 +392,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 request.task_id,
                 cancel,
                 Arc::clone(&self.conversations),
+                tool_names.clone(),
             );
             return Ok(Box::pin(stream::unfold(state, |mut state| async move {
                 state.next_item().await.map(|item| (item, state))
@@ -400,7 +412,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         );
         let value: Value = serde_json::from_slice(&bytes)
             .map_err(|error| invalid_response(format!("响应 JSON 无法解析：{error}")))?;
-        let turn = parse_turn(self.config.protocol, &value)?;
+        let turn = parse_turn(self.config.protocol, &value, &tool_names)?;
         self.remember_turn(request.task_id, &turn)?;
         Ok(Box::pin(stream::once(async move {
             Ok(ModelStreamEvent::Completed(turn))
@@ -584,10 +596,100 @@ fn endpoint_for(config: &OpenAiCompatibleModelConfig) -> Result<Url, ModelProvid
         .map_err(|error| ModelProviderConfigError::InvalidBaseUrl(error.to_string()))
 }
 
+/// Provider 线协议对工具名称的约束比核心工具注册表更严格。
+///
+/// 核心工具名保留点号等可读分隔符（例如 `service.status`），但 Responses 和部分
+/// Chat Completions 服务只接受 `[a-zA-Z0-9_-]+`。这个映射只存在于 Provider 适配层：
+/// 发给模型的是合法的 wire 名称，模型返回后立即还原为核心注册表中的规范名称。
+#[derive(Clone, Debug, Default)]
+struct ProviderToolNameMap {
+    internal_to_wire: HashMap<String, String>,
+    wire_to_internal: HashMap<String, String>,
+}
+
+impl ProviderToolNameMap {
+    fn from_tools(tools: &[ModelToolDefinition]) -> Self {
+        let mut map = Self::default();
+        let mut used_wire_names = HashSet::with_capacity(tools.len());
+
+        // 先保留本身已经符合线协议的名称，避免与后续转换出的别名冲突。
+        for tool in tools {
+            if !provider_tool_name_is_valid(&tool.name) {
+                continue;
+            }
+            let name = tool.name.clone();
+            used_wire_names.insert(name.clone());
+            map.internal_to_wire.insert(name.clone(), name.clone());
+            map.wire_to_internal.insert(name.clone(), name);
+        }
+
+        for tool in tools {
+            if provider_tool_name_is_valid(&tool.name) {
+                continue;
+            }
+            let base = readable_provider_tool_name(&tool.name);
+            let base = if base.is_empty() {
+                "koi_tool".to_owned()
+            } else {
+                base
+            };
+            let mut wire_name = base.clone();
+            let mut suffix = 2_u32;
+            while used_wire_names.contains(&wire_name) {
+                wire_name = format!("{base}_{suffix}");
+                suffix = suffix.saturating_add(1);
+            }
+            used_wire_names.insert(wire_name.clone());
+            map.internal_to_wire
+                .insert(tool.name.clone(), wire_name.clone());
+            map.wire_to_internal.insert(wire_name, tool.name.clone());
+        }
+
+        map
+    }
+
+    fn wire_name(&self, internal_name: &str) -> String {
+        self.internal_to_wire
+            .get(internal_name)
+            .cloned()
+            .unwrap_or_else(|| readable_provider_tool_name(internal_name))
+    }
+
+    fn internal_name(&self, wire_name: &str) -> String {
+        self.wire_to_internal
+            .get(wire_name)
+            .cloned()
+            .unwrap_or_else(|| wire_name.to_owned())
+    }
+}
+
+fn provider_tool_name_is_valid(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn readable_provider_tool_name(name: &str) -> String {
+    let mut result = String::with_capacity(name.len());
+    let mut previous_separator = false;
+    for byte in name.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-') {
+            result.push(char::from(byte));
+            previous_separator = false;
+        } else if !previous_separator {
+            result.push('_');
+            previous_separator = true;
+        }
+    }
+    result.trim_matches('_').to_owned()
+}
+
 fn build_responses_request(
     model: &str,
     request: &ModelRequest,
     pending_tool_calls: &[PendingToolCall],
+    tool_names: &ProviderToolNameMap,
 ) -> Value {
     let mut body = Map::new();
     body.insert("model".into(), Value::String(model.into()));
@@ -597,11 +699,21 @@ fn build_responses_request(
     );
     body.insert(
         "input".into(),
-        Value::Array(responses_input(&request.context, pending_tool_calls)),
+        Value::Array(responses_input(
+            &request.context,
+            pending_tool_calls,
+            tool_names,
+        )),
     );
     body.insert(
         "tools".into(),
-        Value::Array(request.tools.iter().map(responses_tool).collect::<Vec<_>>()),
+        Value::Array(
+            request
+                .tools
+                .iter()
+                .map(|tool| responses_tool(tool, tool_names))
+                .collect::<Vec<_>>(),
+        ),
     );
     apply_common_request_options(&mut body, &request.options, ModelProtocol::Responses);
     if let ModelOutputContract::JsonSchema {
@@ -629,6 +741,7 @@ fn build_chat_request(
     model: &str,
     request: &ModelRequest,
     pending_tool_calls: &[PendingToolCall],
+    tool_names: &ProviderToolNameMap,
 ) -> Value {
     let mut body = Map::new();
     body.insert("model".into(), Value::String(model.into()));
@@ -638,11 +751,18 @@ fn build_chat_request(
             &request.instructions,
             &request.context,
             pending_tool_calls,
+            tool_names,
         )),
     );
     body.insert(
         "tools".into(),
-        Value::Array(request.tools.iter().map(chat_tool).collect::<Vec<_>>()),
+        Value::Array(
+            request
+                .tools
+                .iter()
+                .map(|tool| chat_tool(tool, tool_names))
+                .collect::<Vec<_>>(),
+        ),
     );
     apply_common_request_options(&mut body, &request.options, ModelProtocol::ChatCompletions);
     if request.options.stream {
@@ -710,6 +830,7 @@ fn apply_common_request_options(
 fn responses_input(
     context: &[ModelContextItem],
     pending_tool_calls: &[PendingToolCall],
+    tool_names: &ProviderToolNameMap,
 ) -> Vec<Value> {
     let matches = matched_tool_results(context, pending_tool_calls);
     let first_match_index = matches.iter().map(|(index, _)| *index).min();
@@ -726,7 +847,7 @@ fn responses_input(
                     .iter()
                     .enumerate()
                     .filter(|(pending_index, _)| matched_pending_indices.contains(pending_index))
-                    .map(|(_, call)| responses_function_call(call)),
+                    .map(|(_, call)| responses_function_call(call, tool_names)),
             );
             for (pending_index, call) in pending_tool_calls.iter().enumerate() {
                 if !matched_pending_indices.contains(&pending_index) {
@@ -773,6 +894,7 @@ fn chat_messages(
     instructions: &str,
     context: &[ModelContextItem],
     pending_tool_calls: &[PendingToolCall],
+    tool_names: &ProviderToolNameMap,
 ) -> Vec<Value> {
     // 部分 OpenAI 兼容服务（学校接口也属于这一类）不接受多个连续的 system
     // 消息，甚至不接受 developer role。核心中的系统事件仍然要保留其语义，
@@ -820,7 +942,7 @@ fn chat_messages(
                 .map(|(_, call)| call.clone())
                 .collect::<Vec<_>>();
             if !matched_calls.is_empty() {
-                messages.push(chat_assistant_tool_call(&matched_calls));
+                messages.push(chat_assistant_tool_call(&matched_calls, tool_names));
             }
             for (pending_index, call) in pending_tool_calls.iter().enumerate() {
                 if !matched_pending_indices.contains(&pending_index) {
@@ -936,16 +1058,16 @@ fn responses_message(role: &str, content_type: &str, content: &str) -> Value {
     })
 }
 
-fn responses_function_call(call: &PendingToolCall) -> Value {
+fn responses_function_call(call: &PendingToolCall, tool_names: &ProviderToolNameMap) -> Value {
     json!({
         "type": "function_call",
         "call_id": call.id,
-        "name": call.name,
+        "name": tool_names.wire_name(&call.name),
         "arguments": call.arguments,
     })
 }
 
-fn chat_assistant_tool_call(calls: &[PendingToolCall]) -> Value {
+fn chat_assistant_tool_call(calls: &[PendingToolCall], tool_names: &ProviderToolNameMap) -> Value {
     json!({
         "role": "assistant",
         "content": Value::Null,
@@ -953,7 +1075,7 @@ fn chat_assistant_tool_call(calls: &[PendingToolCall]) -> Value {
             "id": call.id,
             "type": "function",
             "function": {
-                "name": call.name,
+                "name": tool_names.wire_name(&call.name),
                 "arguments": call.arguments,
             },
         })).collect::<Vec<_>>(),
@@ -1031,21 +1153,21 @@ fn model_context_content(item: &ModelContextItem) -> String {
     }
 }
 
-fn responses_tool(tool: &ModelToolDefinition) -> Value {
+fn responses_tool(tool: &ModelToolDefinition, tool_names: &ProviderToolNameMap) -> Value {
     json!({
         "type": "function",
-        "name": tool.name,
+        "name": tool_names.wire_name(&tool.name),
         "description": tool.description,
         "parameters": model_tool_schema(tool),
         "strict": tool.strict,
     })
 }
 
-fn chat_tool(tool: &ModelToolDefinition) -> Value {
+fn chat_tool(tool: &ModelToolDefinition, tool_names: &ProviderToolNameMap) -> Value {
     json!({
         "type": "function",
         "function": {
-            "name": tool.name,
+            "name": tool_names.wire_name(&tool.name),
             "description": tool.description,
             "parameters": model_tool_schema(tool),
             "strict": tool.strict,
@@ -1126,6 +1248,7 @@ struct ModelResponseStream {
     task_id: TaskId,
     cancel: CancellationToken,
     conversations: Arc<Mutex<HashMap<TaskId, ConversationState>>>,
+    tool_names: ProviderToolNameMap,
     queue: VecDeque<Result<ModelStreamEvent, ModelError>>,
     accumulator: StreamAccumulator,
     body_finished: bool,
@@ -1140,6 +1263,7 @@ impl ModelResponseStream {
         task_id: TaskId,
         cancel: CancellationToken,
         conversations: Arc<Mutex<HashMap<TaskId, ConversationState>>>,
+        tool_names: ProviderToolNameMap,
     ) -> Self {
         Self {
             body,
@@ -1148,6 +1272,7 @@ impl ModelResponseStream {
             task_id,
             cancel,
             conversations,
+            tool_names,
             queue: VecDeque::new(),
             accumulator: StreamAccumulator::new(protocol),
             body_finished: false,
@@ -1227,7 +1352,7 @@ impl ModelResponseStream {
 
     fn handle_message(&mut self, message: &SseMessage) {
         if message.data.trim() == "[DONE]" {
-            match self.accumulator.finish() {
+            match self.accumulator.finish(&self.tool_names) {
                 Ok(turn) => self.complete(turn),
                 Err(error) => self.fail(error),
             }
@@ -1277,7 +1402,10 @@ impl ModelResponseStream {
                         self.accumulator
                             .capture_responses_item(item, output_index(value));
                         if let Some(name) = item.get("name").and_then(Value::as_str) {
-                            self.delta(ModelDeltaKind::ToolName, name.to_owned());
+                            self.delta(
+                                ModelDeltaKind::ToolName,
+                                self.tool_names.internal_name(name),
+                            );
                         }
                     }
                 }
@@ -1340,7 +1468,7 @@ impl ModelResponseStream {
                 let response = value.get("response").unwrap_or(value);
                 let result = match &self.accumulator {
                     StreamAccumulator::Responses(accumulator) => {
-                        parse_responses_turn(response, Some(accumulator))
+                        parse_responses_turn(response, Some(accumulator), &self.tool_names)
                     }
                     StreamAccumulator::Chat(_) => {
                         Err(invalid_response("Responses 流状态与 Provider 协议不一致"))
@@ -1419,7 +1547,10 @@ impl ModelResponseStream {
                     if let Some(name) = function.get("name").and_then(Value::as_str) {
                         self.accumulator
                             .capture_chat_tool_name(choice_index, index, name);
-                        self.delta(ModelDeltaKind::ToolName, name.to_owned());
+                        self.delta(
+                            ModelDeltaKind::ToolName,
+                            self.tool_names.internal_name(name),
+                        );
                     }
                     if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
                         self.accumulator.capture_chat_tool_arguments(
@@ -1435,7 +1566,10 @@ impl ModelResponseStream {
                 if let Some(name) = function_call.get("name").and_then(Value::as_str) {
                     self.accumulator
                         .capture_chat_tool_name(choice_index, 0, name);
-                    self.delta(ModelDeltaKind::ToolName, name.to_owned());
+                    self.delta(
+                        ModelDeltaKind::ToolName,
+                        self.tool_names.internal_name(name),
+                    );
                 }
                 if let Some(arguments) = function_call.get("arguments").and_then(Value::as_str) {
                     self.accumulator
@@ -1688,10 +1822,10 @@ impl StreamAccumulator {
         }
     }
 
-    fn finish(&self) -> Result<ModelTurn, ModelError> {
+    fn finish(&self, tool_names: &ProviderToolNameMap) -> Result<ModelTurn, ModelError> {
         match self {
-            Self::Responses(accumulator) => accumulator.finish(),
-            Self::Chat(accumulator) => accumulator.finish(),
+            Self::Responses(accumulator) => accumulator.finish(tool_names),
+            Self::Chat(accumulator) => accumulator.finish(tool_names),
         }
     }
 }
@@ -1723,7 +1857,7 @@ impl ResponsesAccumulator {
         }
     }
 
-    fn finish(&self) -> Result<ModelTurn, ModelError> {
+    fn finish(&self, tool_names: &ProviderToolNameMap) -> Result<ModelTurn, ModelError> {
         let mut outputs = Vec::new();
         if !self.text.is_empty() {
             outputs.push(ModelOutput::Text {
@@ -1736,7 +1870,7 @@ impl ResponsesAccumulator {
             });
         }
         for tool in self.tools.values() {
-            outputs.push(tool.to_model_output()?);
+            outputs.push(tool.to_model_output(tool_names)?);
         }
         if outputs.is_empty() {
             return Err(invalid_response("模型响应没有文本、拒答或工具调用输出"));
@@ -1770,7 +1904,7 @@ impl ChatAccumulator {
         }
     }
 
-    fn finish(&self) -> Result<ModelTurn, ModelError> {
+    fn finish(&self, tool_names: &ProviderToolNameMap) -> Result<ModelTurn, ModelError> {
         let mut outputs = Vec::new();
         for choice in self.choices.values() {
             if !choice.text.is_empty() {
@@ -1784,7 +1918,7 @@ impl ChatAccumulator {
                 });
             }
             for tool in choice.tools.values() {
-                outputs.push(tool.to_model_output()?);
+                outputs.push(tool.to_model_output(tool_names)?);
             }
         }
         if outputs.is_empty() {
@@ -1813,13 +1947,13 @@ struct ToolAccumulator {
 }
 
 impl ToolAccumulator {
-    fn to_model_output(&self) -> Result<ModelOutput, ModelError> {
+    fn to_model_output(&self, tool_names: &ProviderToolNameMap) -> Result<ModelOutput, ModelError> {
         if self.name.trim().is_empty() {
             return Err(invalid_response("工具调用缺少名称"));
         }
         let (arguments, authority_parent_event_id) = parse_tool_arguments(&self.arguments)?;
         Ok(ModelOutput::ToolCall(ToolCall {
-            name: self.name.clone(),
+            name: tool_names.internal_name(&self.name),
             arguments,
             provider_call_id: self.id.clone(),
             authority_parent_event_id,
@@ -1827,19 +1961,24 @@ impl ToolAccumulator {
     }
 }
 
-fn parse_turn(protocol: ModelProtocol, value: &Value) -> Result<ModelTurn, ModelError> {
+fn parse_turn(
+    protocol: ModelProtocol,
+    value: &Value,
+    tool_names: &ProviderToolNameMap,
+) -> Result<ModelTurn, ModelError> {
     match protocol {
         ModelProtocol::Responses => {
             let response = value.get("response").unwrap_or(value);
-            parse_responses_turn(response, None)
+            parse_responses_turn(response, None, tool_names)
         }
-        ModelProtocol::ChatCompletions => parse_chat_turn(value),
+        ModelProtocol::ChatCompletions => parse_chat_turn(value, tool_names),
     }
 }
 
 fn parse_responses_turn(
     response: &Value,
     fallback: Option<&ResponsesAccumulator>,
+    tool_names: &ProviderToolNameMap,
 ) -> Result<ModelTurn, ModelError> {
     let response_id = response
         .get("id")
@@ -1854,7 +1993,7 @@ fn parse_responses_turn(
     let mut outputs = Vec::new();
     if let Some(items) = response.get("output").and_then(Value::as_array) {
         for item in items {
-            parse_responses_item(item, &mut outputs)?;
+            parse_responses_item(item, &mut outputs, tool_names)?;
         }
     }
     if outputs.is_empty() {
@@ -1866,7 +2005,7 @@ fn parse_responses_turn(
     }
     if outputs.is_empty() {
         if let Some(fallback) = fallback {
-            return fallback.finish();
+            return fallback.finish(tool_names);
         }
     }
     if outputs.is_empty() {
@@ -1879,7 +2018,11 @@ fn parse_responses_turn(
     })
 }
 
-fn parse_responses_item(item: &Value, outputs: &mut Vec<ModelOutput>) -> Result<(), ModelError> {
+fn parse_responses_item(
+    item: &Value,
+    outputs: &mut Vec<ModelOutput>,
+    tool_names: &ProviderToolNameMap,
+) -> Result<(), ModelError> {
     match item.get("type").and_then(Value::as_str).unwrap_or_default() {
         "message" => {
             if let Some(content) = item.get("content").and_then(Value::as_array) {
@@ -1921,7 +2064,7 @@ fn parse_responses_item(item: &Value, outputs: &mut Vec<ModelOutput>) -> Result<
                 .unwrap_or_default();
             let (arguments, authority_parent_event_id) = parse_tool_arguments(arguments)?;
             outputs.push(ModelOutput::ToolCall(ToolCall {
-                name: name.into(),
+                name: tool_names.internal_name(name),
                 arguments,
                 provider_call_id: item
                     .get("call_id")
@@ -1938,7 +2081,10 @@ fn parse_responses_item(item: &Value, outputs: &mut Vec<ModelOutput>) -> Result<
     Ok(())
 }
 
-fn parse_chat_turn(value: &Value) -> Result<ModelTurn, ModelError> {
+fn parse_chat_turn(
+    value: &Value,
+    tool_names: &ProviderToolNameMap,
+) -> Result<ModelTurn, ModelError> {
     let choices = value
         .get("choices")
         .and_then(Value::as_array)
@@ -1974,7 +2120,7 @@ fn parse_chat_turn(value: &Value) -> Result<ModelTurn, ModelError> {
                     .unwrap_or_default();
                 let (arguments, authority_parent_event_id) = parse_tool_arguments(arguments)?;
                 outputs.push(ModelOutput::ToolCall(ToolCall {
-                    name: name.into(),
+                    name: tool_names.internal_name(name),
                     arguments,
                     provider_call_id: tool_call
                         .get("id")
@@ -1995,7 +2141,7 @@ fn parse_chat_turn(value: &Value) -> Result<ModelTurn, ModelError> {
                 .unwrap_or_default();
             let (arguments, authority_parent_event_id) = parse_tool_arguments(arguments)?;
             outputs.push(ModelOutput::ToolCall(ToolCall {
-                name: name.into(),
+                name: tool_names.internal_name(name),
                 arguments,
                 provider_call_id: None,
                 authority_parent_event_id,
@@ -2386,12 +2532,55 @@ mod tests {
         let mut request = request(ModelProtocol::Responses, true);
         request.options.reasoning_effort = Some("medium".into());
         request.options.reasoning_summary = Some("auto".into());
+        let tool_names = ProviderToolNameMap::from_tools(&request.tools);
 
-        let body = build_responses_request("test-model", &request, &[]);
+        let body = build_responses_request("test-model", &request, &[], &tool_names);
 
         assert_eq!(body["reasoning"]["effort"], "medium");
         assert_eq!(body["reasoning"]["summary"], "auto");
         assert!(body["reasoning"].get("chain_of_thought").is_none());
+    }
+
+    #[test]
+    fn provider_tool_names_are_sanitized_and_restored() {
+        let tools = vec![
+            ModelToolDefinition {
+                name: "fs.read".into(),
+                description: "读取文件".into(),
+                input_schema: json!({"type": "object"}),
+                strict: true,
+            },
+            ModelToolDefinition {
+                name: "fs_read".into(),
+                description: "读取文件元数据".into(),
+                input_schema: json!({"type": "object"}),
+                strict: true,
+            },
+        ];
+        let tool_names = ProviderToolNameMap::from_tools(&tools);
+
+        // 合法的原始名称保持不变；转换后的名称需要避开现有名称。
+        assert_eq!(tool_names.wire_name("fs_read"), "fs_read");
+        assert_eq!(tool_names.wire_name("fs.read"), "fs_read_2");
+        assert!(provider_tool_name_is_valid(
+            &tool_names.wire_name("fs.read")
+        ));
+        assert_eq!(tool_names.internal_name("fs_read_2"), "fs.read");
+
+        let response = json!({
+            "id": "resp-1",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "fs_read_2",
+                "arguments": "{}"
+            }]
+        });
+        let turn = parse_turn(ModelProtocol::Responses, &response, &tool_names).unwrap();
+        assert!(matches!(
+            &turn.outputs[0],
+            ModelOutput::ToolCall(ToolCall { name, .. }) if name == "fs.read"
+        ));
     }
 
     #[test]
@@ -2491,13 +2680,14 @@ mod tests {
             provider_call_id: None,
             tool_name: None,
         });
+        let tool_names = ProviderToolNameMap::from_tools(&request.tools);
 
-        let responses = responses_input(&request.context, &[]);
+        let responses = responses_input(&request.context, &[], &tool_names);
         let response_content = responses[0]["content"][0]["text"].as_str().unwrap();
         assert!(response_content.contains(&format!("KOI_CONTEXT event_id={eligible_id}")));
         assert!(!responses[1].to_string().contains("KOI_CONTEXT"));
 
-        let chat = chat_messages(&request.instructions, &request.context, &[]);
+        let chat = chat_messages(&request.instructions, &request.context, &[], &tool_names);
         let chat_content = chat[1]["content"].as_str().unwrap();
         assert!(chat_content.contains(&format!("KOI_CONTEXT event_id={eligible_id}")));
 
@@ -2515,8 +2705,8 @@ mod tests {
         assert!(rendered_history.contains("更早的历史事实"));
 
         for schema in [
-            &responses_tool(&request.tools[0])["parameters"],
-            &chat_tool(&request.tools[0])["function"]["parameters"],
+            &responses_tool(&request.tools[0], &tool_names)["parameters"],
+            &chat_tool(&request.tools[0], &tool_names)["function"]["parameters"],
         ] {
             assert_eq!(
                 schema["properties"][AUTHORITY_PARENT_FIELD]["type"],
@@ -2571,13 +2761,19 @@ mod tests {
             },
             current_tool_result,
         ];
+        let tool_names = ProviderToolNameMap::from_tools(&[ModelToolDefinition {
+            name: "fs.read".into(),
+            description: "读取文件".into(),
+            input_schema: json!({"type": "object"}),
+            strict: true,
+        }]);
 
-        let responses = responses_input(&context, &pending_tool_calls);
+        let responses = responses_input(&context, &pending_tool_calls, &tool_names);
         let response_call = responses
             .iter()
             .find(|item| item["type"] == "function_call")
             .expect("Responses 应包含当前工具调用");
-        assert_eq!(response_call["name"], "fs.read");
+        assert_eq!(response_call["name"], "fs_read");
         let response_output = responses
             .iter()
             .find(|item| item["type"] == "function_call_output")
@@ -2600,12 +2796,12 @@ mod tests {
         );
         assert!(!response_output.to_string().contains("旧的 stat 结果"));
 
-        let chat = chat_messages("运维助手", &context, &pending_tool_calls);
+        let chat = chat_messages("运维助手", &context, &pending_tool_calls, &tool_names);
         let chat_call = chat
             .iter()
             .find(|item| item["role"] == "assistant" && item.get("tool_calls").is_some())
             .expect("Chat Completions 应包含当前工具调用");
-        assert_eq!(chat_call["tool_calls"][0]["function"]["name"], "fs.read");
+        assert_eq!(chat_call["tool_calls"][0]["function"]["name"], "fs_read");
         let chat_output = chat
             .iter()
             .find(|item| item["role"] == "tool")
@@ -2640,7 +2836,8 @@ mod tests {
             },
         );
 
-        let messages = chat_messages(&request.instructions, &request.context, &[]);
+        let tool_names = ProviderToolNameMap::from_tools(&request.tools);
+        let messages = chat_messages(&request.instructions, &request.context, &[], &tool_names);
         let system_messages = messages
             .iter()
             .filter(|message| message["role"] == "system")
@@ -2666,7 +2863,8 @@ mod tests {
             ..request(ModelProtocol::ChatCompletions, false)
         };
 
-        let messages = chat_messages(&request.instructions, &request.context, &[]);
+        let tool_names = ProviderToolNameMap::from_tools(&request.tools);
+        let messages = chat_messages(&request.instructions, &request.context, &[], &tool_names);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "system");
         assert!(
@@ -2801,6 +2999,7 @@ mod tests {
             task_id,
             cancel,
             Arc::clone(&conversations),
+            ProviderToolNameMap::default(),
         );
 
         let result = response.next_item().await;
