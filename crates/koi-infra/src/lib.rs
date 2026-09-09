@@ -1,6 +1,7 @@
 //! Infrastructure adapters: QQ, database, model providers, and ops tools.
 
 pub mod alerts;
+pub mod billing;
 pub mod event_store;
 pub mod llm;
 pub(crate) mod logging;

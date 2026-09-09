@@ -40,7 +40,8 @@ pub struct UsageTotals {
 }
 
 impl UsageTotals {
-    fn add(&mut self, usage: &Usage) {
+    /// 将一次模型调用的 usage 累加到任务投影。
+    pub fn add_usage(&mut self, usage: &Usage) {
         self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
         self.cached_input_tokens = self
@@ -49,6 +50,12 @@ impl UsageTotals {
         self.reasoning_tokens = self
             .reasoning_tokens
             .saturating_add(usage.reasoning_tokens.unwrap_or_default());
+    }
+
+    /// 返回任务累计的输入与输出 Token 总数。
+    #[must_use]
+    pub const fn total_tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
     }
 }
 
@@ -217,7 +224,7 @@ impl TaskProjection {
                 super::ModelEvent::CallStarted { .. } => {
                     self.transition(TaskStatus::Running)?;
                 }
-                super::ModelEvent::Completed { usage, .. } => self.usage.add(usage),
+                super::ModelEvent::Completed { usage, .. } => self.usage.add_usage(usage),
                 super::ModelEvent::Delta { .. } | super::ModelEvent::Failed { .. } => {}
             },
             AgentEvent::Tool(tool)

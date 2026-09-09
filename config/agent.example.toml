@@ -53,6 +53,7 @@ max_steps = 128
 max_concurrent_tasks = 8
 max_tasks_per_server = 8
 task_timeout_secs = 3600
+# 单个任务累计输入与输出 Token 的硬预算；达到后自动停止模型循环。删除该字段表示不限制。
 token_budget_per_task = 1200000
 
 # 内置基础服务监测。监测器只在状态变化时向主会话写入 firing/resolved 告警。
@@ -86,7 +87,10 @@ alert_dedup_window_secs = 600
 database_url = "sqlite://data/koi.db?mode=rwc"
 
 [usage]
+# 以下价格均为美元 / 1,000,000 Token。缓存命中价格只计入命中的输入 Token，
+# 普通输入价格只计入未命中的输入 Token，输出价格计入输出 Token。
 input_price_per_million_tokens = 0.0
+cached_input_price_per_million_tokens = 0.0
 output_price_per_million_tokens = 0.0
 monthly_budget_usd = 10.0
 

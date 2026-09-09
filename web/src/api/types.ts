@@ -36,6 +36,7 @@ export interface UsageTotals {
   outputTokens: number;
   cachedInputTokens: number;
   reasoningTokens: number;
+  costUsd: number;
 }
 
 /** 当前事件流将注入模型的文本上下文估算，不含系统提示词和工具定义。 */
@@ -63,6 +64,7 @@ export interface TaskSummary {
   minimumControlPermission: PermissionLevel;
   selectedModel: ModelSelection | null;
   usage: UsageTotals;
+  tokenBudget: number | null;
   contextUsage: ContextUsage;
   eventCount: number;
 }
@@ -83,6 +85,10 @@ export interface TaskEvent {
   permission: PermissionLevel;
   /** 所属工具调用的原始 Proposed 事件 ID；非工具事件为 null/未提供。 */
   toolProposalEventId?: string | null;
+  /** 模型完成事件的供应商 usage；其他事件为 null/未提供。 */
+  usage?: UsageTotals | null;
+  /** 模型完成事件按当前价格配置换算的费用（美元）。 */
+  costUsd?: number | null;
   payload?: unknown;
 }
 
@@ -131,10 +137,27 @@ export interface HealthStatus {
 
 export interface UsageSummary {
   inputTokensToday: number;
+  cachedInputTokensToday: number;
   outputTokensToday: number;
+  totalTokensToday: number;
+  inputTokensMonth: number;
+  cachedInputTokensMonth: number;
+  outputTokensMonth: number;
+  totalTokensMonth: number;
   monthSpentUsd: number;
   monthlyBudgetUsd: number;
-  daily: Array<{ label: string; input: number; output: number }>;
+  tokenBudgetPerTask: number | null;
+  inputPricePerMillionTokens: number;
+  cachedInputPricePerMillionTokens: number;
+  outputPricePerMillionTokens: number;
+  daily: Array<{
+    label: string;
+    input: number;
+    cachedInput: number;
+    output: number;
+    total: number;
+    costUsd: number;
+  }>;
 }
 
 export interface SystemSnapshot {
@@ -175,4 +198,5 @@ export type StreamEvent =
   | { type: "task.updated"; task: TaskSummary }
   | { type: "event.appended"; event: TaskEvent }
   | { type: "approval.updated"; approval: ApprovalRequest }
-  | { type: "authorization.requested"; request: AuthorizationNotification };
+  | { type: "authorization.requested"; request: AuthorizationNotification }
+  | { type: "usage.updated"; usage: UsageSummary };

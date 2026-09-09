@@ -138,6 +138,7 @@ export function EventLine({
   onClick?: () => void;
 }) {
   const { locale } = useI18n();
+  const usage = formatEventUsage(event);
   const content = (
     <>
       <EventIcon kind={event.kind} />
@@ -152,6 +153,11 @@ export function EventLine({
       </div>
       <span className="event-line-meta">
         {event.source}{event.sourceUser ? ` · ${event.sourceUser}` : ""} · {event.permission}
+        {usage
+          ? ` · ${usage}`
+          : event.costUsd !== null && event.costUsd !== undefined
+            ? ` · $${event.costUsd.toFixed(4)}`
+          : ""}
       </span>
     </>
   );
@@ -162,6 +168,13 @@ export function EventLine({
   ) : (
     <article className="event-line">{content}</article>
   );
+}
+
+/** 将单次模型调用的精确用量和费用格式化为紧凑的审计信息。 */
+export function formatEventUsage(event: TaskEvent): string | null {
+  if (!event.usage) return null;
+  const cost = event.costUsd ?? event.usage.costUsd;
+  return `input ${event.usage.inputTokens.toLocaleString()} · cached ${event.usage.cachedInputTokens.toLocaleString()} · output ${event.usage.outputTokens.toLocaleString()} · $${cost.toFixed(4)}`;
 }
 
 /** 长事件默认显示摘要，展开后展示服务端提供的完整正文。 */

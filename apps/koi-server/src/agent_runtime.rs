@@ -42,6 +42,7 @@ pub struct AgentSupervisor {
     reasoning: Arc<ModelTrace>,
     max_model_turns: u16,
     max_concurrent_tasks: usize,
+    token_budget_per_task: Option<u64>,
     active: Mutex<HashMap<TaskId, CancellationToken>>,
     last_models: Mutex<HashMap<TaskId, ModelSelection>>,
     wake: Notify,
@@ -61,6 +62,7 @@ impl AgentSupervisor {
         reasoning: Arc<ModelTrace>,
         max_model_turns: u16,
         max_concurrent_tasks: usize,
+        token_budget_per_task: Option<u64>,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
@@ -72,6 +74,7 @@ impl AgentSupervisor {
             reasoning,
             max_model_turns: max_model_turns.max(1),
             max_concurrent_tasks: max_concurrent_tasks.max(1),
+            token_budget_per_task,
             active: Mutex::new(HashMap::new()),
             last_models: Mutex::new(HashMap::new()),
             wake: Notify::new(),
@@ -319,6 +322,7 @@ impl AgentSupervisor {
             None,
             self.prompts.as_ref(),
         )
+        .with_token_budget(self.token_budget_per_task)
         .with_reasoning_sink(self.reasoning.as_ref())
     }
 
@@ -584,7 +588,12 @@ impl AgentSupervisor {
         task_id: TaskId,
         result: &Result<AgentRunOutcome, koi_core::agent::AgentLoopError>,
     ) {
-        if result.is_err() || matches!(result.as_ref(), Ok(AgentRunOutcome::Cancelled)) {
+        if result.is_err()
+            || matches!(
+                result.as_ref(),
+                Ok(AgentRunOutcome::Cancelled | AgentRunOutcome::BudgetExceeded { .. })
+            )
+        {
             self.models.reset_task(task_id);
         }
         self.finish(task_id);

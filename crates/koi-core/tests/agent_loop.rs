@@ -408,6 +408,76 @@ async fn main_loop_records_model_tool_and_final_response() {
 }
 
 #[tokio::test]
+async fn token_budget_stops_before_tool_execution_and_records_usage() {
+    let evidence_event_id = EventId::new();
+    let model = TwoTurnModel {
+        evidence_event_id,
+        calls: AtomicUsize::new(0),
+    };
+    let tool = Arc::new(StatusTool::new());
+    let mut tools = ToolRegistry::default();
+    tools
+        .register(Arc::clone(&tool) as Arc<dyn ToolExecutor>)
+        .unwrap();
+
+    let store = MemoryEventStore::default();
+    let events = Arc::clone(&store.events);
+    let mut runtime = TaskRuntime::new(store, TaskId::MAIN);
+    let resolver = EvidenceResolver {
+        ingress_event_id: evidence_event_id,
+    };
+    let providers = SourceAuthorizationRegistry::default();
+    let prompts = TestPromptProvider;
+    // 第一次模型调用正好消耗 1 个输入 Token 和 1 个输出 Token，达到预算后不应再执行工具。
+    let agent = AgentLoop::new(&model, &tools, &resolver, &providers, None, &prompts)
+        .with_token_budget(Some(2));
+
+    let outcome = agent
+        .run_main(
+            &mut runtime,
+            AgentRunRequest {
+                trigger_event_id: Some(evidence_event_id),
+                context: vec![ModelContextItem {
+                    event_id: evidence_event_id,
+                    role: ModelInputRole::User,
+                    content: "检查 prod-1".into(),
+                    permission: PermissionLevel::User,
+                    provider_call_id: None,
+                    tool_name: None,
+                }],
+                input_events: vec![],
+                memory_query: None,
+                output_contract: ModelOutputContract::Text,
+                model_options: ModelGenerationOptions::default(),
+                max_model_turns: 3,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        AgentRunOutcome::BudgetExceeded {
+            budget: 2,
+            consumed: 2,
+        }
+    );
+    assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.projection().usage.total_tokens(), 2);
+    assert_eq!(
+        runtime.projection().status,
+        koi_core::domain::TaskStatus::Failed
+    );
+    assert!(events.lock().await.iter().any(|event| matches!(
+        &event.payload,
+        AgentEvent::Control(control)
+            if matches!(control.as_ref(), ControlEvent::BudgetExceeded { budget: 2, consumed: 2 })
+    )));
+}
+
+#[tokio::test]
 async fn cancelled_model_call_during_pause_is_not_recorded_as_failure() {
     let reset_count = Arc::new(AtomicUsize::new(0));
     let model = CancelledStartModel {

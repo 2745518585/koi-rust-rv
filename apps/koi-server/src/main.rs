@@ -7,6 +7,7 @@ use koi_core::domain::{EventSource, PermissionLevel};
 use koi_core::ports::{
     EventStore, SourceAuthorizationRegistry, StaticPermissionDirectory, ToolRegistry,
 };
+use koi_infra::billing::BillingPricing;
 use koi_infra::event_store::JsonlEventStore;
 use koi_infra::llm::ModelProviderRegistry;
 use koi_infra::model_config::{
@@ -139,6 +140,8 @@ impl Default for ModelProxyRuntimeConfig {
 struct AgentConfig {
     max_steps: u16,
     max_concurrent_tasks: usize,
+    /// 单个任务（会话）累计输入与输出 Token 的硬预算；`None` 表示不限制。
+    token_budget_per_task: Option<u64>,
 }
 
 impl Default for AgentConfig {
@@ -146,6 +149,7 @@ impl Default for AgentConfig {
         Self {
             max_steps: 8,
             max_concurrent_tasks: 4,
+            token_budget_per_task: None,
         }
     }
 }
@@ -183,12 +187,21 @@ impl Default for AlertConfig {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 struct UsageConfig {
+    /// 未命中缓存的输入 Token，每百万 Token 的美元价格。
+    input_price_per_million_tokens: f64,
+    /// 缓存命中的输入 Token，每百万 Token 的美元价格。
+    cached_input_price_per_million_tokens: f64,
+    /// 输出 Token，每百万 Token 的美元价格。
+    output_price_per_million_tokens: f64,
     monthly_budget_usd: f64,
 }
 
 impl Default for UsageConfig {
     fn default() -> Self {
         Self {
+            input_price_per_million_tokens: 0.0,
+            cached_input_price_per_million_tokens: 0.0,
+            output_price_per_million_tokens: 0.0,
             monthly_budget_usd: 10.0,
         }
     }
@@ -277,6 +290,23 @@ fn load_logging_config() -> LoggingConfig {
 #[allow(clippy::too_many_lines)]
 async fn run(console_enabled: bool) -> Result<(), ServerError> {
     let config = load_runtime_config()?;
+    let pricing = BillingPricing {
+        input_price_per_million_tokens: config.usage.input_price_per_million_tokens,
+        cached_input_price_per_million_tokens: config.usage.cached_input_price_per_million_tokens,
+        output_price_per_million_tokens: config.usage.output_price_per_million_tokens,
+    }
+    .validate()
+    .map_err(|error| ServerError::Configuration(error.to_string()))?;
+    if config.usage.monthly_budget_usd < 0.0 || !config.usage.monthly_budget_usd.is_finite() {
+        return Err(ServerError::Configuration(
+            "usage.monthly_budget_usd 必须是非负的有限数字".into(),
+        ));
+    }
+    if config.agent.token_budget_per_task == Some(0) {
+        return Err(ServerError::Configuration(
+            "agent.token_budget_per_task 必须大于零；不限制请删除该字段".into(),
+        ));
+    }
     tracing::debug!(
         target: "koi.lifecycle",
         log_directory = %config.logging.directory.display(),
@@ -341,6 +371,7 @@ async fn run(console_enabled: bool) -> Result<(), ServerError> {
             config.usage.monthly_budget_usd,
         )
         .map_err(ServerError::WebApi)?
+        .with_billing(pricing, config.agent.token_budget_per_task)
         .with_model_catalog(
             model_registry
                 .entries()
@@ -388,6 +419,7 @@ async fn run(console_enabled: bool) -> Result<(), ServerError> {
         Arc::clone(&reasoning_trace),
         config.agent.max_steps,
         config.agent.max_concurrent_tasks,
+        config.agent.token_budget_per_task,
     );
     let monitor = if config.monitor.enabled {
         Some(

@@ -316,6 +316,8 @@ pub struct UsageDto {
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
     pub reasoning_tokens: u64,
+    /// 按当前部署价格配置换算的累计费用（美元）。
+    pub cost_usd: f64,
 }
 
 /// 当前事件流可注入模型的文本上下文估算。
@@ -352,6 +354,8 @@ pub struct TaskDto {
     pub minimum_control_permission: String,
     pub selected_model: Option<ModelSelectionDto>,
     pub usage: UsageDto,
+    /// 本任务累计输入与输出 Token 的硬预算；`null` 表示不限制。
+    pub token_budget: Option<u64>,
     pub context_usage: ContextUsageDto,
     pub event_count: usize,
 }
@@ -377,6 +381,10 @@ pub struct EventDto {
     /// 非工具事件以及无法安全解析关联关系的事件为 `null`。该字段只用于展示层
     /// 聚合，不参与权限判断或事件处理。
     pub tool_proposal_event_id: Option<String>,
+    /// 仅模型完成事件携带供应商返回的精确用量。
+    pub usage: Option<UsageDto>,
+    /// 仅模型完成事件携带按当前价格配置换算的费用（美元）。
+    pub cost_usd: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -443,16 +451,29 @@ pub struct HealthDto {
 pub struct DailyUsageDto {
     pub label: String,
     pub input: u64,
+    pub cached_input: u64,
     pub output: u64,
+    pub total: u64,
+    pub cost_usd: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageSummaryDto {
     pub input_tokens_today: u64,
+    pub cached_input_tokens_today: u64,
     pub output_tokens_today: u64,
+    pub total_tokens_today: u64,
+    pub input_tokens_month: u64,
+    pub cached_input_tokens_month: u64,
+    pub output_tokens_month: u64,
+    pub total_tokens_month: u64,
     pub month_spent_usd: f64,
     pub monthly_budget_usd: f64,
+    pub token_budget_per_task: Option<u64>,
+    pub input_price_per_million_tokens: f64,
+    pub cached_input_price_per_million_tokens: f64,
+    pub output_price_per_million_tokens: f64,
     pub daily: Vec<DailyUsageDto>,
 }
 
@@ -479,6 +500,9 @@ pub enum WebStreamEvent {
     EventAppended { event: EventDto },
     #[serde(rename = "authorization.requested")]
     AuthorizationRequested { request: ElevationRequestDto },
+    /// 全局用量在一次模型调用完成后更新；task_id 方法将其归入主会话的可见性边界。
+    #[serde(rename = "usage.updated")]
+    UsageUpdated { usage: UsageSummaryDto },
 }
 
 impl WebStreamEvent {
@@ -488,6 +512,7 @@ impl WebStreamEvent {
             Self::TaskUpdated { task } => &task.task_id,
             Self::EventAppended { event } => &event.task_id,
             Self::AuthorizationRequested { request } => &request.task_id,
+            Self::UsageUpdated { .. } => "00000000-0000-0000-0000-000000000000",
         }
     }
 }

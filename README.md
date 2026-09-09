@@ -34,7 +34,8 @@ npm run build        # 等价于 tsc --noEmit && vite build，产物输出到 we
    - `[monitor]`：可选的本地基础服务监测；支持 HTTP、TCP 和本机原生服务状态检查；
    - `[alerts]`：外部告警 Webhook 的来源名与密钥；密钥也可以通过 `KOI_ALERT_WEBHOOK_TOKEN` 环境变量提供；
    - `[logging]`：按天滚动的 JSON 日志目录与最低级别；`debug` 会保留完整模型请求、供应商原始响应和流式中间输出；
-   - `[usage]`：可选月度预算（当前仅用于展示）。
+   - `[agent].token_budget_per_task`：可选的单任务累计输入与输出 Token 硬预算，达到后自动中断模型循环；删除该字段表示不限制；
+   - `[usage]`：输入、缓存命中输入和输出的美元 / 百万 Token 价格，以及可选的月度费用预算（用于界面展示）。
 2. 复制 `config/models.example.toml` 为 `config/models.toml`，填写供应商、`base_url`、`model_id`、协议、超时、上下文窗口和 API Key。支持 OpenAI Responses 与 Chat Completions 两类协议。生产环境建议使用 `api_key_file` 指向仅模型进程可读的 `0600` 密钥文件，而不是内联 `api_key`。
 3. 复制 `config/authorization.example.toml` 为 `config/authorization.toml`，声明核心身份权限目录：`[source_defaults]` 给出来源的默认身份权限，`[[principals]]` 给出 `(来源, 用户)` 精确身份权限；精确身份优先于来源默认值，未配置的身份按 `None` 失败关闭。该目录是核心权限裁决的依据，外部来源只能提交建议权限、不能改写它。
 4. 运行 `cargo run -p koi-server`（启动时读取 `config/agent.toml`、`config/models.toml` 与 `config/authorization.toml`）。模型系统提示词内嵌于 `koi-server`（`apps/koi-server/prompts/main.md`、`qq.md`、`child.md`；QQ 片段会组装到主会话提示词），无需额外配置。
@@ -51,6 +52,20 @@ npm run build        # 等价于 tsc --noEmit && vite build，产物输出到 we
 3. 先运行 `cargo run -p koi-model-proxy -- --config config/model-proxy.toml`，再运行 `cargo run -p koi-server`。
 
 生产部署中应让 `koi-model-proxy` 使用独立系统用户运行，并使 `models.toml`、API Key 文件只对该用户可读。代理默认只监听回环地址；跨主机部署时必须使用 mTLS 或等效的网络认证。代理令牌不是上游 API Key，但持有它的服务仍能使用代理发起模型调用，因此还应配置模型白名单、预算与速率限制。
+
+### 用量与计费
+
+每次 Responses 或 Chat Completions 调用完成后，核心保存供应商响应中的输入 Token、输出 Token
+和缓存命中输入 Token，并按 `[usage]` 的价格实时换算美元成本。缓存命中 Token 是输入 Token
+的子集，只按缓存价格计费，不会与普通输入价格重复计算；没有完成事件的调用不会被计费。
+
+Web 控制台会在会话头部显示该会话累计 Token、费用和预算，在侧栏显示当前可见会话本月累计费用、
+Token 与当前价格；事件详情也会显示每次模型调用的精确用量和单次费用。服务通过 SSE 推送新的
+模型完成统计，刷新页面后仍从事件存储重算，不依赖前端本地累计。
+
+`[agent].token_budget_per_task` 按任务事件流中已完成模型调用的输入与输出 Token 累计。达到预算
+后核心写入 `BudgetExceeded` 控制事件并停止后续模型调用和工具调用；该事件会进入审计流并在界面
+中体现为预算中断。预算是任务级的，暂停、恢复或重新提交输入不会绕过已经消耗的额度。
 
 服务同时向控制台和 `[logging].directory` 写入日志。文件按天滚动，默认文件名为 `koi.log.YYYY-MM-DD`，每行是独立 JSON；事件持久化、权限审查、模型请求与响应、工具生命周期和任务调度都会记录。`debug` 级别还会记录供应商原始响应与流式中间输出（包括接口实际返回的 reasoning summary 或 `reasoning_content`）。为 Responses 模型设置 `reasoning_summary = "auto"` 后，提供方返回的摘要会通过进程内通道实时发送到日志和 `koi-console attach`，不会写入事件存储。模型供应商未返回的隐藏思维链无法由 Agent 获取；日志只记录实际收到的数据。
 

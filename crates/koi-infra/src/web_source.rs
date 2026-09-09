@@ -11,11 +11,12 @@ use crate::alerts::{
     ALERTMANAGER_SOURCE_NAME, AlertInput, MONITOR_SOURCE_NAME, WEBHOOK_SOURCE_NAME,
     parse_webhook_alerts,
 };
+use crate::billing::{BillingPricing, totals_from_events, usage_from_event};
 use crate::event_store::JsonlEventStore;
 use crate::service_monitor::MonitorAlertSink;
 use crate::web_identity::WebUserStore;
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{Datelike, Utc};
 use koi_api::{
     AlertWebhookPort, AlertWebhookResponse, AppendContextCommand, ApprovalCommand, ApprovalDto,
     CancellationRequestCommand, ContextUsageDto, CreateTaskCommand, DailyUsageDto, DashboardDto,
@@ -32,7 +33,7 @@ use koi_core::domain::{
     AgentEvent, ApprovalGrant, ContextEnvelope, ContextKind, ContextOrigin, ContextPayload,
     ControlEvent, EventEnvelope, EventId, EventSource, IngressDraft, IngressEvent, ModelSelection,
     PermissionLevel, PolicyDecision, Principal, Scope, SourceName, TaskId, TaskProjection,
-    ToolDefinition, ToolEvent,
+    ToolDefinition, ToolEvent, UsageTotals,
 };
 use koi_core::domain::{AuthorizationRequest, AuthorizationRequestResult};
 use koi_core::ports::{
@@ -88,6 +89,8 @@ pub struct KoiWebSource {
     model_context_windows: BTreeMap<ModelSelection, u32>,
     default_model: Option<ModelSelection>,
     monthly_budget_usd: f64,
+    pricing: BillingPricing,
+    token_budget_per_task: Option<u64>,
 }
 
 impl KoiWebSource {
@@ -147,6 +150,8 @@ impl KoiWebSource {
             model_context_windows: BTreeMap::new(),
             default_model: None,
             monthly_budget_usd,
+            pricing: BillingPricing::default(),
+            token_budget_per_task: None,
         })
     }
 
@@ -169,6 +174,20 @@ impl KoiWebSource {
         self
     }
 
+    /// 设置部署级价格表和单任务 Token 预算。
+    ///
+    /// 价格故意放在 `koi-core` 之外：修改展示配置不会改变模型完成事件中记录的不可变用量。
+    #[must_use]
+    pub fn with_billing(
+        mut self,
+        pricing: BillingPricing,
+        token_budget_per_task: Option<u64>,
+    ) -> Self {
+        self.pricing = pricing;
+        self.token_budget_per_task = token_budget_per_task;
+        self
+    }
+
     fn task_dto(
         &self,
         task_id: TaskId,
@@ -182,7 +201,14 @@ impl KoiWebSource {
         let context_window_tokens = selection
             .and_then(|model| self.model_context_windows.get(model))
             .copied();
-        task_dto(task_id, events, projection, context_window_tokens)
+        task_dto(
+            task_id,
+            events,
+            projection,
+            context_window_tokens,
+            self.pricing,
+            self.token_budget_per_task,
+        )
     }
 
     fn validate_principal(&self, principal: &WebPrincipal) -> Result<(), WebApiError> {
@@ -210,7 +236,7 @@ impl KoiWebSource {
             .await
             .unwrap_or_else(|_| vec![event.clone()]);
         let _ = self.events.send(WebStreamEvent::EventAppended {
-            event: event_dto(event, &events),
+            event: event_dto(event, &events, self.pricing),
         });
         // Token 累计与可注入上下文都由完整事件流投影得出；单独推送原始事件不足以
         // 让前端准确更新会话头部指标，因此同时发送新的任务摘要。
@@ -218,6 +244,13 @@ impl KoiWebSource {
             let _ = self.events.send(WebStreamEvent::TaskUpdated {
                 task: self.task_dto(event.task_id, &events, runtime.projection()),
             });
+        }
+        if is_model_completion(event) {
+            if let Ok(records) = self.task_records().await {
+                let _ = self.events.send(WebStreamEvent::UsageUpdated {
+                    usage: self.usage_summary(&records),
+                });
+            }
         }
     }
 
@@ -588,6 +621,61 @@ impl KoiWebSource {
         }
         Ok(None)
     }
+
+    /// 根据当前可见任务的完整事件流计算全局 Token 与费用摘要。
+    ///
+    /// 只有 `ModelEvent::Completed` 才代表一次 API 调用已经拿到供应商 usage；Delta、工具
+    /// 事件和失败事件不会被重复计费。月度统计按事件写入时间计算，任务卡片则保留任务的
+    /// 全生命周期累计值。
+    fn usage_summary(&self, records: &[TaskRecord]) -> UsageSummaryDto {
+        let now = Utc::now();
+        let today = now.date_naive();
+        let mut today_totals = UsageTotals::default();
+        let mut month_totals = UsageTotals::default();
+
+        for record in records {
+            for event in &record.events {
+                let Some(usage) = usage_from_event(event) else {
+                    continue;
+                };
+                if event.recorded_at.date_naive() == today {
+                    today_totals.add_usage(usage);
+                }
+                if event.recorded_at.year() == now.year()
+                    && event.recorded_at.month() == now.month()
+                {
+                    month_totals.add_usage(usage);
+                }
+            }
+        }
+
+        UsageSummaryDto {
+            input_tokens_today: today_totals.input_tokens,
+            cached_input_tokens_today: today_totals.cached_input_tokens,
+            output_tokens_today: today_totals.output_tokens,
+            total_tokens_today: today_totals.total_tokens(),
+            input_tokens_month: month_totals.input_tokens,
+            cached_input_tokens_month: month_totals.cached_input_tokens,
+            output_tokens_month: month_totals.output_tokens,
+            total_tokens_month: month_totals.total_tokens(),
+            month_spent_usd: self.pricing.cost_for_totals(&month_totals),
+            monthly_budget_usd: self.monthly_budget_usd,
+            token_budget_per_task: self.token_budget_per_task,
+            input_price_per_million_tokens: self.pricing.input_price_per_million_tokens,
+            cached_input_price_per_million_tokens: self
+                .pricing
+                .cached_input_price_per_million_tokens,
+            output_price_per_million_tokens: self.pricing.output_price_per_million_tokens,
+            daily: vec![DailyUsageDto {
+                label: "今天".into(),
+                input: today_totals.input_tokens,
+                cached_input: today_totals.cached_input_tokens,
+                output: today_totals.output_tokens,
+                total: today_totals.total_tokens(),
+                cost_usd: self.pricing.cost_for_totals(&today_totals),
+            }],
+        }
+    }
 }
 
 #[async_trait]
@@ -607,19 +695,12 @@ impl WebQueryPort for KoiWebSource {
                 record
                     .events
                     .iter()
-                    .map(|event| event_dto(event, &record.events))
+                    .map(|event| event_dto(event, &record.events, self.pricing))
             })
             .collect::<Vec<_>>();
         recent_events.sort_by(|left, right| right.occurred_at.cmp(&left.occurred_at));
         recent_events.truncate(30);
 
-        let (input_tokens_today, output_tokens_today) =
-            records.iter().fold((0_u64, 0_u64), |totals, record| {
-                (
-                    totals.0.saturating_add(record.summary.usage.input_tokens),
-                    totals.1.saturating_add(record.summary.usage.output_tokens),
-                )
-            });
         Ok(DashboardDto {
             generated_at: Utc::now().to_rfc3339(),
             health: HealthDto {
@@ -637,17 +718,7 @@ impl WebQueryPort for KoiWebSource {
             tools: self.tool_dtos(),
             models: self.models.iter().map(model_selection_dto).collect(),
             default_model: self.default_model.as_ref().map(model_selection_dto),
-            usage: UsageSummaryDto {
-                input_tokens_today,
-                output_tokens_today,
-                month_spent_usd: 0.0,
-                monthly_budget_usd: self.monthly_budget_usd,
-                daily: vec![DailyUsageDto {
-                    label: "今天".into(),
-                    input: input_tokens_today,
-                    output: output_tokens_today,
-                }],
-            },
+            usage: self.usage_summary(&records),
         })
     }
 
@@ -674,7 +745,7 @@ impl WebQueryPort for KoiWebSource {
         Ok(record
             .events
             .iter()
-            .map(|event| event_dto(event, &record.events))
+            .map(|event| event_dto(event, &record.events, self.pricing))
             .collect())
     }
 
@@ -794,7 +865,7 @@ impl WebCommandPort for KoiWebSource {
             .load_task(task_id)
             .await
             .map_err(|error| WebApiError::internal(error.to_string()))?;
-        let dto = event_dto(&recorded, &events);
+        let dto = event_dto(&recorded, &events, self.pricing);
         self.publish(&recorded).await;
         Ok(dto)
     }
@@ -832,7 +903,7 @@ impl WebCommandPort for KoiWebSource {
             .load_task(task_id)
             .await
             .map_err(|error| WebApiError::internal(error.to_string()))?;
-        let dto = event_dto(&recorded, &events);
+        let dto = event_dto(&recorded, &events, self.pricing);
         self.publish(&recorded).await;
         Ok(dto)
     }
@@ -1331,8 +1402,11 @@ fn task_dto(
     events: &[EventEnvelope],
     projection: &TaskProjection,
     context_window_tokens: Option<u32>,
+    pricing: BillingPricing,
+    token_budget_per_task: Option<u64>,
 ) -> TaskDto {
-    let last_event = events.last().map(|event| event_dto(event, events));
+    let last_event = events.last().map(|event| event_dto(event, events, pricing));
+    let totals = totals_from_events(events.iter());
     let started_at = events.first().map_or_else(
         || Utc::now().to_rfc3339(),
         |event| event.recorded_at.to_rfc3339(),
@@ -1365,7 +1439,9 @@ fn task_dto(
             output_tokens: projection.usage.output_tokens,
             cached_input_tokens: projection.usage.cached_input_tokens,
             reasoning_tokens: projection.usage.reasoning_tokens,
+            cost_usd: pricing.cost_for_totals(&totals),
         },
+        token_budget: token_budget_per_task,
         context_usage: ContextUsageDto {
             estimated_tokens: ContextAssembler::from_events(
                 task_id,
@@ -1439,8 +1515,10 @@ fn task_scope(task_id: TaskId, events: &[EventEnvelope]) -> ScopeDto {
         })
 }
 
-fn event_dto(event: &EventEnvelope, events: &[EventEnvelope]) -> EventDto {
+fn event_dto(event: &EventEnvelope, events: &[EventEnvelope], pricing: BillingPricing) -> EventDto {
     let (kind, title, summary) = event_description(&event.payload);
+    let usage = usage_from_event(event).map(|usage| usage_dto(usage, pricing));
+    let cost_usd = usage.as_ref().map(|usage| usage.cost_usd);
     EventDto {
         id: event.id.to_string(),
         task_id: event.task_id.to_string(),
@@ -1457,7 +1535,27 @@ fn event_dto(event: &EventEnvelope, events: &[EventEnvelope]) -> EventDto {
             .direct_permission
             .map_or_else(|| "None".into(), permission_name),
         tool_proposal_event_id: tool_proposal_event_id(event, events),
+        usage,
+        cost_usd,
     }
+}
+
+fn usage_dto(usage: &koi_core::domain::Usage, pricing: BillingPricing) -> UsageDto {
+    UsageDto {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cached_input_tokens: usage.cached_input_tokens.unwrap_or_default(),
+        reasoning_tokens: usage.reasoning_tokens.unwrap_or_default(),
+        cost_usd: pricing.cost_for_usage(usage),
+    }
+}
+
+fn is_model_completion(event: &EventEnvelope) -> bool {
+    matches!(
+        &event.payload,
+        AgentEvent::Model(model)
+            if matches!(model.as_ref(), koi_core::domain::ModelEvent::Completed { .. })
+    )
 }
 
 /// 提取事件直接来源用户的显示名。输入、审批和取消事件本身携带已认证身份；其余
@@ -1950,19 +2048,19 @@ mod tests {
         let proposal_id = events[0].id.to_string();
 
         assert_eq!(
-            event_dto(&events[0], &events).tool_proposal_event_id,
+            event_dto(&events[0], &events, BillingPricing::default()).tool_proposal_event_id,
             Some(proposal_id.clone())
         );
         assert_eq!(
-            event_dto(&events[1], &events).tool_proposal_event_id,
+            event_dto(&events[1], &events, BillingPricing::default()).tool_proposal_event_id,
             Some(proposal_id.clone())
         );
         assert_eq!(
-            event_dto(&events[2], &events).tool_proposal_event_id,
+            event_dto(&events[2], &events, BillingPricing::default()).tool_proposal_event_id,
             Some(proposal_id.clone())
         );
         assert_eq!(
-            event_dto(&events[3], &events).tool_proposal_event_id,
+            event_dto(&events[3], &events, BillingPricing::default()).tool_proposal_event_id,
             Some(proposal_id)
         );
     }
@@ -2016,12 +2114,24 @@ mod tests {
         let events = vec![proposed, approval_requested, approval_submitted, control];
         let proposal_id = events[0].id.to_string();
 
-        assert_eq!(event_dto(&events[0], &events).kind, "tool");
-        assert_eq!(event_dto(&events[1], &events).kind, "tool");
-        assert_eq!(event_dto(&events[2], &events).kind, "ingress");
-        assert_eq!(event_dto(&events[3], &events).kind, "control");
         assert_eq!(
-            event_dto(&events[2], &events).tool_proposal_event_id,
+            event_dto(&events[0], &events, BillingPricing::default()).kind,
+            "tool"
+        );
+        assert_eq!(
+            event_dto(&events[1], &events, BillingPricing::default()).kind,
+            "tool"
+        );
+        assert_eq!(
+            event_dto(&events[2], &events, BillingPricing::default()).kind,
+            "ingress"
+        );
+        assert_eq!(
+            event_dto(&events[3], &events, BillingPricing::default()).kind,
+            "control"
+        );
+        assert_eq!(
+            event_dto(&events[2], &events, BillingPricing::default()).tool_proposal_event_id,
             Some(proposal_id)
         );
     }

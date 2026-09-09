@@ -66,6 +66,13 @@ function applyStreamEvent(snapshot: SystemSnapshot, streamEvent: StreamEvent): S
     return snapshot;
   }
 
+  if (streamEvent.type === "usage.updated") {
+    return {
+      ...snapshot,
+      usage: streamEvent.usage,
+    };
+  }
+
   return {
     ...snapshot,
     recentEvents: [streamEvent.event, ...snapshot.recentEvents].slice(0, 24),
@@ -310,6 +317,7 @@ export default function App() {
         selectedTaskId={selectedTask?.taskId ?? ""}
         view={view}
         pendingApprovals={pendingApprovals.length}
+        usage={snapshot.usage}
         user={user}
         isLive={isLive}
         open={sidebarOpen}
@@ -352,6 +360,7 @@ export default function App() {
             isLive={isLive}
             approvals={displayedApprovals}
             models={snapshot.models}
+            usage={snapshot.usage}
             maximumPermission={user.permission}
             currentUsername={user.username}
             suggestedPermission={suggestedPermission}

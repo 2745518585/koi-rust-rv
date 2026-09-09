@@ -1,7 +1,7 @@
 import type { LucideIcon } from "lucide-react";
 import { FileClock, LogOut, Plus, ShieldCheck, Wrench, X } from "lucide-react";
 import type { AuthUser } from "../api/client";
-import type { TaskSummary } from "../api/types";
+import type { TaskSummary, UsageSummary } from "../api/types";
 import { useI18n } from "../i18n";
 import { shortId } from "../lib/format";
 import type { ViewKey } from "../lib/ui";
@@ -12,6 +12,7 @@ interface SidebarProps {
   selectedTaskId: string;
   view: ViewKey;
   pendingApprovals: number;
+  usage: UsageSummary;
   user: AuthUser;
   isLive: boolean;
   /** 移动端抽屉展开状态。 */
@@ -28,6 +29,7 @@ export function Sidebar({
   selectedTaskId,
   view,
   pendingApprovals,
+  usage,
   user,
   isLive,
   open,
@@ -68,6 +70,8 @@ export function Sidebar({
           {t("newSession")}
         </button>
       </div>
+
+      <UsageCard usage={usage} />
 
       <div className="side-sessions">
         <div className="side-group">{t("mainSession")}</div>
@@ -129,6 +133,48 @@ export function Sidebar({
       </div>
     </aside>
   );
+}
+
+function UsageCard({ usage }: { usage: UsageSummary }) {
+  const { t } = useI18n();
+  const monthlyBudget = usage.monthlyBudgetUsd > 0
+    ? ` / ${formatUsd(usage.monthlyBudgetUsd)}`
+    : "";
+  const taskBudgetValue = usage.tokenBudgetPerTask;
+  const taskBudget = taskBudgetValue === null
+    ? t("unlimited")
+    : `${formatTokenCount(taskBudgetValue)} ${t("tokens")}`;
+  return (
+    <section className="side-usage" aria-label={t("usageSummary")}>
+      <div className="side-usage-head">
+        <span>{t("monthCost")}</span>
+        <strong>{formatUsd(usage.monthSpentUsd)}{monthlyBudget}</strong>
+      </div>
+      <div className="side-usage-line">
+        <span>{t("monthTokens")}</span>
+        <strong>{formatTokenCount(usage.totalTokensMonth)}</strong>
+      </div>
+      <div className="side-usage-line">
+        <span>{t("taskTokenBudget")}</span>
+        <strong>{taskBudget}</strong>
+      </div>
+      <small title={t("pricingHint")}>
+        {t("pricingShort", {
+          input: usage.inputPricePerMillionTokens,
+          cached: usage.cachedInputPricePerMillionTokens,
+          output: usage.outputPricePerMillionTokens,
+        })}
+      </small>
+    </section>
+  );
+}
+
+function formatTokenCount(tokens: number): string {
+  return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(tokens);
+}
+
+function formatUsd(value: number): string {
+  return `$${value.toFixed(4)}`;
 }
 
 function SessionItem({

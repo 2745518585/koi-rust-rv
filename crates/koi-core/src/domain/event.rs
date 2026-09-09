@@ -375,6 +375,16 @@ pub struct Usage {
     pub reasoning_tokens: Option<u64>,
 }
 
+impl Usage {
+    /// 返回本次模型调用实际消耗的输入与输出 Token 总数。
+    ///
+    /// 缓存命中 Token 属于输入 Token 的子集，因此不会再次加到总数中。
+    #[must_use]
+    pub const fn total_tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ToolCall {
     pub name: String,

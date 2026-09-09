@@ -76,6 +76,11 @@ pub enum AgentRunOutcome {
     StartedChildTask {
         task_id: TaskId,
     },
+    /// 任务累计 Token 已达到配置的预算，核心已停止继续调用模型。
+    BudgetExceeded {
+        budget: u64,
+        consumed: u64,
+    },
     Cancelled,
 }
 
@@ -135,6 +140,7 @@ pub struct AgentLoop<'a, S: EventStore> {
     prompts: &'a dyn crate::ports::SystemPromptProvider,
     task_manager: Option<&'a TaskManager<S>>,
     reasoning_sink: Option<&'a dyn ModelReasoningSink>,
+    token_budget: Option<u64>,
 }
 
 impl<'a, S: EventStore> AgentLoop<'a, S> {
@@ -156,6 +162,7 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
             prompts,
             task_manager: None,
             reasoning_sink: None,
+            token_budget: None,
         }
     }
 
@@ -170,6 +177,16 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
     #[must_use]
     pub const fn with_reasoning_sink(mut self, sink: &'a dyn ModelReasoningSink) -> Self {
         self.reasoning_sink = Some(sink);
+        self
+    }
+
+    /// 设置本任务累计输入与输出 Token 的硬预算。
+    ///
+    /// `None` 表示不限制；`Some(0)` 表示禁止发起模型调用。预算按事件流中已经完成的
+    /// 模型调用累计，因此任务暂停、恢复或重新排队不会绕过预算。
+    #[must_use]
+    pub const fn with_token_budget(mut self, token_budget: Option<u64>) -> Self {
+        self.token_budget = token_budget;
         self
     }
 
@@ -368,6 +385,10 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                 return Ok(AgentRunOutcome::Cancelled);
             }
 
+            if let Some(outcome) = self.check_token_budget(runtime).await? {
+                return Ok(outcome);
+            }
+
             context = self
                 .fit_context_to_budget(runtime, &request, context)
                 .await?;
@@ -383,6 +404,12 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
                 Err(AgentLoopError::Cancelled) => return Ok(AgentRunOutcome::Cancelled),
                 Err(error) => return Err(error),
             };
+
+            // Completed 事件已经包含供应商返回的精确 usage。达到预算后立即停止，避免
+            // 继续执行本轮工具调用或发起下一轮模型请求。
+            if let Some(outcome) = self.check_token_budget(runtime).await? {
+                return Ok(outcome);
+            }
 
             let outputs = completed.outputs;
             let mut tool_calls = Vec::new();
@@ -445,6 +472,27 @@ impl<'a, S: EventStore> AgentLoop<'a, S> {
 
         self.record_failed(runtime, "达到最大模型轮数").await?;
         Err(AgentLoopError::ModelTurnLimitExceeded)
+    }
+
+    /// 检查累计 Token 预算，并在首次超限时写入可审计的控制事件。
+    async fn check_token_budget(
+        &self,
+        runtime: &mut TaskRuntime<S>,
+    ) -> Result<Option<AgentRunOutcome>, AgentLoopError> {
+        let Some(budget) = self.token_budget else {
+            return Ok(None);
+        };
+        let consumed = runtime.projection().usage.total_tokens();
+        if consumed < budget {
+            return Ok(None);
+        }
+        runtime
+            .record(
+                AgentEvent::control(ControlEvent::BudgetExceeded { budget, consumed }),
+                None,
+            )
+            .await?;
+        Ok(Some(AgentRunOutcome::BudgetExceeded { budget, consumed }))
     }
 
     fn model_tools(&self, is_main_session: bool) -> Vec<crate::domain::ModelToolDefinition> {

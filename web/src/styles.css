@@ -102,6 +102,24 @@ textarea { resize: none; }
 .side-new { padding: 8px 12px 10px; }
 .side-new-button { width: 100%; }
 
+.side-usage {
+  display: grid;
+  gap: 5px;
+  margin: 0 12px 4px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--bg);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 9.5px;
+}
+.side-usage-head,
+.side-usage-line { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.side-usage-head strong { color: var(--accent-strong); font-size: 11px; }
+.side-usage-line strong { color: var(--ink); font-weight: 600; }
+.side-usage small { overflow: hidden; color: var(--faint); text-overflow: ellipsis; white-space: nowrap; }
+
 .side-sessions { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 0 8px; overflow-y: auto; }
 .side-group { padding: 12px 9px 5px; color: var(--faint); font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.08em; text-transform: uppercase; }
 .side-note { margin: 2px 9px 10px; color: var(--faint); font-size: 11px; line-height: 1.5; }
@@ -341,6 +359,10 @@ textarea { resize: none; }
 .conv-metrics { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-family: var(--mono); font-size: 10px; white-space: nowrap; }
 .conv-metric { display: inline-flex; align-items: baseline; gap: 4px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
 .conv-metric b { color: var(--faint); font-weight: 600; }
+.conv-metric-danger { border-color: #e7b9b6; color: var(--danger); background: var(--danger-soft); }
+.conv-metric-danger b { color: var(--danger); }
+.conv-month-usage { color: var(--muted); font-family: var(--mono); font-size: 10px; white-space: nowrap; }
+.conv-month-usage b { margin-right: 4px; color: var(--faint); font-weight: 600; }
 
 .model-select {
   height: 29px;
@@ -448,6 +470,7 @@ textarea { resize: none; }
   box-shadow: none;
 }
 .msg-agent time { color: var(--faint); }
+.msg-usage { display: block; margin-top: 6px; color: var(--faint); font-family: var(--mono); font-size: 9.5px; }
 .msg-agent-error {
   align-self: flex-start;
   width: auto;

@@ -17,12 +17,21 @@ import {
   Trash2,
 } from "lucide-react";
 import type { KoiApiClient } from "../api/client";
-import type { ApprovalGrant, ApprovalRequest, ModelSelection, PermissionLevel, TaskEvent, TaskSummary } from "../api/types";
+import type {
+  ApprovalGrant,
+  ApprovalRequest,
+  ModelSelection,
+  PermissionLevel,
+  TaskEvent,
+  TaskSummary,
+  UsageSummary,
+} from "../api/types";
 import { useI18n } from "../i18n";
 import { groupConversationEvents, type ConversationFeedItem } from "../lib/events";
 import { formatRelative, scopeLabel } from "../lib/format";
 import {
   EmptyState, EventIcon, EventLine, EventSummary, PermissionSelector, StatusBadge,
+  formatEventUsage,
   suggestedPermissionOptions,
 } from "../lib/ui";
 import { ApprovalCard } from "./ApprovalCard";
@@ -37,6 +46,7 @@ export interface ConversationProps {
   isLive: boolean;
   approvals: ApprovalRequest[];
   models: ModelSelection[];
+  usage: UsageSummary;
   /** 当前身份权限，作为建议授权选择器的上限。 */
   maximumPermission: PermissionLevel;
   /** 当前 Web 用户名，用于区分自己的输入与其他来源的输入。 */
@@ -64,6 +74,7 @@ export function Conversation({
   isLive,
   approvals,
   models,
+  usage,
   maximumPermission,
   currentUsername,
   suggestedPermission,
@@ -332,6 +343,23 @@ export function Conversation({
             <b>{t("totalTokenUsage")}</b>
             {formatTokenCount(totalTokens)}
           </span>
+          <span className="conv-metric" title={t("costHint")}>
+            <b>{t("cost")}</b>
+            {formatUsd(task.usage.costUsd)}
+          </span>
+          {task.tokenBudget !== null ? (
+            <span
+              className={`conv-metric ${totalTokens >= task.tokenBudget ? "conv-metric-danger" : ""}`}
+              title={t("taskBudgetHint")}
+            >
+              <b>{t("budget")}</b>
+              {formatTokenCount(totalTokens)} / {formatTokenCount(task.tokenBudget)}
+            </span>
+          ) : null}
+        </div>
+        <div className="conv-month-usage hide-narrow" title={t("globalUsageHint")}>
+          <b>{t("monthCost")}</b>
+          {formatUsd(usage.monthSpentUsd)}
         </div>
         <select
           className="model-select hide-narrow"
@@ -516,6 +544,10 @@ function formatTokenUsageDetail(task: TaskSummary): string {
   return `input ${task.usage.inputTokens.toLocaleString()} · output ${task.usage.outputTokens.toLocaleString()} · cached ${task.usage.cachedInputTokens.toLocaleString()} · reasoning ${task.usage.reasoningTokens.toLocaleString()}`;
 }
 
+function formatUsd(value: number): string {
+  return `$${value.toFixed(4)}`;
+}
+
 function ConversationFeedMessage({
   item,
   currentUsername,
@@ -610,6 +642,7 @@ function ToolEventGroupLine({ events }: { events: TaskEvent[] }) {
 
 function ConversationMessage({ event, currentUsername }: { event: TaskEvent; currentUsername: string }) {
   const { locale } = useI18n();
+  const usage = formatEventUsage(event);
   if (event.kind === "ingress") {
     const ownInput = event.source === "web" && event.sourceUser === currentUsername;
     const sourceLabel = event.sourceUser ? `${event.source} · ${event.sourceUser}` : event.source;
@@ -640,6 +673,7 @@ function ConversationMessage({ event, currentUsername }: { event: TaskEvent; cur
     <article className={`msg msg-agent ${failed ? "msg-agent-error" : ""}`}>
       {failed ? <strong>{event.title}</strong> : null}
       <MarkdownContent content={event.detail ?? event.summary} />
+      {usage ? <small className="msg-usage">{usage}</small> : null}
       <time>{formatRelative(event.occurredAt, locale)}</time>
     </article>
   );
