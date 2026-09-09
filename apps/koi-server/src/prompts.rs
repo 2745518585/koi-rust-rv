@@ -50,6 +50,8 @@ mod tests {
         assert!(prompt.content.contains("For a Web conversation"));
         assert!(prompt.content.contains("call `qq.reply`"));
         assert!(prompt.content.contains("For a child task"));
+        assert!(prompt.content.contains("## Completion protocol"));
+        assert!(prompt.content.contains("progress-only text"));
         assert!(
             prompt
                 .content
@@ -72,5 +74,6 @@ mod tests {
         assert!(!prompt.content.contains("## QQ source context"));
         assert!(prompt.content.contains("every visible input event"));
         assert!(prompt.content.contains("An alert can authorize"));
+        assert!(prompt.content.contains("## Completion protocol"));
     }
 }

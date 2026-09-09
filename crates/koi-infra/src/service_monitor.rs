@@ -20,6 +20,8 @@ use tracing::{error, info};
 
 use crate::alerts::{AlertInput, MONITOR_SOURCE_NAME};
 
+const MAX_CHECK_DESCRIPTION_CHARS: usize = 512;
+
 /// Basic check types supported by the built-in monitor.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -40,6 +42,9 @@ pub struct ServiceCheckConfig {
     pub target: String,
     #[serde(default)]
     pub name: Option<String>,
+    /// 该检查项的业务说明，会随告警作为参考资料提供给模型。
+    #[serde(default)]
+    pub description: Option<String>,
     #[serde(default = "default_severity")]
     pub severity: String,
     #[serde(default = "default_check_enabled")]
@@ -285,6 +290,21 @@ fn validate_config(config: &ServiceMonitorConfig) -> Result<(), ServiceMonitorCo
                 check.id
             )));
         }
+        if let Some(description) = &check.description {
+            let description = description.trim();
+            if description.is_empty() || description.chars().count() > MAX_CHECK_DESCRIPTION_CHARS {
+                return Err(ServiceMonitorConfigError::Invalid(format!(
+                    "检查项 {} 的 description 无效，长度必须为 1 到 {MAX_CHECK_DESCRIPTION_CHARS} 个字符",
+                    check.id
+                )));
+            }
+            if description.contains('\0') {
+                return Err(ServiceMonitorConfigError::Invalid(format!(
+                    "检查项 {} 的 description 不能包含 NUL 字符",
+                    check.id
+                )));
+            }
+        }
         if check
             .timeout_secs
             .is_some_and(|timeout_secs| timeout_secs == 0)
@@ -470,6 +490,7 @@ fn make_alert(
         name: "service_unhealthy".into(),
         severity: check.severity.clone(),
         summary,
+        description: check.description.clone(),
         labels,
         scope: koi_core::domain::Scope::new("service", check.id.clone()),
         occurred_at: Utc::now(),
@@ -496,6 +517,7 @@ mod tests {
             kind: ServiceCheckKind::Http,
             target: "http://127.0.0.1:8080/healthz".into(),
             name: Some("API".into()),
+            description: Some("检查 API 健康端点是否返回预期状态码".into()),
             severity: "critical".into(),
             enabled: true,
             expected_status: Some(200),
@@ -516,6 +538,10 @@ mod tests {
         let firing = transition_alert("local", 3, 2, &check, &mut state, &failed).unwrap();
         assert_eq!(firing.native_event_id, "api:firing");
         assert_eq!(firing.labels["state"], "firing");
+        assert_eq!(
+            firing.description.as_deref(),
+            Some("检查 API 健康端点是否返回预期状态码")
+        );
         assert!(
             transition_alert(
                 "local",
@@ -545,6 +571,16 @@ mod tests {
         let mut config = ServiceMonitorConfig::default();
         config.checks.push(ServiceCheckConfig {
             target: "not-a-url".into(),
+            ..check()
+        });
+        assert!(ServiceMonitor::new(config, Arc::new(TestSink)).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_check_descriptions() {
+        let mut config = ServiceMonitorConfig::default();
+        config.checks.push(ServiceCheckConfig {
+            description: Some("  ".into()),
             ..check()
         });
         assert!(ServiceMonitor::new(config, Arc::new(TestSink)).is_err());

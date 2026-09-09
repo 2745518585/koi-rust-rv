@@ -181,6 +181,8 @@ koi-console --socket /path/to/koi-admin.sock attach
 - `kind = "tcp"`：检查 `host:port` 是否可以建立连接；
 - `kind = "service"`：Windows 使用 `sc.exe` 检查服务，Linux/Unix 使用 `systemctl` 检查服务是否 active。
 
+每个 `[[monitor.checks]]` 都可以配置可选的 `description` 简短说明。说明会原样保存在告警上下文中，并以“规则说明”标注注入模型，帮助模型理解检查项的业务含义；它只是参考资料，不会改变告警权限。
+
 示例配置：
 
 ```toml
@@ -197,6 +199,7 @@ id = "koi-api"
 kind = "http"
 target = "http://127.0.0.1:8080/healthz"
 name = "Koi API"
+description = "检查 Koi API 健康端点是否可达并返回预期状态码"
 severity = "critical"
 expected_status = 200
 ```

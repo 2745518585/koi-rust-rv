@@ -249,16 +249,44 @@ fn render_payload(payload: &ContextPayload) -> String {
             name,
             severity,
             summary,
+            description,
             labels,
-        } => format!(
-            "告警：{name}\n严重级别：{severity}\n摘要：{summary}\n标签：{}",
-            labels
-                .iter()
-                .map(|(key, value)| format!("{key}={value}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        } => {
+            let mut content = format!("告警：{name}\n严重级别：{severity}\n摘要：{summary}");
+            if let Some(description) = description {
+                content.push_str(&format!("\n规则说明：{description}"));
+            }
+            content.push_str(&format!(
+                "\n标签：{}",
+                labels
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            content
+        }
         ContextPayload::Structured(value) => value.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    #[test]
+    fn renders_alert_rule_description_for_model() {
+        let content = render_payload(&ContextPayload::Alert {
+            name: "service_unhealthy".into(),
+            severity: "critical".into(),
+            summary: "检查失败".into(),
+            description: Some("该检查用于确认公网入口可达".into()),
+            labels: BTreeMap::new(),
+        });
+
+        assert!(content.contains("规则说明：该检查用于确认公网入口可达"));
     }
 }
 

@@ -297,6 +297,12 @@ pub enum ContextPayload {
         name: String,
         severity: String,
         summary: String,
+        /// 由告警规则配置提供的简短说明，帮助模型理解检查项的业务含义。
+        ///
+        /// 该字段是参考资料，不改变告警权限，也不能作为工具调用授权依据。使用
+        /// `Option` 并提供默认值，以兼容已经持久化的旧版告警事件。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
         labels: BTreeMap<String, String>,
     },
     Structured(Value),

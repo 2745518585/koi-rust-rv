@@ -70,6 +70,7 @@ id = "koi-api"
 kind = "http"
 target = "http://127.0.0.1:8080/healthz"
 name = "Koi API"
+description = "检查 Koi API 健康端点是否可达并返回预期状态码"
 severity = "critical"
 expected_status = 200
 

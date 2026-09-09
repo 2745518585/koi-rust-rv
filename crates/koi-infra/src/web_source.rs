@@ -1239,12 +1239,14 @@ impl AlertIngestResult {
 
 fn alert_context(alert: AlertInput) -> Result<ContextEnvelope, WebApiError> {
     let content_hash = fingerprint(&format!(
-        "{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}",
         alert.source,
         alert.source_instance,
         alert.native_event_id,
         alert.name,
         alert.severity,
+        serde_json::to_string(&alert.description)
+            .map_err(|error| WebApiError::internal(error.to_string()))?,
         serde_json::to_string(&alert.labels)
             .map_err(|error| WebApiError::internal(error.to_string()))?,
     ));
@@ -1268,6 +1270,7 @@ fn alert_context(alert: AlertInput) -> Result<ContextEnvelope, WebApiError> {
             name: alert.name,
             severity: alert.severity,
             summary: alert.summary,
+            description: alert.description,
             labels: alert.labels,
         },
         causation_id: None,
