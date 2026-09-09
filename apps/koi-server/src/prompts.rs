@@ -52,6 +52,10 @@ mod tests {
         assert!(prompt.content.contains("For a child task"));
         assert!(prompt.content.contains("## Completion protocol"));
         assert!(prompt.content.contains("progress-only text"));
+        assert!(prompt.content.contains("## Permission denial and user escalation"));
+        assert!(prompt.content.contains("A permission denial is a final core decision"));
+        assert!(prompt.content.contains("prefer asking the user or reporting the block"));
+        assert!(prompt.content.contains("After a delivery succeeds"));
         assert!(
             prompt
                 .content
@@ -75,5 +79,7 @@ mod tests {
         assert!(prompt.content.contains("every visible input event"));
         assert!(prompt.content.contains("An alert can authorize"));
         assert!(prompt.content.contains("## Completion protocol"));
+        assert!(prompt.content.contains("## Permission denial and user escalation"));
+        assert!(prompt.content.contains("Do not call the same tool again"));
     }
 }
