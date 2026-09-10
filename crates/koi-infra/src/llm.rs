@@ -3001,7 +3001,10 @@ mod tests {
         )
         .unwrap();
         let events = provider
-            .start(request(ModelProtocol::Responses, true), CancellationToken::new())
+            .start(
+                request(ModelProtocol::Responses, true),
+                CancellationToken::new(),
+            )
             .await
             .unwrap()
             .collect::<Vec<_>>()
